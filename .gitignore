@@ -151,3 +151,8 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+outputs
+*orig
+*tmp*
+uv.lock

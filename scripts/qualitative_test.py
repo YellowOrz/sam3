@@ -8,6 +8,7 @@ Usage:
   python scripts/qualitative_test.py                    # SAM 3.1 default
   python scripts/qualitative_test.py --version sam3     # SAM 3
   python scripts/qualitative_test.py --video /path/to/video.mp4
+  python scripts/qualitative_test.py --device cuda:2
 """
 
 import argparse
@@ -52,11 +53,23 @@ MASK_COLORS = [
 ]
 
 
+def parse_device(value):
+    """Validate a CUDA device string and return it with its numeric index."""
+    if value == "cuda":
+        return "cuda:0", 0
+    if not value.startswith("cuda:"):
+        raise argparse.ArgumentTypeError("device must look like 'cuda:0'")
+    try:
+        index = int(value.split(":", 1)[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("device must look like 'cuda:0'") from exc
+    if index < 0:
+        raise argparse.ArgumentTypeError("CUDA device index must be non-negative")
+    return value, index
+
+
 def extract_frames(video_path, output_dir):
-    if os.path.exists(output_dir) and len(os.listdir(output_dir)) > 0:
-        n = len([f for f in os.listdir(output_dir) if f.endswith(".jpg")])
-        print(f"Using existing {n} frames in {output_dir}")
-        return n
+    """Replace any cached frames with frames extracted from ``video_path``."""
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir)
@@ -214,7 +227,24 @@ def main():
     parser.add_argument(
         "--n_frames", type=int, default=30, help="Number of frames for synthetic video"
     )
+    parser.add_argument(
+        "--device",
+        type=parse_device,
+        default=("cuda:0", 0),
+        metavar="cuda:N",
+        help="CUDA device to use (default: cuda:0)",
+    )
     args = parser.parse_args()
+
+    device_name, device_index = args.device
+    if not torch.cuda.is_available():
+        parser.error("CUDA is required by the SAM 3 video predictor")
+    if device_index >= torch.cuda.device_count():
+        parser.error(
+            f"Requested {device_name}, but only {torch.cuda.device_count()} "
+            "CUDA device(s) are visible"
+        )
+    torch.cuda.set_device(device_index)
 
     username = getpass.getuser()
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_{username}"
