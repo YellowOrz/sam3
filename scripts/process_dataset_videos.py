@@ -48,6 +48,8 @@ COLORS = (
     (255, 60, 160),
     (160, 60, 255),
 )
+EDGE_HALO_THICKNESS = 4
+EDGE_COLOR_THICKNESS = 2
 
 
 def utc_now() -> str:
@@ -253,6 +255,13 @@ def color_for_label(label: int) -> Tuple[int, int, int]:
     return COLORS[(label - 1) % len(COLORS)]
 
 
+def lighter_color(
+    color: Tuple[int, int, int], amount: float = 0.45
+) -> Tuple[int, int, int]:
+    """Return a lighter BGR color while preserving the instance color family."""
+    return tuple(round(channel + (255 - channel) * amount) for channel in color)
+
+
 def build_label_and_overlay(
     frame: np.ndarray,
     outputs: Dict[str, Any],
@@ -300,10 +309,28 @@ def build_label_and_overlay(
 
     for obj_id, label, probability, mask_bool in objects_in_frame:
         color = color_for_label(label)
+        # RETR_LIST keeps both outer contours and inner boundaries (for example
+        # holes in a mask). Use a lighter variant of the instance color for the
+        # halo so the highlighted edge stays in the same color family.
         contours, _ = cv2.findContours(
-            mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            mask_bool.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
         )
-        cv2.drawContours(overlay, contours, -1, color, 2)
+        cv2.drawContours(
+            overlay,
+            contours,
+            -1,
+            lighter_color(color),
+            EDGE_HALO_THICKNESS,
+            cv2.LINE_AA,
+        )
+        cv2.drawContours(
+            overlay,
+            contours,
+            -1,
+            color,
+            EDGE_COLOR_THICKNESS,
+            cv2.LINE_AA,
+        )
         ys, xs = np.nonzero(mask_bool)
         x = int(np.median(xs))
         y = int(np.median(ys))
