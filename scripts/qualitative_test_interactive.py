@@ -1,5 +1,53 @@
 #!/usr/bin/env python3
-"""Run an interactive text-prompted SAM 3/3.1 qualitative video test."""
+"""交互式 SAM 3/3.1 视频分割工具。
+
+使用方法
+========
+
+启动示例::
+
+    uv run python scripts/qualitative_test_interactive.py \
+        --version sam3 \
+        --checkpoint ~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt \
+        --video /path/to/color.mp4 \
+        --text_prompt "human hand" \
+        --device cuda:0 \
+        --propagation-direction forward \
+        --checkpoint-interval 20 \
+        --output-dir ./outputs/interactive/example
+
+如果输出目录中已经存在结果，请增加 ``--overwrite``。
+``--propagation-direction`` 默认为 ``both``，会从编辑帧向前、向后传播；设为
+``forward`` 时只向视频结尾传播，并保留编辑帧之前已有的结果。
+
+交互操作
+--------
+
+* 程序会从第 0 帧应用文本提示，并在后台向整段视频传播 mask。
+* 拖动 ``frame`` 时间轴可浏览已经处理完成的帧。
+* 传播进行中按空格会同时暂停传播和画面播放；暂停后空格只控制画面播放，
+  ``Enter`` 可从当前帧恢复传播。
+* 鼠标中键点击 mask 可选择对象；重叠区域可重复点击以切换对象。
+* 鼠标左键添加正点，右键添加负点；首次添加点时会暂停后台传播。
+* 每个对象在每一帧最多使用 16 个点，窗口状态会显示当前数量；达到上限后
+  不再接受更多点，本轮未确认的点可用 ``Backspace`` 撤销。
+* ``P`` 根据当前编辑点刷新当前帧 mask，仅作为预览。
+  每次预览都会恢复到最近的 CPU 检查点，并向前重放到编辑帧，因此相同点集
+  使用相同的 tracker 基础状态。``--checkpoint-interval`` 控制检查点间隔，
+  默认每 20 帧保存一次。
+* ``Enter`` 确认当前编辑，并从当前帧重新开始传播。
+* ``Backspace`` 撤销最近一次点击，``Esc`` 放弃当前未确认的编辑。
+* ``C`` 清除所有已确认和未确认的点，恢复文本提示并从第 0 帧重新传播。
+* 视频传播完成后窗口会保持打开，可继续浏览或点击任意已处理帧进行编辑。
+* ``Q`` 结束操作；程序会补齐尚未完成的传播并写出结果。
+* 每次鼠标按键点击和键盘输入都会以 ``INTERACTION`` 开头输出一行日志。
+
+输出文件
+--------
+
+* ``result.mp4``：使用原视频帧率、叠加最终 mask 的完整视频。
+* ``interactions.json``：文本提示、确认点和交互事件记录。
+"""
 
 import argparse
 import getpass
@@ -29,6 +77,7 @@ import matplotlib.pyplot as plt
 
 OUTPUT_DIR = "/tmp/sam3_qualitative_test"
 WINDOW_NAME = "SAM 3 interactive video"
+MAX_PROMPT_POINTS = 16
 MASK_COLORS = [
     (255, 0, 0),
     (0, 255, 0),
@@ -440,9 +489,17 @@ def collect_propagation(
 
 
 class PropagationRunner:
-    def __init__(self, predictor: Any, event_queue: queue.Queue):
+    def __init__(
+        self,
+        predictor: Any,
+        event_queue: queue.Queue,
+        propagation_direction: str,
+        checkpoint_interval: int = 20,
+    ):
         self.predictor = predictor
         self.event_queue = event_queue
+        self.propagation_direction = propagation_direction
+        self.checkpoint_interval = checkpoint_interval
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.generation = 0
@@ -458,14 +515,21 @@ class PropagationRunner:
         self.stop_event = threading.Event()
         self.generation = generation
         self.session_id = session_id
+        cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
 
         def run() -> None:
             stopped = False
+            next_checkpoint_frame = start_frame_index
+            max_forward_frame = start_frame_index - 1
             try:
+                # CUDA's current device is thread-local. Bind this worker to the
+                # caller's device before PyTorch or Triton launches any kernels.
+                if cuda_device is not None:
+                    torch.cuda.set_device(cuda_device)
                 request = {
                     "type": "propagate_in_video",
                     "session_id": session_id,
-                    "propagation_direction": "both",
+                    "propagation_direction": self.propagation_direction,
                     "start_frame_index": start_frame_index,
                 }
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -473,14 +537,40 @@ class PropagationRunner:
                         if self.stop_event.is_set():
                             stopped = True
                             break
+                        frame_index = int(response["frame_index"])
                         self.event_queue.put(
                             (
                                 "frame",
                                 generation,
-                                int(response["frame_index"]),
+                                frame_index,
                                 normalize_masks(response.get("outputs", {})),
                             )
                         )
+                        # The bidirectional stream yields its forward half first.
+                        # Ignore decreasing frame indices so the backward half does
+                        # not overwrite forward checkpoints with a different causal
+                        # history.
+                        if frame_index > max_forward_frame:
+                            max_forward_frame = frame_index
+                            if frame_index >= next_checkpoint_frame:
+                                checkpoint = self.predictor.handle_request(
+                                    {
+                                        "type": "save_checkpoint",
+                                        "session_id": session_id,
+                                        "frame_index": frame_index,
+                                    }
+                                )
+                                self.event_queue.put(
+                                    (
+                                        "checkpoint",
+                                        generation,
+                                        checkpoint,
+                                        None,
+                                    )
+                                )
+                                next_checkpoint_frame = (
+                                    frame_index + self.checkpoint_interval
+                                )
                 stopped = stopped or self.stop_event.is_set()
                 self.event_queue.put(("done", generation, stopped, None))
             except BaseException as exc:
@@ -518,6 +608,8 @@ class InteractiveApp:
         prompt: str,
         output_dir: Path,
         window_width: int,
+        propagation_direction: str = "both",
+        checkpoint_interval: int = 20,
     ):
         self.predictor = predictor
         self.version = version
@@ -528,8 +620,15 @@ class InteractiveApp:
         self.frame_count = frame_count
         self.prompt = prompt
         self.output_dir = output_dir
+        self.propagation_direction = propagation_direction
+        self.checkpoint_interval = checkpoint_interval
         self.event_queue: queue.Queue = queue.Queue()
-        self.runner = PropagationRunner(predictor, self.event_queue)
+        self.runner = PropagationRunner(
+            predictor,
+            self.event_queue,
+            propagation_direction,
+            checkpoint_interval,
+        )
         self.generation = 0
         self.propagation_complete = False
         self.cache: Dict[int, Dict[int, np.ndarray]] = {}
@@ -570,15 +669,69 @@ class InteractiveApp:
             }
         )
 
+    def log_input(self, input_type: str, **payload: Any) -> None:
+        print(
+            "INTERACTION "
+            + json.dumps(
+                {
+                    "timestamp": utc_now(),
+                    "input": input_type,
+                    "frame_index": self.display_index,
+                    **payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     def start(self, initial_masks: Dict[int, np.ndarray]) -> None:
         self.cache[0] = initial_masks
         self.record_event("initial_prompt", frame_index=0, text=self.prompt)
+        self.save_checkpoint(0)
         self.start_propagation(0)
+
+    def save_checkpoint(self, frame_index: int) -> Dict[str, Any]:
+        response = self.predictor.handle_request(
+            {
+                "type": "save_checkpoint",
+                "session_id": self.session_id,
+                "frame_index": frame_index,
+            }
+        )
+        cpu_bytes = int(response.get("cpu_bytes", 0))
+        checkpoint_frame = int(response.get("frame_index", frame_index))
+        checkpoint_count = int(response.get("checkpoint_count", 0))
+        print(
+            "CHECKPOINT "
+            + json.dumps(
+                {
+                    "frame_index": checkpoint_frame,
+                    "checkpoint_count": checkpoint_count,
+                    "cpu_bytes": cpu_bytes,
+                    "cpu_mib": round(cpu_bytes / (1024 * 1024), 2),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        self.record_event(
+            "checkpoint_saved",
+            frame_index=checkpoint_frame,
+            checkpoint_count=checkpoint_count,
+            cpu_bytes=cpu_bytes,
+        )
+        return response
 
     def start_propagation(self, frame_index: int) -> None:
         self.generation += 1
         self.propagation_complete = False
-        self.stale_frames.update(self.cache)
+        if self.propagation_direction == "forward":
+            self.stale_frames.update(
+                index for index in self.cache if index >= frame_index
+            )
+        else:
+            self.stale_frames.update(self.cache)
         self.runner.start(self.session_id, frame_index, self.generation)
         self.status = "propagating"
         self.record_event(
@@ -608,9 +761,38 @@ class InteractiveApp:
             elif event_type == "done":
                 stopped = bool(value)
                 self.propagation_complete = not stopped
-                self.status = "paused" if stopped else "complete"
+                if stopped:
+                    self.status = "paused"
+                else:
+                    self.follow_live = False
+                    self.playing = False
+                    self.status = "complete - ready for review"
                 self.record_event(
                     "propagation_end", generation=generation, stopped=stopped
+                )
+            elif event_type == "checkpoint":
+                checkpoint = value
+                cpu_bytes = int(checkpoint.get("cpu_bytes", 0))
+                checkpoint_frame = int(checkpoint["frame_index"])
+                checkpoint_count = int(checkpoint.get("checkpoint_count", 0))
+                print(
+                    "CHECKPOINT "
+                    + json.dumps(
+                        {
+                            "frame_index": checkpoint_frame,
+                            "checkpoint_count": checkpoint_count,
+                            "cpu_bytes": cpu_bytes,
+                            "cpu_mib": round(cpu_bytes / (1024 * 1024), 2),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                self.record_event(
+                    "checkpoint_saved",
+                    frame_index=checkpoint_frame,
+                    checkpoint_count=checkpoint_count,
+                    cpu_bytes=cpu_bytes,
                 )
             elif event_type == "error":
                 self.fatal_error = value
@@ -679,15 +861,27 @@ class InteractiveApp:
         if self.active_obj is None:
             self.status = "select an object first"
             return
+        if self.editing and self.display_index != self.edit_frame:
+            self.set_display_index(int(self.edit_frame), programmatic=True)
+            return
+        frame_index = int(self.edit_frame) if self.editing else self.display_index
+        point_count = sum(
+            1
+            for point in [*self.confirmed_points, *self.draft_points]
+            if (point.frame_index, point.obj_id)
+            == (frame_index, int(self.active_obj))
+        )
+        if point_count >= MAX_PROMPT_POINTS:
+            self.status = (
+                f"point limit reached ({MAX_PROMPT_POINTS}) for obj {self.active_obj}"
+            )
+            return
         if not self.editing:
             self.stop_propagation()
             self.editing = True
             self.edit_frame = self.display_index
             self.follow_live = False
             self.playing = False
-        if self.display_index != self.edit_frame:
-            self.set_display_index(int(self.edit_frame), programmatic=True)
-            return
         self.sequence += 1
         point = PointEdit(
             self.sequence, int(self.edit_frame), int(self.active_obj), x, y, label
@@ -701,11 +895,30 @@ class InteractiveApp:
                 **point.as_json(),
             }
         )
-        self.status = "editing (unconfirmed)"
+        self.status = (
+            f"editing (unconfirmed) - obj {self.active_obj} points "
+            f"{point_count + 1}/{MAX_PROMPT_POINTS}"
+        )
 
     def on_mouse(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
         del flags, param
+        buttons = {
+            cv2.EVENT_LBUTTONDOWN: "left",
+            cv2.EVENT_MBUTTONDOWN: "middle",
+            cv2.EVENT_RBUTTONDOWN: "right",
+        }
+        if event not in buttons:
+            return
         source_x, source_y = self.image_coordinates(x, y)
+        self.log_input(
+            "mouse",
+            button=buttons[event],
+            display_x=x,
+            display_y=y,
+            source_x=source_x,
+            source_y=source_y,
+            active_obj=self.active_obj,
+        )
         if event == cv2.EVENT_MBUTTONDOWN:
             self.select_object(source_x, source_y)
         elif event == cv2.EVENT_LBUTTONDOWN:
@@ -735,6 +948,14 @@ class InteractiveApp:
             for p in self.draft_points
         )
 
+    def relative_point_coordinates(
+        self, points: Sequence[PointEdit]
+    ) -> List[List[float]]:
+        return [
+            [point.x / self.video_info.width, point.y / self.video_info.height]
+            for point in points
+        ]
+
     def apply_points(self, keys: Iterable[Tuple[int, int]]) -> None:
         for frame_index, obj_id in sorted(set(keys)):
             points = self.points_for_key((frame_index, obj_id), include_draft=True)
@@ -745,11 +966,11 @@ class InteractiveApp:
                     "type": "add_prompt",
                     "session_id": self.session_id,
                     "frame_index": frame_index,
-                    "points": [[point.x, point.y] for point in points],
+                    "points": self.relative_point_coordinates(points),
                     "point_labels": [point.label for point in points],
                     "clear_old_points": True,
                     "obj_id": obj_id,
-                    "rel_coordinates": False,
+                    "rel_coordinates": True,
                 }
             )
             self.cache[frame_index] = normalize_masks(response.get("outputs", {}))
@@ -760,11 +981,14 @@ class InteractiveApp:
             self.status = "nothing to preview"
             return
         self.stop_propagation()
+        signature = self.draft_signature()
+        if signature == self.preview_signature:
+            self.status = "preview"
+            return
         keys = {(point.frame_index, point.obj_id) for point in self.draft_points}
-        if self.preview_signature is not None and self.preview_keys - keys:
-            self.restore_confirmed_state()
+        self.restore_preview_baseline(int(self.edit_frame))
         self.apply_points(keys)
-        self.preview_signature = self.draft_signature()
+        self.preview_signature = signature
         self.preview_keys = keys
         self.status = "preview"
         self.record_event(
@@ -791,7 +1015,7 @@ class InteractiveApp:
         self.stop_propagation()
         if not self.draft_points:
             if self.preview_signature is not None:
-                self.restore_confirmed_state()
+                self.restore_preview_baseline(int(self.edit_frame))
             frame_index = int(self.edit_frame)
             self.reset_edit_state()
             if not self.propagation_complete:
@@ -810,6 +1034,10 @@ class InteractiveApp:
             "confirm", frame_index=frame_index, point_sequences=list(committed_now)
         )
         self.reset_edit_state()
+        self.predictor.handle_request(
+            {"type": "clear_checkpoints", "session_id": self.session_id}
+        )
+        self.save_checkpoint(frame_index)
         self.start_propagation(frame_index)
 
     def reset_edit_state(self) -> None:
@@ -831,9 +1059,31 @@ class InteractiveApp:
         )
         self.reset_edit_state()
         if had_preview:
-            self.restore_confirmed_state()
-        else:
-            self.start_propagation(frame_index)
+            self.restore_preview_baseline(frame_index)
+        self.start_propagation(frame_index)
+
+    def clear_all_interactions(self) -> None:
+        cleared_confirmed = len(self.confirmed_points)
+        cleared_draft = len(self.draft_points)
+        self.stop_propagation()
+        self.confirmed_points = []
+        self.commits = []
+        self.reset_edit_state()
+        self.active_obj = None
+        self.selection_position = None
+        self.selection_candidates = []
+        self.selection_offset = 0
+        self.predictor.handle_request(
+            {"type": "clear_checkpoints", "session_id": self.session_id}
+        )
+        self.restore_confirmed_state()
+        self.record_event(
+            "clear_all_interactions",
+            cleared_confirmed_points=cleared_confirmed,
+            cleared_draft_points=cleared_draft,
+        )
+        self.save_checkpoint(0)
+        self.start_propagation(0)
 
     def replay_commit_points(
         self, committed_sequences: set[int], keys: Iterable[Tuple[int, int]]
@@ -850,22 +1100,33 @@ class InteractiveApp:
                     "type": "add_prompt",
                     "session_id": self.session_id,
                     "frame_index": frame_index,
-                    "points": [[point.x, point.y] for point in points],
+                    "points": self.relative_point_coordinates(points),
                     "point_labels": [point.label for point in points],
                     "clear_old_points": True,
                     "obj_id": obj_id,
-                    "rel_coordinates": False,
+                    "rel_coordinates": True,
                 }
             )
             self.cache[frame_index] = normalize_masks(response.get("outputs", {}))
 
-    def synchronous_propagation(self, start_frame_index: int) -> None:
+    def synchronous_propagation(
+        self,
+        start_frame_index: int,
+        propagation_direction: Optional[str] = None,
+        max_frame_num_to_track: Optional[int] = None,
+    ) -> None:
         request = {
             "type": "propagate_in_video",
             "session_id": self.session_id,
-            "propagation_direction": "both",
+            "propagation_direction": (
+                self.propagation_direction
+                if propagation_direction is None
+                else propagation_direction
+            ),
             "start_frame_index": start_frame_index,
         }
+        if max_frame_num_to_track is not None:
+            request["max_frame_num_to_track"] = max_frame_num_to_track
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for response in self.predictor.handle_stream_request(request):
                 frame_index = int(response["frame_index"])
@@ -873,20 +1134,55 @@ class InteractiveApp:
                 self.stale_frames.discard(frame_index)
         self.propagation_complete = True
 
+    def restore_preview_baseline(self, target_frame_index: int) -> None:
+        self.stop_propagation()
+        self.status = "restoring checkpoint"
+        response = self.predictor.handle_request(
+            {
+                "type": "restore_checkpoint",
+                "session_id": self.session_id,
+                "frame_index": target_frame_index,
+            }
+        )
+        if not response.get("is_success", False):
+            raise RuntimeError(
+                f"no checkpoint is available at or before frame {target_frame_index}"
+            )
+        checkpoint_frame = int(response["frame_index"])
+        self.stale_frames.update(
+            range(checkpoint_frame + 1, self.frame_count)
+        )
+        if checkpoint_frame < target_frame_index:
+            replay_start = checkpoint_frame + 1
+            self.status = (
+                f"replaying {replay_start}-{target_frame_index} from checkpoint "
+                f"{checkpoint_frame}"
+            )
+            # _get_processing_order uses an inclusive end point, hence N frames
+            # from replay_start through target require max_frame_num_to_track=N-1.
+            self.synchronous_propagation(
+                replay_start,
+                propagation_direction="forward",
+                max_frame_num_to_track=target_frame_index - replay_start,
+            )
+        self.propagation_complete = False
+        self.set_display_index(target_frame_index, programmatic=True)
+        self.record_event(
+            "checkpoint_restored",
+            checkpoint_frame=checkpoint_frame,
+            target_frame=target_frame_index,
+            cpu_bytes=int(response.get("cpu_bytes", 0)),
+        )
+
     def restore_confirmed_state(self) -> None:
         self.stop_propagation()
         self.status = "restoring"
         self.predictor.handle_request(
             {
-                "type": "close_session",
+                "type": "reset_session",
                 "session_id": self.session_id,
-                "run_gc_collect": False,
             }
         )
-        response = self.predictor.handle_request(
-            {"type": "start_session", "resource_path": str(self.frame_dir)}
-        )
-        self.session_id = response["session_id"]
         response = self.predictor.handle_request(
             {
                 "type": "add_prompt",
@@ -895,15 +1191,14 @@ class InteractiveApp:
                 "text": self.prompt,
             }
         )
-        self.cache = {0: normalize_masks(response.get("outputs", {}))}
+        self.cache[0] = normalize_masks(response.get("outputs", {}))
         self.stale_frames = set(range(self.frame_count))
-        self.synchronous_propagation(0)
+        self.stale_frames.discard(0)
         committed_sequences: set[int] = set()
         for commit in self.commits:
             committed_sequences.update(commit.point_sequences)
             self.replay_commit_points(committed_sequences, commit.affected_keys)
-            self.synchronous_propagation(commit.frame_index)
-        self.stale_frames.clear()
+        self.propagation_complete = False
         self.status = "restored"
         self.record_event("restore_complete", commits_replayed=len(self.commits))
 
@@ -943,6 +1238,18 @@ class InteractiveApp:
             self.set_display_index(later[0], programmatic=True)
 
     def handle_key(self, key: int) -> bool:
+        key_names = {
+            8: "Backspace",
+            10: "Enter",
+            13: "Enter",
+            27: "Esc",
+            32: "Space",
+            127: "Backspace",
+        }
+        key_name = key_names.get(key)
+        if key_name is None:
+            key_name = chr(key) if 32 <= key <= 126 else f"code-{key}"
+        self.log_input("keyboard", key=key_name, key_code=key)
         if key in (ord("q"), ord("Q")):
             return False
         if key == 27:
@@ -951,11 +1258,18 @@ class InteractiveApp:
             self.undo()
         elif key in (ord("p"), ord("P")):
             self.preview()
+        elif key in (ord("c"), ord("C")):
+            self.clear_all_interactions()
         elif key in (10, 13):
             self.confirm()
         elif key == ord(" ") and not self.editing:
             self.follow_live = False
-            self.playing = not self.playing
+            if self.runner.is_alive:
+                self.stop_propagation()
+                self.playing = False
+                self.status = "paused"
+            else:
+                self.playing = not self.playing
             self.last_play_time = time.monotonic()
         return True
 
@@ -1004,8 +1318,6 @@ class InteractiveApp:
                 key = cv2.waitKey(15) & 0xFF
                 if key != 255:
                     running = self.handle_key(key)
-                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                    running = False
             self.finalize()
         finally:
             if self.runner.is_alive:
@@ -1064,6 +1376,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "input_video": str(app.video_path),
             "model_version": app.version,
             "text_prompt": app.prompt,
+            "propagation_direction": app.propagation_direction,
             "source": {
                 "width": app.video_info.width,
                 "height": app.video_info.height,
@@ -1104,6 +1417,8 @@ def run_interactive(
     prompt: str,
     output_dir: Path,
     window_width: int,
+    propagation_direction: str,
+    checkpoint_interval: int,
 ) -> None:
     response = predictor.handle_request(
         {"type": "start_session", "resource_path": str(frame_dir)}
@@ -1130,6 +1445,8 @@ def run_interactive(
             prompt,
             output_dir,
             window_width,
+            propagation_direction,
+            checkpoint_interval,
         )
         app.start(normalize_masks(response.get("outputs", {})))
         app.run()
@@ -1218,10 +1535,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite", action="store_true", help="Replace existing interactive outputs"
     )
     parser.add_argument(
+        "--propagation-direction",
+        choices=("both", "forward"),
+        default="both",
+        help="Propagate from an edited frame in both directions or forward only",
+    )
+    parser.add_argument(
         "--window-width",
         type=positive_int,
         default=1280,
         help="Maximum interactive image width (default: 1280)",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=positive_int,
+        default=20,
+        metavar="FRAMES",
+        help="Save a CPU tracker checkpoint every FRAMES frames (default: 20)",
     )
     return parser
 
@@ -1274,6 +1604,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.text_prompt,
                 output_dir,
                 args.window_width,
+                args.propagation_direction,
+                args.checkpoint_interval,
             )
     finally:
         predictor.shutdown()

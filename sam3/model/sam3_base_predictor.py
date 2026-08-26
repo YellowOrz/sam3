@@ -9,11 +9,16 @@ Provides the common handle_request/handle_stream_request API and session managem
 Subclasses only need to override methods where their behavior differs.
 """
 
+import copy
 import gc
+import inspect
 import time
 import uuid
+import weakref
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from sam3.logger import get_logger
 
@@ -27,6 +32,142 @@ logger = get_logger(__name__)
 # where freed blocks get reused by the next session — empty_cache is only
 # needed to keep memory from growing unbounded.
 _CLEAR_CACHE_THRESHOLD = 80
+
+
+@dataclass(frozen=True)
+class _CpuTensorSnapshot:
+    tensor: torch.Tensor
+    device: torch.device
+
+
+@dataclass(frozen=True)
+class _TensorCacheEntry:
+    source: weakref.ReferenceType
+    snapshot: _CpuTensorSnapshot
+
+
+def _tensor_cache_key(tensor: torch.Tensor) -> tuple:
+    storage = tensor.untyped_storage()
+    try:
+        version = tensor._version
+    except RuntimeError:
+        # Tensors created under torch.inference_mode() intentionally have no
+        # version counter. Their contents are compared after copying to CPU.
+        version = None
+    return (
+        id(tensor),
+        storage.data_ptr(),
+        version,
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+    )
+
+
+def _clone_state_to_cpu(value, tensor_cache, memo):
+    """Clone mutable inference data while reusing unchanged tensor snapshots."""
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+    if isinstance(value, torch.Tensor):
+        key = _tensor_cache_key(value)
+        entry = tensor_cache.get(key)
+        has_version_counter = key[2] is not None
+        cpu_tensor = None
+        if not has_version_counter:
+            cpu_tensor = value.detach().to(device="cpu", copy=True)
+        can_reuse = entry is not None and entry.source() is value
+        if can_reuse and cpu_tensor is not None:
+            can_reuse = torch.equal(entry.snapshot.tensor, cpu_tensor)
+        if not can_reuse:
+            snapshot = _CpuTensorSnapshot(
+                (
+                    cpu_tensor
+                    if cpu_tensor is not None
+                    else value.detach().to(device="cpu", copy=True)
+                ),
+                value.device,
+            )
+            entry = _TensorCacheEntry(weakref.ref(value), snapshot)
+            tensor_cache[key] = entry
+        else:
+            snapshot = entry.snapshot
+        memo[value_id] = snapshot
+        return snapshot
+    if isinstance(value, np.ndarray):
+        result = value.copy()
+        memo[value_id] = result
+        return result
+    if isinstance(value, dict):
+        result = type(value)()
+        if hasattr(value, "default_factory"):
+            result.default_factory = value.default_factory
+        memo[value_id] = result
+        for key, item in value.items():
+            result[_clone_state_to_cpu(key, tensor_cache, memo)] = (
+                _clone_state_to_cpu(item, tensor_cache, memo)
+            )
+        return result
+    if isinstance(value, list):
+        result = []
+        memo[value_id] = result
+        result.extend(_clone_state_to_cpu(item, tensor_cache, memo) for item in value)
+        return result
+    if isinstance(value, tuple):
+        result = tuple(
+            _clone_state_to_cpu(item, tensor_cache, memo) for item in value
+        )
+        memo[value_id] = result
+        return result
+    if isinstance(value, set):
+        result = {_clone_state_to_cpu(item, tensor_cache, memo) for item in value}
+        memo[value_id] = result
+        return result
+    result = copy.deepcopy(value)
+    memo[value_id] = result
+    return result
+
+
+def _restore_state_from_cpu(value, memo):
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+    if isinstance(value, _CpuTensorSnapshot):
+        result = value.tensor.to(device=value.device, copy=True)
+        memo[value_id] = result
+        return result
+    if isinstance(value, np.ndarray):
+        result = value.copy()
+        memo[value_id] = result
+        return result
+    if isinstance(value, dict):
+        result = type(value)()
+        if hasattr(value, "default_factory"):
+            result.default_factory = value.default_factory
+        memo[value_id] = result
+        for key, item in value.items():
+            result[_restore_state_from_cpu(key, memo)] = _restore_state_from_cpu(
+                item, memo
+            )
+        return result
+    if isinstance(value, list):
+        result = []
+        memo[value_id] = result
+        result.extend(_restore_state_from_cpu(item, memo) for item in value)
+        return result
+    if isinstance(value, tuple):
+        result = tuple(_restore_state_from_cpu(item, memo) for item in value)
+        memo[value_id] = result
+        return result
+    if isinstance(value, set):
+        result = {_restore_state_from_cpu(item, memo) for item in value}
+        memo[value_id] = result
+        return result
+    result = copy.deepcopy(value)
+    memo[value_id] = result
+    return result
 
 
 class Sam3BasePredictor:
@@ -83,6 +224,18 @@ class Sam3BasePredictor:
             )
         elif request_type == "reset_session":
             return self.reset_session(session_id=request["session_id"])
+        elif request_type == "save_checkpoint":
+            return self.save_checkpoint(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+            )
+        elif request_type == "restore_checkpoint":
+            return self.restore_checkpoint(
+                session_id=request["session_id"],
+                target_frame_idx=request["frame_index"],
+            )
+        elif request_type == "clear_checkpoints":
+            return self.clear_checkpoints(session_id=request["session_id"])
         elif request_type == "cancel_propagation":
             return self.cancel_propagation(session_id=request["session_id"])
         elif request_type == "close_session":
@@ -127,8 +280,23 @@ class Sam3BasePredictor:
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
-            offload_state_to_cpu=offload_state_to_cpu,
         )
+        # SAM 3 supports offloading the tracking state, while the SAM 3.1
+        # multiplex tracker does not expose that option. Keep the shared
+        # request API compatible with both implementations by forwarding the
+        # option only when the selected model accepts it.
+        init_state_parameters = inspect.signature(self.model.init_state).parameters
+        accepts_extra_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in init_state_parameters.values()
+        )
+        if "offload_state_to_cpu" in init_state_parameters or accepts_extra_kwargs:
+            init_kwargs["offload_state_to_cpu"] = offload_state_to_cpu
+        elif offload_state_to_cpu:
+            raise ValueError(
+                f"{type(self.model).__name__} does not support "
+                "offload_state_to_cpu=True"
+            )
         if hasattr(self, "async_loading_frames"):
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
@@ -142,6 +310,8 @@ class Sam3BasePredictor:
             "session_id": session_id,
             "start_time": time.time(),
             "last_use_time": time.time(),
+            "checkpoints": {},
+            "checkpoint_tensor_cache": {},
         }
         logger.info(f"started new session {session_id}")
         return {"session_id": session_id}
@@ -311,6 +481,133 @@ class Sam3BasePredictor:
         self._extend_expiration_time(session)
         self.model.reset_state(inference_state)
         return {"is_success": True}
+
+    def _checkpoint_frame(self, state, requested_frame_idx):
+        processed = [
+            index
+            for index, output in enumerate(state.get("previous_stages_out", ()))
+            if output is not None
+        ]
+        if not processed:
+            return int(requested_frame_idx)
+        requested_frame_idx = int(requested_frame_idx)
+        later = [index for index in processed if index >= requested_frame_idx]
+        return max(later) if later else max(processed)
+
+    def _checkpoint_mutable_state(self, state, tensor_cache):
+        # These entries are immutable or cheaply reproducible. In particular,
+        # input_batch owns every decoded video frame and must never be copied per
+        # checkpoint. feature_cache only keeps the current backbone frame.
+        excluded = {"input_batch", "constants", "feature_cache"}
+        memo = {}
+        return {
+            key: _clone_state_to_cpu(value, tensor_cache, memo)
+            for key, value in state.items()
+            if key not in excluded
+        }
+
+    def _checkpoint_cpu_bytes(self, session):
+        tensor_storages = {}
+        numpy_storages = {}
+
+        def visit(value, seen):
+            value_id = id(value)
+            if value_id in seen:
+                return
+            seen.add(value_id)
+            if isinstance(value, _CpuTensorSnapshot):
+                tensor = value.tensor
+                storage = tensor.untyped_storage()
+                tensor_storages[storage.data_ptr()] = storage.nbytes()
+            elif isinstance(value, np.ndarray):
+                numpy_storages[value.__array_interface__["data"][0]] = value.nbytes
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    visit(key, seen)
+                    visit(item, seen)
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    visit(item, seen)
+
+        seen = set()
+        visit(session.get("checkpoints", {}), seen)
+        visit(session.get("checkpoint_tensor_cache", {}), seen)
+        return sum(tensor_storages.values()) + sum(numpy_storages.values())
+
+    def save_checkpoint(self, session_id, frame_idx):
+        """Save a CPU-only snapshot of a session's mutable inference state."""
+        session = self._get_session(session_id)
+        self._extend_expiration_time(session)
+        state = session["state"]
+        checkpoint_frame = self._checkpoint_frame(state, frame_idx)
+        checkpoints = session["checkpoints"]
+        tensor_cache = session["checkpoint_tensor_cache"]
+        dead_keys = [key for key, entry in tensor_cache.items() if entry.source() is None]
+        for key in dead_keys:
+            tensor_cache.pop(key, None)
+        if checkpoint_frame not in checkpoints:
+            checkpoints[checkpoint_frame] = self._checkpoint_mutable_state(
+                state, tensor_cache
+            )
+        cpu_bytes = self._checkpoint_cpu_bytes(session)
+        logger.info(
+            f"saved CPU checkpoint at frame {checkpoint_frame} in session "
+            f"{session_id} ({cpu_bytes} bytes across {len(checkpoints)} checkpoints)"
+        )
+        return {
+            "is_success": True,
+            "frame_index": checkpoint_frame,
+            "checkpoint_count": len(checkpoints),
+            "cpu_bytes": cpu_bytes,
+        }
+
+    def restore_checkpoint(self, session_id, target_frame_idx):
+        """Restore the newest checkpoint at or before ``target_frame_idx``."""
+        session = self._get_session(session_id)
+        self._extend_expiration_time(session)
+        checkpoints = session["checkpoints"]
+        candidates = [
+            frame for frame in checkpoints if frame <= int(target_frame_idx)
+        ]
+        if not candidates:
+            return {"is_success": False, "frame_index": None}
+        checkpoint_frame = max(candidates)
+        state = session["state"]
+        immutable = {
+            key: state[key]
+            for key in ("input_batch", "constants")
+            if key in state
+        }
+        state.clear()
+        gc.collect()
+        restored = _restore_state_from_cpu(checkpoints[checkpoint_frame], {})
+        state.update(immutable)
+        state.update(restored)
+        # Backbone features are valid for only the frame that produced them and
+        # are intentionally recomputed after a restore.
+        state["feature_cache"] = {}
+        for tracker_state in state.get("tracker_inference_states", ()):
+            if isinstance(tracker_state, dict) and "cached_features" in tracker_state:
+                tracker_state["cached_features"] = state["feature_cache"]
+        # A restored generator cannot be resumed. Removing the trailing
+        # propagation marker makes the next bounded forward call recompute the
+        # requested segment instead of taking the propagation_fetch path.
+        history = state.get("action_history", [])
+        while history and str(history[-1].get("type", "")).startswith("propagation"):
+            history.pop()
+        return {
+            "is_success": True,
+            "frame_index": checkpoint_frame,
+            "checkpoint_count": len(checkpoints),
+            "cpu_bytes": self._checkpoint_cpu_bytes(session),
+        }
+
+    def clear_checkpoints(self, session_id):
+        session = self._get_session(session_id)
+        self._extend_expiration_time(session)
+        session["checkpoints"].clear()
+        session["checkpoint_tensor_cache"].clear()
+        return {"is_success": True, "checkpoint_count": 0, "cpu_bytes": 0}
 
     def close_session(
         self,
