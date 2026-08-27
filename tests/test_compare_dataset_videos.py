@@ -27,15 +27,23 @@ def touch_result(root: Path, relative_dir: str) -> None:
     result_path.touch()
 
 
-def test_collect_sequences_requires_identical_relative_paths(tmp_path: Path) -> None:
+def test_collect_sequences_skips_relative_paths_missing_from_any_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
     touch_result(first, "can")
     touch_result(first, "basket")
     touch_result(second, "can")
+    monkeypatch.setattr(
+        compare, "probe_video", lambda _: compare.VideoInfo(16, 12, 3, 12.0)
+    )
 
-    with pytest.raises(RuntimeError, match=r"missing: basket"):
-        compare.collect_sequences([first, second])
+    sequences = compare.collect_sequences([first, second])
+
+    assert [sequence.name for sequence in sequences] == ["can"]
+    assert "Skipping result.mp4 paths" in caplog.text
+    assert "basket" in caplog.text
 
 
 def test_collect_sequences_rejects_flat_name_collisions(tmp_path: Path) -> None:
@@ -73,8 +81,6 @@ def test_main_writes_and_overwrites_comparison_video(tmp_path: Path) -> None:
         str(second),
         "--output-dir",
         str(output_dir),
-        "--grid",
-        "1x2",
     ]
 
     assert compare.main(arguments) == 0

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build side-by-side comparison videos from SAM 3 dataset outputs.
 
-Each input root is expected to contain the same relative set of ``result.mp4``
-files. One comparison video is produced per sequence, with cells ordered exactly
-as the input roots appear on the command line.
+One comparison video is produced for each ``result.mp4`` relative path shared by
+all input roots, with cells ordered exactly as the roots appear on the command
+line. Paths missing from any root are skipped.
 
 Example:
     uv run python scripts/compare_dataset_videos.py \
@@ -77,39 +77,6 @@ def recommend_grid(cell_count: int) -> Grid:
     )
 
 
-def choose_grid(cell_count: int) -> Grid:
-    recommended = recommend_grid(cell_count)
-    rows, columns = recommended
-    alternative = (columns, rows)
-    alternative_text = (
-        f"; alternative {alternative[0]}x{alternative[1]}"
-        if alternative != recommended
-        else ""
-    )
-    if not sys.stdin.isatty():
-        raise RuntimeError("--grid is required when standard input is not a terminal")
-    while True:
-        raw_value = input(
-            f"{cell_count} inputs: recommended grid {rows}x{columns}"
-            f"{alternative_text}\nGrid [{rows}x{columns}]: "
-        ).strip()
-        if not raw_value:
-            return recommended
-        try:
-            grid = parse_grid(raw_value)
-        except argparse.ArgumentTypeError as exc:
-            print(f"Invalid grid: {exc}", file=sys.stderr)
-            continue
-        if grid[0] * grid[1] < cell_count:
-            print(
-                f"Invalid grid: {grid[0]}x{grid[1]} has fewer than "
-                f"{cell_count} cells",
-                file=sys.stderr,
-            )
-            continue
-        return grid
-
-
 def discover_results(output_root: Path) -> Dict[Path, Path]:
     """Map each result video by its sequence directory relative to a root."""
     results: Dict[Path, Path] = {}
@@ -147,24 +114,6 @@ def probe_video(video_path: Path) -> VideoInfo:
     return info
 
 
-def describe_path_set_difference(
-    reference_root: Path,
-    reference_paths: set[Path],
-    current_root: Path,
-    current_paths: set[Path],
-) -> str:
-    lines = [
-        f"result.mp4 relative paths differ between {reference_root} and {current_root}"
-    ]
-    missing = sorted(reference_paths - current_paths, key=lambda path: path.as_posix())
-    extra = sorted(current_paths - reference_paths, key=lambda path: path.as_posix())
-    if missing:
-        lines.append("missing: " + ", ".join(path.as_posix() for path in missing))
-    if extra:
-        lines.append("extra: " + ", ".join(path.as_posix() for path in extra))
-    return "\n".join(lines)
-
-
 def validate_video_info(
     sequence_dir: Path,
     reference_path: Path,
@@ -193,18 +142,19 @@ def collect_sequences(output_roots: Sequence[Path]) -> List[SequenceInputs]:
     if not discovered[0]:
         raise RuntimeError(f"no result.mp4 files found below {output_roots[0]}")
 
-    reference_paths = set(discovered[0])
-    for root, current in zip(output_roots[1:], discovered[1:]):
-        current_paths = set(current)
-        if current_paths != reference_paths:
-            raise RuntimeError(
-                describe_path_set_difference(
-                    output_roots[0], reference_paths, root, current_paths
-                )
-            )
+    path_sets = [set(result) for result in discovered]
+    common_paths = set.intersection(*path_sets)
+    skipped_paths = set.union(*path_sets) - common_paths
+    if skipped_paths:
+        LOGGER.warning(
+            "Skipping result.mp4 paths missing from one or more roots: %s",
+            ", ".join(path.as_posix() for path in sorted(skipped_paths)),
+        )
+    if not common_paths:
+        raise RuntimeError("no result.mp4 relative paths are shared by all input roots")
 
     names: Dict[str, Path] = {}
-    for relative_dir in sorted(reference_paths, key=lambda path: path.as_posix()):
+    for relative_dir in sorted(common_paths, key=lambda path: path.as_posix()):
         sequence_name = relative_dir.name
         if sequence_name in names:
             raise RuntimeError(
@@ -215,7 +165,7 @@ def collect_sequences(output_roots: Sequence[Path]) -> List[SequenceInputs]:
         names[sequence_name] = relative_dir
 
     sequences = []
-    for relative_dir in sorted(reference_paths, key=lambda path: path.as_posix()):
+    for relative_dir in sorted(common_paths, key=lambda path: path.as_posix()):
         sequence_name = relative_dir.name
 
         videos = tuple(result[relative_dir] for result in discovered)
@@ -390,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         "output_roots",
         nargs="+",
         metavar="OUTPUT_ROOT",
-        help="Prompt-specific roots containing matching result.mp4 files",
+        help="Prompt-specific roots containing result.mp4 files",
     )
     parser.add_argument(
         "--output-dir",
@@ -420,12 +370,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if not output_root.is_dir():
             parser.error(f"OUTPUT_ROOT is not a directory: {output_root}")
 
-    grid = args.grid
-    if grid is None:
-        try:
-            grid = choose_grid(len(output_roots))
-        except RuntimeError as exc:
-            parser.error(str(exc))
+    grid = args.grid or recommend_grid(len(output_roots))
     if grid[0] * grid[1] < len(output_roots):
         parser.error(
             f"grid {grid[0]}x{grid[1]} has fewer than " f"{len(output_roots)} cells"

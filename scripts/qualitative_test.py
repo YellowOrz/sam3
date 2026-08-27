@@ -24,7 +24,6 @@ from PIL import Image as PIL_Image, ImageDraw
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from PIL import Image as PIL_Image, ImageDraw
 
 
 OUTPUT_DIR = "/tmp/sam3_qualitative_test"

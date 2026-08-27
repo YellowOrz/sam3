@@ -27,6 +27,12 @@ from tqdm.auto import tqdm
 logger = get_logger(__name__)
 
 
+def _frame_progress(processing_order, num_frames, reverse, **kwargs):
+    if not reverse:
+        kwargs.update(initial=processing_order.start, total=num_frames)
+    return tqdm(processing_order, **kwargs)
+
+
 class Sam3VideoInference(Sam3VideoBase):
     TEXT_ID_FOR_TEXT = 0
     TEXT_ID_FOR_VISUAL = 1
@@ -289,8 +295,12 @@ class Sam3VideoInference(Sam3VideoBase):
         # e.g., we output an object on frame 4 only if it becomes confirmed on frame 6.
         unconfirmed_status_delay = self.masklet_confirmation_consecutive_det_thresh - 1
         unconfirmed_obj_ids_per_frame = {}  # frame_idx -> hidden_obj_ids
-        for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
+        for frame_idx in _frame_progress(
+            processing_order,
+            inference_state["num_frames"],
+            reverse,
+            desc="propagate_in_video",
+            disable=self.rank > 0,
         ):
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
 
@@ -1044,7 +1054,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
         # if fetch just return from output
         if propagation_type == "propagation_fetch":
-            for frame_idx in tqdm(processing_order):
+            for frame_idx in _frame_progress(
+                processing_order, inference_state["num_frames"], reverse
+            ):
                 if self.rank == 0:
                     obj_id_to_mask = inference_state["cached_frame_outputs"].get(
                         frame_idx, {}
@@ -1085,7 +1097,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     tracker_state, run_mem_encoder=True
                 )
 
-        for frame_idx in tqdm(processing_order):
+        for frame_idx in _frame_progress(
+            processing_order, inference_state["num_frames"], reverse
+        ):
             # run Tracker propagation
             if propagation_type == "propagation_partial":
                 self._prepare_backbone_feats(inference_state, frame_idx, reverse)

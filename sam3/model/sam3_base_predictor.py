@@ -106,8 +106,8 @@ def _clone_state_to_cpu(value, tensor_cache, memo):
             result.default_factory = value.default_factory
         memo[value_id] = result
         for key, item in value.items():
-            result[_clone_state_to_cpu(key, tensor_cache, memo)] = (
-                _clone_state_to_cpu(item, tensor_cache, memo)
+            result[_clone_state_to_cpu(key, tensor_cache, memo)] = _clone_state_to_cpu(
+                item, tensor_cache, memo
             )
         return result
     if isinstance(value, list):
@@ -116,9 +116,7 @@ def _clone_state_to_cpu(value, tensor_cache, memo):
         result.extend(_clone_state_to_cpu(item, tensor_cache, memo) for item in value)
         return result
     if isinstance(value, tuple):
-        result = tuple(
-            _clone_state_to_cpu(item, tensor_cache, memo) for item in value
-        )
+        result = tuple(_clone_state_to_cpu(item, tensor_cache, memo) for item in value)
         memo[value_id] = result
         return result
     if isinstance(value, set):
@@ -488,11 +486,7 @@ class Sam3BasePredictor:
             for index, output in enumerate(state.get("previous_stages_out", ()))
             if output is not None
         ]
-        if not processed:
-            return int(requested_frame_idx)
-        requested_frame_idx = int(requested_frame_idx)
-        later = [index for index in processed if index >= requested_frame_idx]
-        return max(later) if later else max(processed)
+        return max([int(requested_frame_idx), *processed])
 
     def _checkpoint_mutable_state(self, state, tensor_cache):
         # These entries are immutable or cheaply reproducible. In particular,
@@ -506,34 +500,6 @@ class Sam3BasePredictor:
             if key not in excluded
         }
 
-    def _checkpoint_cpu_bytes(self, session):
-        tensor_storages = {}
-        numpy_storages = {}
-
-        def visit(value, seen):
-            value_id = id(value)
-            if value_id in seen:
-                return
-            seen.add(value_id)
-            if isinstance(value, _CpuTensorSnapshot):
-                tensor = value.tensor
-                storage = tensor.untyped_storage()
-                tensor_storages[storage.data_ptr()] = storage.nbytes()
-            elif isinstance(value, np.ndarray):
-                numpy_storages[value.__array_interface__["data"][0]] = value.nbytes
-            elif isinstance(value, dict):
-                for key, item in value.items():
-                    visit(key, seen)
-                    visit(item, seen)
-            elif isinstance(value, (list, tuple, set)):
-                for item in value:
-                    visit(item, seen)
-
-        seen = set()
-        visit(session.get("checkpoints", {}), seen)
-        visit(session.get("checkpoint_tensor_cache", {}), seen)
-        return sum(tensor_storages.values()) + sum(numpy_storages.values())
-
     def save_checkpoint(self, session_id, frame_idx):
         """Save a CPU-only snapshot of a session's mutable inference state."""
         session = self._get_session(session_id)
@@ -542,23 +508,20 @@ class Sam3BasePredictor:
         checkpoint_frame = self._checkpoint_frame(state, frame_idx)
         checkpoints = session["checkpoints"]
         tensor_cache = session["checkpoint_tensor_cache"]
-        dead_keys = [key for key, entry in tensor_cache.items() if entry.source() is None]
+        dead_keys = [
+            key for key, entry in tensor_cache.items() if entry.source() is None
+        ]
         for key in dead_keys:
             tensor_cache.pop(key, None)
-        if checkpoint_frame not in checkpoints:
+        created = checkpoint_frame not in checkpoints
+        if created:
             checkpoints[checkpoint_frame] = self._checkpoint_mutable_state(
                 state, tensor_cache
             )
-        cpu_bytes = self._checkpoint_cpu_bytes(session)
-        logger.info(
-            f"saved CPU checkpoint at frame {checkpoint_frame} in session "
-            f"{session_id} ({cpu_bytes} bytes across {len(checkpoints)} checkpoints)"
-        )
         return {
             "is_success": True,
             "frame_index": checkpoint_frame,
-            "checkpoint_count": len(checkpoints),
-            "cpu_bytes": cpu_bytes,
+            "created": created,
         }
 
     def restore_checkpoint(self, session_id, target_frame_idx):
@@ -566,17 +529,13 @@ class Sam3BasePredictor:
         session = self._get_session(session_id)
         self._extend_expiration_time(session)
         checkpoints = session["checkpoints"]
-        candidates = [
-            frame for frame in checkpoints if frame <= int(target_frame_idx)
-        ]
+        candidates = [frame for frame in checkpoints if frame <= int(target_frame_idx)]
         if not candidates:
             return {"is_success": False, "frame_index": None}
         checkpoint_frame = max(candidates)
         state = session["state"]
         immutable = {
-            key: state[key]
-            for key in ("input_batch", "constants")
-            if key in state
+            key: state[key] for key in ("input_batch", "constants") if key in state
         }
         state.clear()
         gc.collect()
@@ -598,8 +557,6 @@ class Sam3BasePredictor:
         return {
             "is_success": True,
             "frame_index": checkpoint_frame,
-            "checkpoint_count": len(checkpoints),
-            "cpu_bytes": self._checkpoint_cpu_bytes(session),
         }
 
     def clear_checkpoints(self, session_id):
@@ -607,7 +564,7 @@ class Sam3BasePredictor:
         self._extend_expiration_time(session)
         session["checkpoints"].clear()
         session["checkpoint_tensor_cache"].clear()
-        return {"is_success": True, "checkpoint_count": 0, "cpu_bytes": 0}
+        return {"is_success": True}
 
     def close_session(
         self,

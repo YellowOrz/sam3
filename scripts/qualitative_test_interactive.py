@@ -17,8 +17,8 @@
         --output-dir ./outputs/interactive/example
 
 如果输出目录中已经存在结果，请增加 ``--overwrite``。
-``--propagation-direction`` 默认为 ``both``，会从编辑帧向前、向后传播；设为
-``forward`` 时只向视频结尾传播，并保留编辑帧之前已有的结果。
+``--propagation-direction forward`` 只从编辑帧向视频结尾传播；默认 ``both``
+会先向结尾传播，再向视频开头传播。
 
 交互操作
 --------
@@ -28,7 +28,7 @@
 * 传播进行中按空格会同时暂停传播和画面播放；暂停后空格只控制画面播放，
   ``Enter`` 可从当前帧恢复传播。
 * 鼠标中键点击 mask 可选择对象；重叠区域可重复点击以切换对象。
-* 鼠标左键添加正点，右键添加负点；首次添加点时会暂停后台传播。
+* 按空格暂停播放后，鼠标左键添加正点，右键添加负点。
 * 每个对象在每一帧最多使用 16 个点，窗口状态会显示当前数量；达到上限后
   不再接受更多点，本轮未确认的点可用 ``Backspace`` 撤销。
 * ``P`` 根据当前编辑点刷新当前帧 mask，仅作为预览。
@@ -66,17 +66,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
-import matplotlib
 import numpy as np
 import torch
-from PIL import Image as PIL_Image, ImageDraw
+from tqdm.auto import tqdm
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-
-OUTPUT_DIR = "/tmp/sam3_qualitative_test"
 WINDOW_NAME = "SAM 3 interactive video"
+WINDOW_FLAGS = cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL
 MAX_PROMPT_POINTS = 16
 MASK_COLORS = [
     (255, 0, 0),
@@ -211,62 +206,12 @@ def extract_frames(video_path: Path, output_dir: Path) -> int:
     return index
 
 
-def synthesize_video(
-    out_dir: Path,
-    num_objects: int = 5,
-    n_frames: int = 30,
-    width: int = 1024,
-    height: int = 1024,
-) -> int:
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True)
-    colors = [
-        tuple(np.random.randint(0, 256, size=3).tolist()) for _ in range(num_objects)
-    ]
-    positions = [
-        [
-            float(np.random.randint(80, width - 80)),
-            float(np.random.randint(80, height - 80)),
-        ]
-        for _ in range(num_objects)
-    ]
-    velocities = [
-        [np.random.choice([-1, 1]) * 15, np.random.choice([-1, 1]) * 15]
-        for _ in range(num_objects)
-    ]
-    for index in range(n_frames):
-        image = PIL_Image.new("RGB", (width, height), (0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        for object_index in range(num_objects):
-            x, y = positions[object_index]
-            draw.ellipse(
-                [(x - 50, y - 50), (x + 50, y + 50)], fill=colors[object_index]
-            )
-            vx, vy = velocities[object_index]
-            positions[object_index] = [
-                np.clip(x + vx, 50, width - 50),
-                np.clip(y + vy, 50, height - 50),
-            ]
-            if x < 50 or x > width - 50:
-                velocities[object_index][0] *= -1
-            if y < 50 or y > height - 50:
-                velocities[object_index][1] *= -1
-        image.save(out_dir / f"{index:05d}.jpg")
-    print(f"Generated {n_frames} synthetic frames with {num_objects} circles")
-    return n_frames
-
-
 def load_frame_bgr(frame_dir: Path, frame_index: int) -> np.ndarray:
     frame_path = frame_dir / f"{frame_index:05d}.jpg"
     frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
     if frame is None:
         raise RuntimeError(f"cannot read frame: {frame_path}")
     return frame
-
-
-def load_frame(frame_dir: Path, frame_index: int) -> np.ndarray:
-    return cv2.cvtColor(load_frame_bgr(frame_dir, frame_index), cv2.COLOR_BGR2RGB)
 
 
 def as_numpy(value: Any) -> np.ndarray:
@@ -298,22 +243,6 @@ def normalize_masks(outputs: Optional[Dict[str, Any]]) -> Dict[int, np.ndarray]:
         int(obj_id): np.asarray(mask, dtype=bool).copy()
         for obj_id, mask in zip(obj_ids, masks)
     }
-
-
-def render_overlay(
-    frame_rgb: np.ndarray, masks_by_obj: Dict[int, np.ndarray]
-) -> np.ndarray:
-    overlay = frame_rgb.copy().astype(np.float32)
-    for obj_id, mask in sorted(masks_by_obj.items()):
-        color = MASK_COLORS[obj_id % len(MASK_COLORS)]
-        mask_bool = mask.astype(bool)
-        for channel in range(3):
-            overlay[:, :, channel] = np.where(
-                mask_bool,
-                overlay[:, :, channel] * 0.6 + color[channel] * 0.4,
-                overlay[:, :, channel],
-            )
-    return overlay.astype(np.uint8)
 
 
 def render_frame_bgr(
@@ -435,59 +364,6 @@ def render_frame_bgr(
     return rendered
 
 
-def save_overlay(
-    frame_rgb: np.ndarray,
-    masks_by_obj: Dict[int, np.ndarray],
-    output_path: Path,
-    title: Optional[str] = None,
-) -> None:
-    overlay = render_overlay(frame_rgb, masks_by_obj)
-    figure, axis = plt.subplots(1, 1, figsize=(12, 7), dpi=100)
-    axis.imshow(overlay)
-    for obj_id, mask in sorted(masks_by_obj.items()):
-        if mask.any():
-            ys, xs = np.where(mask)
-            color_rgb = MASK_COLORS[obj_id % len(MASK_COLORS)]
-            axis.text(
-                int(xs.mean()),
-                int(ys.mean()),
-                str(obj_id),
-                color="white",
-                fontsize=10,
-                ha="center",
-                va="center",
-                fontweight="bold",
-                bbox=dict(
-                    boxstyle="round,pad=0.2",
-                    facecolor=tuple(c / 255 for c in color_rgb),
-                    alpha=0.8,
-                ),
-            )
-    if title:
-        axis.set_title(title, fontsize=12, fontweight="bold", pad=8)
-    axis.axis("off")
-    figure.tight_layout(pad=0)
-    figure.savefig(output_path, bbox_inches="tight", pad_inches=0)
-    plt.close(figure)
-
-
-def collect_propagation(
-    model: Any, session_id: str
-) -> Dict[int, Dict[int, np.ndarray]]:
-    mask_dict = {}
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for response in model.handle_stream_request(
-            {"type": "propagate_in_video", "session_id": session_id}
-        ):
-            frame_index = response.get("frame_index")
-            if frame_index is not None:
-                mask_dict[int(frame_index)] = normalize_masks(
-                    response.get("outputs", {})
-                )
-    torch.cuda.synchronize()
-    return mask_dict
-
-
 class PropagationRunner:
     def __init__(
         self,
@@ -521,6 +397,7 @@ class PropagationRunner:
             stopped = False
             next_checkpoint_frame = start_frame_index
             max_forward_frame = start_frame_index - 1
+            forward = True
             try:
                 # CUDA's current device is thread-local. Bind this worker to the
                 # caller's device before PyTorch or Triton launches any kernels.
@@ -532,12 +409,23 @@ class PropagationRunner:
                     "propagation_direction": self.propagation_direction,
                     "start_frame_index": start_frame_index,
                 }
+                last_frame_index = None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     for response in self.predictor.handle_stream_request(request):
                         if self.stop_event.is_set():
                             stopped = True
                             break
                         frame_index = int(response["frame_index"])
+                        if (
+                            forward
+                            and last_frame_index is not None
+                            and frame_index < last_frame_index
+                        ):
+                            self.event_queue.put(
+                                ("direction", generation, -1, start_frame_index)
+                            )
+                            forward = False
+                        last_frame_index = frame_index
                         self.event_queue.put(
                             (
                                 "frame",
@@ -550,7 +438,7 @@ class PropagationRunner:
                         # Ignore decreasing frame indices so the backward half does
                         # not overwrite forward checkpoints with a different causal
                         # history.
-                        if frame_index > max_forward_frame:
+                        if forward and frame_index > max_forward_frame:
                             max_forward_frame = frame_index
                             if frame_index >= next_checkpoint_frame:
                                 checkpoint = self.predictor.handle_request(
@@ -636,6 +524,9 @@ class InteractiveApp:
         self.display_index = 0
         self.follow_live = True
         self.playing = True
+        self.playback_direction = 1
+        self.playback_origin: Optional[int] = None
+        self.reverse_ready = False
         self.last_play_time = time.monotonic()
         self.active_obj: Optional[int] = None
         self.status = "initializing"
@@ -670,7 +561,7 @@ class InteractiveApp:
         )
 
     def log_input(self, input_type: str, **payload: Any) -> None:
-        print(
+        tqdm.write(
             "INTERACTION "
             + json.dumps(
                 {
@@ -682,7 +573,7 @@ class InteractiveApp:
                 ensure_ascii=False,
                 sort_keys=True,
             ),
-            flush=True,
+            file=sys.stderr,
         )
 
     def start(self, initial_masks: Dict[int, np.ndarray]) -> None:
@@ -699,33 +590,23 @@ class InteractiveApp:
                 "frame_index": frame_index,
             }
         )
-        cpu_bytes = int(response.get("cpu_bytes", 0))
-        checkpoint_frame = int(response.get("frame_index", frame_index))
-        checkpoint_count = int(response.get("checkpoint_count", 0))
-        print(
-            "CHECKPOINT "
-            + json.dumps(
-                {
-                    "frame_index": checkpoint_frame,
-                    "checkpoint_count": checkpoint_count,
-                    "cpu_bytes": cpu_bytes,
-                    "cpu_mib": round(cpu_bytes / (1024 * 1024), 2),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        self.record_event(
-            "checkpoint_saved",
-            frame_index=checkpoint_frame,
-            checkpoint_count=checkpoint_count,
-            cpu_bytes=cpu_bytes,
-        )
+        self.record_checkpoint(response, frame_index)
         return response
+
+    def record_checkpoint(self, response: Dict[str, Any], fallback_frame: int) -> None:
+        if not response.get("created", True):
+            return
+        frame_index = int(response.get("frame_index", fallback_frame))
+        self.record_event("checkpoint_saved", frame_index=frame_index)
+        tqdm.write(
+            f"saved CPU checkpoint at frame {frame_index} in session {self.session_id}",
+            file=sys.stderr,
+        )
 
     def start_propagation(self, frame_index: int) -> None:
         self.generation += 1
         self.propagation_complete = False
+        self.reverse_ready = False
         if self.propagation_direction == "forward":
             self.stale_frames.update(
                 index for index in self.cache if index >= frame_index
@@ -763,37 +644,25 @@ class InteractiveApp:
                 self.propagation_complete = not stopped
                 if stopped:
                     self.status = "paused"
-                else:
+                elif self.playback_origin is None:
                     self.follow_live = False
                     self.playing = False
                     self.status = "complete - ready for review"
+                else:
+                    if (
+                        self.propagation_direction == "both"
+                        and self.playback_origin == 0
+                    ):
+                        self.reverse_ready = True
+                    self.status = "playing propagated frames"
                 self.record_event(
                     "propagation_end", generation=generation, stopped=stopped
                 )
             elif event_type == "checkpoint":
-                checkpoint = value
-                cpu_bytes = int(checkpoint.get("cpu_bytes", 0))
-                checkpoint_frame = int(checkpoint["frame_index"])
-                checkpoint_count = int(checkpoint.get("checkpoint_count", 0))
-                print(
-                    "CHECKPOINT "
-                    + json.dumps(
-                        {
-                            "frame_index": checkpoint_frame,
-                            "checkpoint_count": checkpoint_count,
-                            "cpu_bytes": cpu_bytes,
-                            "cpu_mib": round(cpu_bytes / (1024 * 1024), 2),
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-                self.record_event(
-                    "checkpoint_saved",
-                    frame_index=checkpoint_frame,
-                    checkpoint_count=checkpoint_count,
-                    cpu_bytes=cpu_bytes,
-                )
+                self.record_checkpoint(value, self.display_index)
+            elif event_type == "direction":
+                self.reverse_ready = True
+                self.status = "propagating backward"
             elif event_type == "error":
                 self.fatal_error = value
                 self.status = "error"
@@ -818,6 +687,7 @@ class InteractiveApp:
             return
         self.follow_live = False
         self.playing = False
+        self.playback_origin = None
         self.set_display_index(frame_index, programmatic=True)
 
     def image_coordinates(self, x: int, y: int) -> Tuple[int, int]:
@@ -858,6 +728,9 @@ class InteractiveApp:
         )
 
     def add_point(self, x: int, y: int, label: int) -> None:
+        if self.playing:
+            self.status = "pause playback before editing"
+            return
         if self.active_obj is None:
             self.status = "select an object first"
             return
@@ -868,8 +741,7 @@ class InteractiveApp:
         point_count = sum(
             1
             for point in [*self.confirmed_points, *self.draft_points]
-            if (point.frame_index, point.obj_id)
-            == (frame_index, int(self.active_obj))
+            if (point.frame_index, point.obj_id) == (frame_index, int(self.active_obj))
         )
         if point_count >= MAX_PROMPT_POINTS:
             self.status = (
@@ -882,6 +754,7 @@ class InteractiveApp:
             self.edit_frame = self.display_index
             self.follow_live = False
             self.playing = False
+            self.playback_origin = None
         self.sequence += 1
         point = PointEdit(
             self.sequence, int(self.edit_frame), int(self.active_obj), x, y, label
@@ -1039,6 +912,15 @@ class InteractiveApp:
         )
         self.save_checkpoint(frame_index)
         self.start_propagation(frame_index)
+        self.start_playback_cycle(frame_index)
+
+    def start_playback_cycle(self, frame_index: int) -> None:
+        self.playback_origin = frame_index
+        self.playback_direction = 1
+        self.follow_live = False
+        self.playing = True
+        self.last_play_time = time.monotonic()
+        self.set_display_index(frame_index, programmatic=True)
 
     def reset_edit_state(self) -> None:
         self.editing = False
@@ -1149,9 +1031,7 @@ class InteractiveApp:
                 f"no checkpoint is available at or before frame {target_frame_index}"
             )
         checkpoint_frame = int(response["frame_index"])
-        self.stale_frames.update(
-            range(checkpoint_frame + 1, self.frame_count)
-        )
+        self.stale_frames.update(range(checkpoint_frame + 1, self.frame_count))
         if checkpoint_frame < target_frame_index:
             replay_start = checkpoint_frame + 1
             self.status = (
@@ -1171,7 +1051,6 @@ class InteractiveApp:
             "checkpoint_restored",
             checkpoint_frame=checkpoint_frame,
             target_frame=target_frame_index,
-            cpu_bytes=int(response.get("cpu_bytes", 0)),
         )
 
     def restore_confirmed_state(self) -> None:
@@ -1233,9 +1112,31 @@ class InteractiveApp:
         if now - self.last_play_time < 1.0 / self.video_info.fps:
             return
         self.last_play_time = now
-        later = sorted(index for index in self.cache if index > self.display_index)
-        if later:
-            self.set_display_index(later[0], programmatic=True)
+        next_frame = self.display_index + self.playback_direction
+        if 0 <= next_frame < self.frame_count:
+            if next_frame in self.cache and next_frame not in self.stale_frames:
+                self.set_display_index(next_frame, programmatic=True)
+            return
+        if (
+            self.playback_direction > 0
+            and self.reverse_ready
+            and self.playback_origin is not None
+        ):
+            self.playback_direction = -1
+            self.set_display_index(int(self.playback_origin), programmatic=True)
+            self.status = "playing backward"
+        elif (
+            self.playback_direction > 0
+            and self.propagation_direction == "forward"
+            and self.propagation_complete
+        ):
+            self.playing = False
+            self.playback_origin = None
+            self.status = "complete - ready for review"
+        elif self.playback_direction < 0:
+            self.playing = False
+            self.playback_origin = None
+            self.status = "complete - ready for review"
 
     def handle_key(self, key: int) -> bool:
         key_names = {
@@ -1264,6 +1165,7 @@ class InteractiveApp:
             self.confirm()
         elif key == ord(" ") and not self.editing:
             self.follow_live = False
+            self.playback_origin = None
             if self.runner.is_alive:
                 self.stop_propagation()
                 self.playing = False
@@ -1299,7 +1201,7 @@ class InteractiveApp:
         write_interactive_outputs(self)
 
     def run(self) -> None:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow(WINDOW_NAME, WINDOW_FLAGS)
         self.window_open = True
         cv2.createTrackbar(
             "frame", WINDOW_NAME, 0, max(0, self.frame_count - 1), self.on_trackbar
@@ -1456,61 +1358,6 @@ def run_interactive(
         predictor.handle_request({"type": "close_session", "session_id": session_id})
 
 
-def run_batch(
-    predictor: Any, version: str, frame_dir: Path, frame_count: int, text_prompt: str
-) -> None:
-    image = load_frame(frame_dir, 0)
-    image_height, image_width = image.shape[:2]
-    print(f"Video: {image_width}x{image_height}, {frame_count} frames")
-    response = predictor.handle_request(
-        {"type": "start_session", "resource_path": str(frame_dir)}
-    )
-    session_id = response["session_id"]
-    try:
-        out_dir = Path(OUTPUT_DIR) / f"{version}_text_{text_prompt}"
-        if out_dir.exists():
-            shutil.rmtree(out_dir)
-        out_dir.mkdir(parents=True)
-        print(f"\nTest: text prompt '{text_prompt}' -> propagate")
-        predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": 0,
-                "text": text_prompt,
-            }
-        )
-        masks_by_frame = collect_propagation(predictor, session_id)
-        print(f"Propagated through {len(masks_by_frame)} frames")
-        saved = 0
-        for frame_index in sorted(masks_by_frame):
-            if frame_index % 5 != 0 or not masks_by_frame[frame_index]:
-                continue
-            save_overlay(
-                load_frame(frame_dir, frame_index),
-                masks_by_frame[frame_index],
-                out_dir / f"frame_{frame_index:05d}.png",
-                title=f"{version} | frame {frame_index} | "
-                f"{len(masks_by_frame[frame_index])} objects",
-            )
-            saved += 1
-        frame_zero = masks_by_frame.get(0, {})
-        print(f"\nDetected {len(frame_zero)} objects on frame 0:")
-        for obj_id, mask in sorted(frame_zero.items()):
-            if mask.any():
-                ys, xs = np.where(mask)
-                print(
-                    f"  obj {obj_id}: centroid ({int(xs.mean())}, {int(ys.mean())}), "
-                    f"{int(mask.sum())} pixels"
-                )
-        print(f"\nSaved {saved} overlay images to {out_dir}")
-        print(
-            "QUALITATIVE TEST PASSED" if frame_zero else "WARNING: No objects detected!"
-        )
-    finally:
-        predictor.handle_request({"type": "close_session", "session_id": session_id})
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive SAM3 qualitative test")
     parser.add_argument("--version", default="sam3.1", choices=["sam3", "sam3.1"])
@@ -1529,7 +1376,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="CUDA device (default: cuda:0)",
     )
     parser.add_argument(
-        "--output-dir", required=True, help="Directory for the result video and metadata"
+        "--output-dir",
+        required=True,
+        help="Directory for the result video and metadata",
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="Replace existing interactive outputs"

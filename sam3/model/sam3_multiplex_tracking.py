@@ -14,7 +14,7 @@ from sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
 from sam3.model.data_misc import BatchedDatapoint
 from sam3.model.sam3_multiplex_base import MaskletConfirmationStatus, Sam3MultiplexBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
-from sam3.model.sam3_video_inference import is_image_type
+from sam3.model.sam3_video_inference import _frame_progress, is_image_type
 from sam3.perflib.compile import (
     clone_output_wrapper,
     compile_wrapper,
@@ -345,8 +345,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # Batch postprocessing: accumulate yield_list entries and process every postprocess_batch_size frames
         postprocess_yield_list = []
 
-        for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
+        for frame_idx in _frame_progress(
+            processing_order,
+            inference_state["num_frames"],
+            reverse,
+            desc="propagate_in_video",
+            disable=self.rank > 0,
         ):
             out = self._run_single_frame_inference(
                 inference_state,
@@ -1934,8 +1938,12 @@ class Sam3MultiplexTrackingProd(Sam3MultiplexTracking):
         # e.g., we output an object on frame 4 only if it becomes confirmed on frame 6.
         unconfirmed_status_delay = self.masklet_confirmation_consecutive_det_thresh - 1
 
-        for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
+        for frame_idx in _frame_progress(
+            processing_order,
+            inference_state["num_frames"],
+            reverse,
+            desc="propagate_in_video",
+            disable=self.rank > 0,
         ):
             out = self._run_single_frame_inference(
                 inference_state,
@@ -2345,7 +2353,9 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
 
         # if fetch just return from output
         if propagation_type == "propagation_fetch":
-            for frame_idx in tqdm(processing_order):
+            for frame_idx in _frame_progress(
+                processing_order, inference_state["num_frames"], reverse
+            ):
                 if self.rank == 0:
                     frame_idx, out = self.fetch_and_process_single_frame_results(
                         inference_state, frame_idx
@@ -2368,7 +2378,9 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
                     sam2_state, run_mem_encoder=True
                 )
 
-        for frame_idx in tqdm(processing_order):
+        for frame_idx in _frame_progress(
+            processing_order, inference_state["num_frames"], reverse
+        ):
             # run SAM2 propagation
             if propagation_type == "propagation_partial":
                 self._prepare_backbone_feats(inference_state, frame_idx, reverse)

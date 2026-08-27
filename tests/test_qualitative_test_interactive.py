@@ -1,5 +1,6 @@
 import json
 from contextlib import nullcontext
+from io import StringIO
 from pathlib import Path
 
 import cv2
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
+from sam3.model.sam3_video_inference import _frame_progress
 from scripts import qualitative_test_interactive as qualitative
 
 
@@ -18,12 +20,12 @@ class FakePredictor:
     def handle_request(self, request):
         self.requests.append(request)
         if request["type"] == "save_checkpoint":
+            created = request["frame_index"] not in self.checkpoint_frames
             self.checkpoint_frames.add(request["frame_index"])
             return {
                 "is_success": True,
                 "frame_index": request["frame_index"],
-                "checkpoint_count": len(self.checkpoint_frames),
-                "cpu_bytes": 1024,
+                "created": created,
             }
         if request["type"] == "restore_checkpoint":
             candidates = [
@@ -34,12 +36,10 @@ class FakePredictor:
             return {
                 "is_success": bool(candidates),
                 "frame_index": max(candidates) if candidates else None,
-                "checkpoint_count": len(self.checkpoint_frames),
-                "cpu_bytes": 1024,
             }
         if request["type"] == "clear_checkpoints":
             self.checkpoint_frames.clear()
-            return {"is_success": True, "checkpoint_count": 0, "cpu_bytes": 0}
+            return {"is_success": True}
         obj_id = request.get("obj_id", 1)
         mask = np.zeros((8, 10), dtype=bool)
         mask[2:6, 3:8] = True
@@ -66,6 +66,14 @@ class FakePredictor:
             }
 
 
+def test_forward_progress_uses_absolute_frame_numbers() -> None:
+    progress = _frame_progress(range(50, 200), 200, reverse=False, file=StringIO())
+
+    assert (progress.n, progress.total) == (50, 200)
+    list(progress)
+    assert progress.n == 200
+
+
 def test_parser_has_no_interactive_switch() -> None:
     args = qualitative.build_parser().parse_args(
         ["--video", "input.mp4", "--output-dir", "output"]
@@ -74,6 +82,19 @@ def test_parser_has_no_interactive_switch() -> None:
     assert not hasattr(args, "interactive")
     assert args.propagation_direction == "both"
     assert args.checkpoint_interval == 20
+    assert qualitative.WINDOW_FLAGS & cv2.WINDOW_GUI_NORMAL
+
+    forward = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            "input.mp4",
+            "--output-dir",
+            "output",
+            "--propagation-direction",
+            "forward",
+        ]
+    )
+    assert forward.propagation_direction == "forward"
 
 
 def test_propagation_thread_binds_callers_cuda_device(monkeypatch) -> None:
@@ -103,28 +124,42 @@ def test_propagation_thread_binds_callers_cuda_device(monkeypatch) -> None:
         lambda **kwargs: nullcontext(),
     )
     runner = qualitative.PropagationRunner(
-        StreamingPredictor(), qualitative.queue.Queue(), "forward"
+        StreamingPredictor(), qualitative.queue.Queue(), "both"
     )
 
     runner.start("session", start_frame_index=0, generation=1)
     runner.join()
 
-    assert calls == [("set_device", 3), ("predict", "session", "forward")]
+    assert calls == [("set_device", 3), ("predict", "session", "both")]
 
 
-def test_parser_accepts_forward_only_propagation() -> None:
-    args = qualitative.build_parser().parse_args(
-        [
-            "--video",
-            "input.mp4",
-            "--output-dir",
-            "output",
-            "--propagation-direction",
-            "forward",
-        ]
+def test_propagation_thread_reports_backward_phase(monkeypatch) -> None:
+    class StreamingPredictor:
+        def handle_stream_request(self, request):
+            for frame_index in (1, 2, 0):
+                yield {"frame_index": frame_index, "outputs": {}}
+
+        def handle_request(self, request):
+            return {
+                "is_success": True,
+                "frame_index": request["frame_index"],
+                "created": True,
+            }
+
+    monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(qualitative.torch, "autocast", lambda **kwargs: nullcontext())
+    events = qualitative.queue.Queue()
+    runner = qualitative.PropagationRunner(
+        StreamingPredictor(), events, "both", checkpoint_interval=100
     )
 
-    assert args.propagation_direction == "forward"
+    runner.start("session", start_frame_index=1, generation=3)
+    runner.join()
+
+    queued = []
+    while not events.empty():
+        queued.append(events.get_nowait())
+    assert ("direction", 3, -1, 1) in queued
 
 
 def make_app(
@@ -135,7 +170,7 @@ def make_app(
     for frame_index in range(3):
         frame = np.full((8, 10, 3), 30 + frame_index, dtype=np.uint8)
         assert cv2.imwrite(str(frame_dir / f"{frame_index:05d}.jpg"), frame)
-    return qualitative.InteractiveApp(
+    app = qualitative.InteractiveApp(
         predictor=FakePredictor(),
         version="sam3.1",
         session_id="session",
@@ -148,6 +183,9 @@ def make_app(
         window_width=1280,
         propagation_direction=propagation_direction,
     )
+    app.follow_live = False
+    app.playing = False
+    return app
 
 
 def test_normalize_masks_copies_and_indexes_masks() -> None:
@@ -186,6 +224,12 @@ def test_left_and_right_click_pause_then_build_global_draft(tmp_path: Path) -> N
     app.active_obj = 4
     stops = []
     app.stop_propagation = lambda: stops.append(True)
+
+    app.playing = True
+    app.add_point(2, 3, 1)
+    assert not app.draft_points
+    assert app.status == "pause playback before editing"
+    app.playing = False
 
     app.add_point(2, 3, 1)
     app.active_obj = 8
@@ -254,6 +298,9 @@ def test_forward_propagation_only_invalidates_later_frames(tmp_path: Path) -> No
 
 def test_space_pauses_propagation_and_playback(tmp_path: Path) -> None:
     app = make_app(tmp_path)
+    app.playing = True
+    point = qualitative.PointEdit(1, 0, 3, 4, 2, 1)
+    app.confirmed_points = [point]
     app.runner.thread = type("LiveThread", (), {"is_alive": lambda self: True})()
     stopped = []
     app.stop_propagation = lambda: stopped.append(True)
@@ -264,6 +311,57 @@ def test_space_pauses_propagation_and_playback(tmp_path: Path) -> None:
     assert not app.follow_live
     assert not app.playing
     assert app.status == "paused"
+    assert app.confirmed_points == [point]
+
+
+def test_playback_waits_for_fresh_frames_then_reverses(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}, 2: {}}
+    app.stale_frames = {0, 2}
+    app.start_playback_cycle(1)
+
+    app.last_play_time = 0
+    app.advance_playback()
+    assert app.display_index == 1
+
+    app.stale_frames.discard(2)
+    app.last_play_time = 0
+    app.advance_playback()
+    assert app.display_index == 2
+
+    app.reverse_ready = True
+    app.last_play_time = 0
+    app.advance_playback()
+    assert app.display_index == 1
+    assert app.playback_direction == -1
+
+    app.last_play_time = 0
+    app.advance_playback()
+    assert app.display_index == 1
+    app.stale_frames.discard(0)
+    app.last_play_time = 0
+    app.advance_playback()
+    assert app.display_index == 0
+    app.last_play_time = 0
+    app.advance_playback()
+    assert not app.playing
+    assert app.playback_origin is None
+
+
+def test_forward_playback_stops_at_end(tmp_path: Path) -> None:
+    app = make_app(tmp_path, propagation_direction="forward")
+    app.cache = {0: {}, 1: {}, 2: {}}
+    app.stale_frames = set()
+    app.start_playback_cycle(1)
+    app.display_index = 2
+    app.propagation_complete = True
+
+    app.last_play_time = 0
+    app.advance_playback()
+
+    assert not app.playing
+    assert app.playback_origin is None
+    assert app.display_index == 2
 
 
 def test_preview_then_enter_commits_once_and_starts_propagation(tmp_path: Path) -> None:
@@ -291,6 +389,31 @@ def test_preview_then_enter_commits_once_and_starts_propagation(tmp_path: Path) 
     assert app.commits[0].point_sequences == (point_sequence,)
     assert starts == [0]
     assert len(add_requests) == 1
+    assert app.playing
+    assert not app.follow_live
+    assert app.playback_origin == 0
+
+
+def test_points_on_multiple_frames_are_applied_independently(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.confirmed_points = [
+        qualitative.PointEdit(1, 0, 5, 2, 3, 1),
+        qualitative.PointEdit(2, 2, 5, 7, 6, 0),
+    ]
+
+    app.apply_points([(0, 5), (2, 5)])
+
+    requests = [
+        request
+        for request in app.predictor.requests
+        if request.get("type") == "add_prompt" and "points" in request
+    ]
+    assert [
+        (request["frame_index"], request["point_labels"]) for request in requests
+    ] == [
+        (0, [1]),
+        (2, [0]),
+    ]
 
 
 def test_preview_rollback_restores_checkpoint_without_reloading_frames(
@@ -388,22 +511,26 @@ def test_cpu_checkpoints_reuse_unchanged_tensor_snapshots() -> None:
         "checkpoint_tensor_cache": {},
     }
 
-    first = predictor.save_checkpoint("session", 1)
-    state["previous_stages_out"][2] = "done"
+    predictor.save_checkpoint("session", 1)
     second = predictor.save_checkpoint("session", 2)
+    duplicate = predictor.save_checkpoint("session", 2)
+    checkpoints = predictor._all_inference_states["session"]["checkpoints"]
+    first_snapshot = checkpoints[1]["tracker_inference_states"][0]["memory"]
+    second_snapshot = checkpoints[2]["tracker_inference_states"][0]["memory"]
     tracked.fill_(99)
     restored = predictor.restore_checkpoint("session", 1)
 
-    assert first["cpu_bytes"] == tracked.untyped_storage().nbytes()
-    assert second["cpu_bytes"] == first["cpu_bytes"]
+    assert first_snapshot is second_snapshot
+    assert second["created"] and not duplicate["created"]
     assert restored["frame_index"] == 1
     restored_memory = predictor._all_inference_states["session"]["state"][
         "tracker_inference_states"
     ][0]["memory"]
     assert torch.equal(restored_memory, torch.arange(8, dtype=torch.bfloat16))
-    assert "temporary" not in predictor._all_inference_states["session"]["state"][
-        "feature_cache"
-    ]
+    assert (
+        "temporary"
+        not in predictor._all_inference_states["session"]["state"]["feature_cache"]
+    )
 
 
 def test_cpu_checkpoints_support_mutated_inference_tensors() -> None:
@@ -494,9 +621,7 @@ def test_c_clears_all_interactions_and_restarts_text_propagation(
     assert not app.editing
     assert app.active_obj is None
     assert starts == [0]
-    assert any(
-        event["type"] == "clear_all_interactions" for event in app.events
-    )
+    assert any(event["type"] == "clear_all_interactions" for event in app.events)
     request_types = [request["type"] for request in app.predictor.requests]
     assert "reset_session" in request_types
     assert "close_session" not in request_types
@@ -512,7 +637,7 @@ def test_mouse_clicks_and_keyboard_keys_are_logged(tmp_path: Path, capsys) -> No
     app.on_mouse(cv2.EVENT_RBUTTONDOWN, 6, 7, 0, None)
     assert app.handle_key(ord("x"))
 
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert output.count("INTERACTION ") == 4
     assert '"button": "left"' in output
     assert '"button": "middle"' in output
