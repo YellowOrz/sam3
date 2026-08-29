@@ -47,6 +47,7 @@ class FakePredictor:
             "frame_index": request.get("frame_index", 0),
             "outputs": {
                 "out_obj_ids": np.array([obj_id]),
+                "out_probs": np.array([0.75]),
                 "out_binary_masks": mask[None],
             },
         }
@@ -61,6 +62,7 @@ class FakePredictor:
                 "frame_index": frame_index,
                 "outputs": {
                     "out_obj_ids": np.array([1]),
+                    "out_probs": np.array([0.75]),
                     "out_binary_masks": mask[None],
                 },
             }
@@ -203,6 +205,55 @@ def test_normalize_masks_copies_and_indexes_masks() -> None:
     masks[:] = 0
     assert result[11][3, 4]
     assert qualitative.normalize_masks(None) == {}
+
+
+def test_render_frame_matches_dataset_annotations(monkeypatch) -> None:
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[5:15, 10:20] = True
+    texts = []
+    original_put_text = cv2.putText
+
+    def capture_text(image, text, *args):
+        texts.append(text)
+        return original_put_text(image, text, *args)
+
+    monkeypatch.setattr(cv2, "putText", capture_text)
+
+    qualitative.render_frame_bgr(
+        frame,
+        {7: mask},
+        probabilities_by_obj={7: 0.876},
+        object_to_label={7: 1},
+        frame_index=3,
+        prompt="hand",
+    )
+
+    assert "label=1 id=7 p=0.88" in texts
+    assert "frame=3 prompt=hand" in texts
+    assert qualitative.EDGE_HALO_THICKNESS == 2
+    assert qualitative.EDGE_COLOR_THICKNESS == 1
+
+
+def test_overlapping_masks_blend_both_instance_colors(monkeypatch) -> None:
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    mask = np.ones((20, 20), dtype=bool)
+    monkeypatch.setattr(cv2, "drawContours", lambda image, *args: image)
+    monkeypatch.setattr(cv2, "putText", lambda image, *args: image)
+
+    rendered = qualitative.render_frame_bgr(
+        frame,
+        {1: mask, 2: mask},
+        object_to_label={1: 1, 2: 2},
+    )
+
+    first = np.asarray(qualitative.COLORS[0], dtype=np.float32)
+    second = np.asarray(qualitative.COLORS[1], dtype=np.float32)
+    expected = (
+        first * qualitative.MASK_ALPHA * (1.0 - qualitative.MASK_ALPHA)
+        + second * qualitative.MASK_ALPHA
+    ).astype(np.uint8)
+    assert np.array_equal(rendered[10, 10], expected)
 
 
 def test_middle_click_cycles_overlapping_objects_smallest_first(tmp_path: Path) -> None:
@@ -645,20 +696,27 @@ def test_mouse_clicks_and_keyboard_keys_are_logged(tmp_path: Path, capsys) -> No
     assert '"key": "x"' in output
 
 
-def test_interactive_outputs_write_only_video_and_json(tmp_path: Path) -> None:
+def test_interactive_outputs_write_mask_video_and_metadata(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     mask = np.zeros((8, 10), dtype=bool)
     mask[2:6, 3:8] = True
     app.cache = {frame_index: {1: mask} for frame_index in range(3)}
+    app.probability_cache = {
+        frame_index: {1: 0.75} for frame_index in range(3)
+    }
     app.confirmed_points = [qualitative.PointEdit(1, 1, 1, 4, 3, 1)]
     app.events = [{"sequence": 1, "type": "confirm"}]
 
     qualitative.write_interactive_outputs(app)
 
     result_path = app.output_dir / "result.mp4"
-    metadata_path = app.output_dir / "interactions.json"
+    masks_path = app.output_dir / "masks.mkv"
+    metadata_path = app.output_dir / "metadata.json"
+    interactions_path = app.output_dir / "interactions.json"
     assert result_path.is_file()
+    assert masks_path.is_file()
     assert metadata_path.is_file()
+    assert interactions_path.is_file()
     assert not list(app.output_dir.glob("*.png"))
     capture = cv2.VideoCapture(str(result_path))
     try:
@@ -667,10 +725,23 @@ def test_interactive_outputs_write_only_video_and_json(tmp_path: Path) -> None:
         assert capture.get(cv2.CAP_PROP_FPS) == 12.0
     finally:
         capture.release()
+    capture = cv2.VideoCapture(str(masks_path))
+    try:
+        assert capture.isOpened()
+        assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 3
+        ok, labels = capture.read()
+        assert ok
+        assert set(np.unique(labels)) == {0, 1}
+    finally:
+        capture.release()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["source"]["fps"] == 12.0
-    assert metadata["propagation_direction"] == "both"
-    assert metadata["confirmed_points"][0]["frame_index"] == 1
+    assert metadata["frames_processed"] == 3
+    assert metadata["object_id_to_label"] == {"1": 1}
+    assert metadata["outputs"]["instance_masks_codec"] == "FFV1"
+    interactions = json.loads(interactions_path.read_text(encoding="utf-8"))
+    assert interactions["propagation_direction"] == "both"
+    assert interactions["confirmed_points"][0]["frame_index"] == 1
 
 
 def test_existing_output_requires_overwrite(tmp_path: Path) -> None:

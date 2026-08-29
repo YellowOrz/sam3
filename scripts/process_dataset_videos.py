@@ -48,8 +48,9 @@ COLORS = (
     (255, 60, 160),
     (160, 60, 255),
 )
-EDGE_HALO_THICKNESS = 4
-EDGE_COLOR_THICKNESS = 2
+MASK_ALPHA = 0.30
+EDGE_HALO_THICKNESS = 2
+EDGE_COLOR_THICKNESS = 1
 
 
 def utc_now() -> str:
@@ -268,7 +269,7 @@ def build_label_and_overlay(
     object_to_label: Dict[int, int],
     frame_index: int,
     prompt: str,
-    alpha: float = 0.45,
+    alpha: float = MASK_ALPHA,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Convert model masks into an 8-bit label image and annotated BGR frame."""
     height, width = frame.shape[:2]

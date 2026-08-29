@@ -46,6 +46,8 @@
 --------
 
 * ``result.mp4``：使用原视频帧率、叠加最终 mask 的完整视频。
+* ``masks.mkv``：FFV1 无损灰度标签视频；0 为背景，1--255 为对象标签。
+* ``metadata.json``：输入、模型、对象标签映射和输出格式元数据。
 * ``interactions.json``：文本提示、确认点和交互事件记录。
 """
 
@@ -73,28 +75,23 @@ from tqdm.auto import tqdm
 WINDOW_NAME = "SAM 3 interactive video"
 WINDOW_FLAGS = cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL
 MAX_PROMPT_POINTS = 16
-MASK_COLORS = [
-    (255, 0, 0),
-    (0, 255, 0),
-    (0, 0, 255),
-    (255, 255, 0),
-    (255, 0, 255),
-    (0, 255, 255),
-    (255, 128, 0),
-    (128, 0, 255),
-    (0, 128, 255),
-    (255, 64, 128),
-    (128, 255, 0),
-    (64, 128, 255),
-    (255, 200, 0),
-    (0, 200, 128),
-    (200, 0, 128),
-    (128, 128, 255),
-    (255, 128, 128),
-    (128, 255, 128),
-    (128, 128, 0),
-    (0, 128, 128),
-]
+COLORS = (
+    (60, 60, 255),
+    (60, 220, 60),
+    (255, 100, 60),
+    (60, 220, 220),
+    (220, 60, 220),
+    (220, 180, 60),
+    (120, 60, 255),
+    (255, 160, 60),
+    (60, 160, 255),
+    (180, 255, 60),
+    (255, 60, 160),
+    (160, 60, 255),
+)
+MASK_ALPHA = 0.30
+EDGE_HALO_THICKNESS = 2
+EDGE_COLOR_THICKNESS = 1
 
 
 @dataclass(frozen=True)
@@ -245,57 +242,112 @@ def normalize_masks(outputs: Optional[Dict[str, Any]]) -> Dict[int, np.ndarray]:
     }
 
 
+def normalize_frame_outputs(
+    outputs: Optional[Dict[str, Any]],
+) -> Tuple[Dict[int, np.ndarray], Dict[int, float]]:
+    masks = normalize_masks(outputs)
+    if not outputs:
+        return masks, {}
+    obj_ids = as_numpy(outputs.get("out_obj_ids")).reshape(-1)
+    probabilities = as_numpy(outputs.get("out_probs")).reshape(-1)
+    if len(probabilities) not in (0, len(obj_ids)):
+        raise RuntimeError(
+            f"object and probability counts differ: "
+            f"{len(obj_ids)} != {len(probabilities)}"
+        )
+    return masks, {
+        int(obj_id): float(probability)
+        for obj_id, probability in zip(obj_ids, probabilities)
+    }
+
+
+def color_for_label(label: int) -> Tuple[int, int, int]:
+    return COLORS[(label - 1) % len(COLORS)]
+
+
+def lighter_color(
+    color: Tuple[int, int, int], amount: float = 0.45
+) -> Tuple[int, int, int]:
+    return tuple(round(channel + (255 - channel) * amount) for channel in color)
+
+
 def render_frame_bgr(
     frame: np.ndarray,
     masks_by_obj: Dict[int, np.ndarray],
+    probabilities_by_obj: Optional[Dict[int, float]] = None,
+    object_to_label: Optional[Dict[int, int]] = None,
+    frame_index: Optional[int] = None,
+    prompt: Optional[str] = None,
     points: Sequence[PointEdit] = (),
     active_obj: Optional[int] = None,
     stale: bool = False,
     status: Optional[str] = None,
 ) -> np.ndarray:
+    probabilities_by_obj = probabilities_by_obj or {}
+    object_to_label = object_to_label or {}
     blended = frame.astype(np.float32)
-    for obj_id, mask in sorted(masks_by_obj.items()):
+    for obj_id, mask in masks_by_obj.items():
         mask_bool = mask.astype(bool)
         if mask_bool.shape != frame.shape[:2]:
             raise RuntimeError(
                 f"mask dimensions {mask_bool.shape} differ from frame {frame.shape[:2]}"
             )
-        rgb = MASK_COLORS[obj_id % len(MASK_COLORS)]
-        color = np.array((rgb[2], rgb[1], rgb[0]), dtype=np.float32)
-        blended[mask_bool] = blended[mask_bool] * 0.55 + color * 0.45
-    rendered = blended.astype(np.uint8)
-    for obj_id, mask in sorted(masks_by_obj.items()):
-        contours, _ = cv2.findContours(
-            mask.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        label = object_to_label.get(obj_id, obj_id)
+        color = np.asarray(color_for_label(label), dtype=np.float32)
+        blended[mask_bool] = (
+            blended[mask_bool] * (1.0 - MASK_ALPHA) + color * MASK_ALPHA
         )
-        rgb = MASK_COLORS[obj_id % len(MASK_COLORS)]
-        color = (rgb[2], rgb[1], rgb[0])
-        thickness = 4 if obj_id == active_obj else 2
-        cv2.drawContours(rendered, contours, -1, (255, 255, 255), thickness + 2)
-        cv2.drawContours(rendered, contours, -1, color, thickness)
+    rendered = blended.astype(np.uint8)
+    for obj_id, mask in masks_by_obj.items():
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+        label = object_to_label.get(obj_id, obj_id)
+        color = color_for_label(label)
+        cv2.drawContours(
+            rendered,
+            contours,
+            -1,
+            lighter_color(color),
+            EDGE_HALO_THICKNESS,
+            cv2.LINE_AA,
+        )
+        cv2.drawContours(
+            rendered,
+            contours,
+            -1,
+            color,
+            EDGE_COLOR_THICKNESS,
+            cv2.LINE_AA,
+        )
         ys, xs = np.where(mask)
         if len(xs):
-            center = (int(xs.mean()), int(ys.mean()))
+            center = (int(np.median(xs)), int(np.median(ys)))
+            text = f"label={label} id={obj_id}"
+            if obj_id in probabilities_by_obj:
+                text += f" p={probabilities_by_obj[obj_id]:.2f}"
             cv2.putText(
                 rendered,
-                str(obj_id),
-                center,
+                text,
+                (max(0, center[0] - 40), max(18, center[1])),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                3,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                rendered,
-                str(obj_id),
-                center,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.48,
                 color,
                 1,
                 cv2.LINE_AA,
             )
+    if frame_index is not None and prompt is not None:
+        safe_prompt = prompt.encode("ascii", errors="replace").decode("ascii")
+        cv2.putText(
+            rendered,
+            f"frame={frame_index} prompt={safe_prompt}",
+            (10, 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     for point in points:
         if point.label == 1:
             cv2.line(
@@ -431,7 +483,9 @@ class PropagationRunner:
                                 "frame",
                                 generation,
                                 frame_index,
-                                normalize_masks(response.get("outputs", {})),
+                                normalize_frame_outputs(
+                                    response.get("outputs", {})
+                                ),
                             )
                         )
                         # The bidirectional stream yields its forward half first.
@@ -520,6 +574,7 @@ class InteractiveApp:
         self.generation = 0
         self.propagation_complete = False
         self.cache: Dict[int, Dict[int, np.ndarray]] = {}
+        self.probability_cache: Dict[int, Dict[int, float]] = {}
         self.stale_frames: set[int] = set()
         self.display_index = 0
         self.follow_live = True
@@ -576,8 +631,15 @@ class InteractiveApp:
             file=sys.stderr,
         )
 
-    def start(self, initial_masks: Dict[int, np.ndarray]) -> None:
-        self.cache[0] = initial_masks
+    def store_frame_outputs(
+        self, frame_index: int, outputs: Optional[Dict[str, Any]]
+    ) -> None:
+        masks, probabilities = normalize_frame_outputs(outputs)
+        self.cache[frame_index] = masks
+        self.probability_cache[frame_index] = probabilities
+
+    def start(self, initial_outputs: Optional[Dict[str, Any]]) -> None:
+        self.store_frame_outputs(0, initial_outputs)
         self.record_event("initial_prompt", frame_index=0, text=self.prompt)
         self.save_checkpoint(0)
         self.start_propagation(0)
@@ -635,7 +697,9 @@ class InteractiveApp:
                 continue
             if event_type == "frame":
                 frame_index = int(value)
-                self.cache[frame_index] = extra
+                masks, probabilities = extra
+                self.cache[frame_index] = masks
+                self.probability_cache[frame_index] = probabilities
                 self.stale_frames.discard(frame_index)
                 if self.follow_live and not self.editing:
                     self.set_display_index(frame_index, programmatic=True)
@@ -846,7 +910,7 @@ class InteractiveApp:
                     "rel_coordinates": True,
                 }
             )
-            self.cache[frame_index] = normalize_masks(response.get("outputs", {}))
+            self.store_frame_outputs(frame_index, response.get("outputs", {}))
             self.stale_frames.discard(frame_index)
 
     def preview(self) -> None:
@@ -989,7 +1053,7 @@ class InteractiveApp:
                     "rel_coordinates": True,
                 }
             )
-            self.cache[frame_index] = normalize_masks(response.get("outputs", {}))
+            self.store_frame_outputs(frame_index, response.get("outputs", {}))
 
     def synchronous_propagation(
         self,
@@ -1012,7 +1076,7 @@ class InteractiveApp:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for response in self.predictor.handle_stream_request(request):
                 frame_index = int(response["frame_index"])
-                self.cache[frame_index] = normalize_masks(response.get("outputs", {}))
+                self.store_frame_outputs(frame_index, response.get("outputs", {}))
                 self.stale_frames.discard(frame_index)
         self.propagation_complete = True
 
@@ -1070,7 +1134,7 @@ class InteractiveApp:
                 "text": self.prompt,
             }
         )
-        self.cache[0] = normalize_masks(response.get("outputs", {}))
+        self.store_frame_outputs(0, response.get("outputs", {}))
         self.stale_frames = set(range(self.frame_count))
         self.stale_frames.discard(0)
         committed_sequences: set[int] = set()
@@ -1092,6 +1156,7 @@ class InteractiveApp:
         rendered = render_frame_bgr(
             load_frame_bgr(self.frame_dir, self.display_index),
             self.cache.get(self.display_index, {}),
+            probabilities_by_obj=self.probability_cache.get(self.display_index, {}),
             points=self.current_points_for_display(),
             active_obj=self.active_obj,
             stale=self.display_index in self.stale_frames,
@@ -1237,39 +1302,126 @@ def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     temporary_path.replace(path)
 
 
+def build_label_image(
+    masks_by_obj: Dict[int, np.ndarray],
+    object_to_label: Dict[int, int],
+    width: int,
+    height: int,
+) -> np.ndarray:
+    label_image = np.zeros((height, width), dtype=np.uint8)
+    for obj_id, mask in masks_by_obj.items():
+        if obj_id not in object_to_label:
+            label = len(object_to_label) + 1
+            if label > 255:
+                raise RuntimeError(
+                    "more than 255 tracked instances; uint8 labels overflow"
+                )
+            object_to_label[obj_id] = label
+        if mask.shape != (height, width):
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        label_image[mask.astype(bool)] = object_to_label[obj_id]
+    return label_image
+
+
 def write_interactive_outputs(app: InteractiveApp) -> None:
     app.output_dir.mkdir(parents=True, exist_ok=True)
     result_path = app.output_dir / "result.mp4"
+    masks_path = app.output_dir / "masks.mkv"
     temporary_result = app.output_dir / ".result.tmp.mp4"
-    if temporary_result.exists():
-        temporary_result.unlink()
-    writer = cv2.VideoWriter(
+    temporary_masks = app.output_dir / ".masks.tmp.mkv"
+    for path in (temporary_result, temporary_masks):
+        if path.exists():
+            path.unlink()
+    result_writer = cv2.VideoWriter(
         str(temporary_result),
         cv2.VideoWriter_fourcc(*"mp4v"),
         app.video_info.fps,
         (app.video_info.width, app.video_info.height),
     )
-    if not writer.isOpened():
-        writer.release()
+    if not result_writer.isOpened():
+        result_writer.release()
+        temporary_result.unlink(missing_ok=True)
         raise RuntimeError(f"cannot create output video: {temporary_result}")
+    mask_writer = cv2.VideoWriter(
+        str(temporary_masks),
+        cv2.VideoWriter_fourcc(*"FFV1"),
+        app.video_info.fps,
+        (app.video_info.width, app.video_info.height),
+        isColor=False,
+    )
+    if not mask_writer.isOpened():
+        result_writer.release()
+        mask_writer.release()
+        for path in (temporary_result, temporary_masks):
+            path.unlink(missing_ok=True)
+        raise RuntimeError(f"cannot create lossless mask video: {temporary_masks}")
+    object_to_label: Dict[int, int] = {}
     try:
         for frame_index in range(app.frame_count):
-            points = [p for p in app.confirmed_points if p.frame_index == frame_index]
-            writer.write(
+            masks_by_obj = app.cache[frame_index]
+            label_image = build_label_image(
+                masks_by_obj,
+                object_to_label,
+                app.video_info.width,
+                app.video_info.height,
+            )
+            mask_writer.write(label_image)
+            result_writer.write(
                 render_frame_bgr(
                     load_frame_bgr(app.frame_dir, frame_index),
-                    app.cache[frame_index],
-                    points=points,
+                    masks_by_obj,
+                    probabilities_by_obj=app.probability_cache.get(frame_index, {}),
+                    object_to_label=object_to_label,
+                    frame_index=frame_index,
+                    prompt=app.prompt,
                 )
             )
     except BaseException:
-        writer.release()
-        if temporary_result.exists():
-            temporary_result.unlink()
+        result_writer.release()
+        mask_writer.release()
+        for path in (temporary_result, temporary_masks):
+            path.unlink(missing_ok=True)
         raise
     finally:
-        writer.release()
+        result_writer.release()
+        mask_writer.release()
     temporary_result.replace(result_path)
+    temporary_masks.replace(masks_path)
+    source = {
+        "width": app.video_info.width,
+        "height": app.video_info.height,
+        "frame_count": app.frame_count,
+        "fps": app.video_info.fps,
+    }
+    outputs = {
+        "instance_masks_video": "masks.mkv",
+        "instance_masks_codec": "FFV1",
+        "instance_masks_pixel_format": "gray8",
+        "visualization_video": "result.mp4",
+        "label_dtype": "uint8",
+        "background_label": 0,
+    }
+    atomic_write_json(
+        app.output_dir / "metadata.json",
+        {
+            "status": "success",
+            "completed_at": utc_now(),
+            "input_video": str(app.video_path),
+            "prompt": app.prompt,
+            "model_version": app.version,
+            "source": source,
+            "frames_processed": app.frame_count,
+            "object_id_to_label": {
+                str(obj_id): label
+                for obj_id, label in sorted(object_to_label.items())
+            },
+            "outputs": outputs,
+        },
+    )
     atomic_write_json(
         app.output_dir / "interactions.json",
         {
@@ -1279,13 +1431,8 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "model_version": app.version,
             "text_prompt": app.prompt,
             "propagation_direction": app.propagation_direction,
-            "source": {
-                "width": app.video_info.width,
-                "height": app.video_info.height,
-                "frame_count": app.frame_count,
-                "fps": app.video_info.fps,
-            },
-            "outputs": {"visualization_video": "result.mp4"},
+            "source": source,
+            "outputs": outputs,
             "confirmed_points": [
                 p.as_json()
                 for p in sorted(app.confirmed_points, key=lambda point: point.sequence)
@@ -1293,13 +1440,18 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "events": app.events,
         },
     )
-    print(f"Saved interactive result to {result_path}")
+    print(f"Saved interactive outputs to {app.output_dir}")
 
 
 def validate_interactive_outputs(output_dir: Path, overwrite: bool) -> None:
     existing = [
         p
-        for p in (output_dir / "result.mp4", output_dir / "interactions.json")
+        for p in (
+            output_dir / "result.mp4",
+            output_dir / "masks.mkv",
+            output_dir / "metadata.json",
+            output_dir / "interactions.json",
+        )
         if p.exists()
     ]
     if existing and not overwrite:
@@ -1350,7 +1502,7 @@ def run_interactive(
             propagation_direction,
             checkpoint_interval,
         )
-        app.start(normalize_masks(response.get("outputs", {})))
+        app.start(response.get("outputs", {}))
         app.run()
     finally:
         if app is not None:
