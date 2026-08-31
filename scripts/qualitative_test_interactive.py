@@ -12,34 +12,45 @@
         --video /path/to/color.mp4 \
         --text_prompt "human hand" \
         --device cuda:0 \
-        --propagation-direction forward \
         --checkpoint-interval 20 \
         --output-dir ./outputs/interactive/example
 
 如果输出目录中已经存在结果，请增加 ``--overwrite``。
-``--propagation-direction forward`` 只从编辑帧向视频结尾传播；默认 ``both``
-会先向结尾传播，再向视频开头传播。
 
 交互操作
 --------
 
-* 程序会从第 0 帧应用文本提示，并在后台向整段视频传播 mask。
-* 拖动 ``frame`` 时间轴可浏览已经处理完成的帧。
-* 传播进行中按空格会同时暂停传播和画面播放；暂停后空格只控制画面播放，
-  ``Enter`` 可从当前帧恢复传播。
-* 鼠标中键点击 mask 可选择对象；重叠区域可重复点击以切换对象。
-* 按空格暂停播放后，鼠标左键添加正点，右键添加负点。
+* 程序从第 0 帧开始正向播放和正向传播 mask；播放和传播是两套互不影响的
+  状态，后续传播方向由 UI 按钮控制。
+* 下方时间轴的蓝色部分是从第 0 帧开始连续处理完成的可播放范围，灰色尾部
+  只表示视频总长度；拖动位置不会超过蓝色范围，拖动会暂停画面播放，但不会
+  影响传播。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
+* 播放按钮依次为倒放、暂停、正放；传播按钮依次为暂停、反向、正向、先正向
+  再反向、先反向再正向。每组只有一个按钮高亮；点击倒放或正放会取消当前
+  mask 选择，但保留未提交点。
+* 传播运行时只能点击传播暂停，其他传播方向按钮暂时禁用；自然完成后自动
+  回到传播暂停。点击任一传播方向会确认未提交点，并从编辑帧（没有编辑时为
+  当前帧）启动传播。
+* 只有播放和传播都暂停后才能操作视频画面或使用编辑快捷键；运行期间除
+  ``Q`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
+* 鼠标中键点击 mask 可选择对象；重叠区域从小到大循环，循环末尾取消选择；
+  点击空白处也会取消选择。选中 mask 使用高亮填充和细青色轮廓。
+* 鼠标左键添加正点，右键添加负点。未选择 mask 时，第一个正点会创建新的
+  对象；第一个负点不会创建对象。
 * 每个对象在每一帧最多使用 16 个点，窗口状态会显示当前数量；达到上限后
   不再接受更多点，本轮未确认的点可用 ``Backspace`` 撤销。
 * ``P`` 根据当前编辑点刷新当前帧 mask，仅作为预览。
-  每次预览都会恢复到最近的 CPU 检查点，并向前重放到编辑帧，因此相同点集
-  使用相同的 tracker 基础状态。``--checkpoint-interval`` 控制检查点间隔，
-  默认每 20 帧保存一次。
-* ``Enter`` 确认当前编辑，并从当前帧重新开始传播。
+  每次预览都会恢复到最近的 CPU 检查点，并按对应方向重放到编辑帧，因此
+  相同点集使用相同的 tracker 基础状态。正向和反向传播都会保存带方向的 CPU 检查点；
+  ``--checkpoint-interval`` 控制检查点间隔，默认每 20 帧保存一次。
 * ``Backspace`` 撤销最近一次点击，``Esc`` 放弃当前未确认的编辑。
 * ``C`` 清除所有已确认和未确认的点，恢复文本提示并从第 0 帧重新传播。
+* 未提交点始终绑定创建它们的编辑帧；播放或拖动时间轴不会提交或丢弃它们。
 * 视频传播完成后窗口会保持打开，可继续浏览或点击任意已处理帧进行编辑。
-* ``Q`` 结束操作；程序会补齐尚未完成的传播并写出结果。
+* ``Enter`` 和空格不执行任何操作。
+* ``Q`` 只检查所有帧是否都至少处理过一次：仍有未处理帧时提示并保持窗口
+  打开；全部处理过才退出并写出结果。退出不会确认未提交点或自动补传播，
+  终端会打印已处理帧数和可播放范围。
 * 每次鼠标按键点击和键盘输入都会以 ``INTERACTION`` 开头输出一行日志。
 
 输出文件
@@ -89,9 +100,22 @@ COLORS = (
     (255, 60, 160),
     (160, 60, 255),
 )
-MASK_ALPHA = 0.30
+MASK_ALPHA = 0.10
+SELECTED_MASK_ALPHA = 0.20
+SELECTED_COLOR = (255, 255, 0)
 EDGE_HALO_THICKNESS = 2
 EDGE_COLOR_THICKNESS = 1
+SELECTED_HALO_THICKNESS = 4
+SELECTED_EDGE_THICKNESS = 2
+TIMELINE_HEIGHT = 72
+BUTTON_ROW_HEIGHT = 82
+CONTROL_HEIGHT = TIMELINE_HEIGHT + BUTTON_ROW_HEIGHT
+PROPAGATION_MODES = (
+    "backward",
+    "forward",
+    "forward_backward",
+    "backward_forward",
+)
 
 
 @dataclass(frozen=True)
@@ -155,6 +179,13 @@ def positive_int(value: str) -> int:
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def window_width_int(value: str) -> int:
+    number = positive_int(value)
+    if number < 640:
+        raise argparse.ArgumentTypeError("window width must be at least 640")
     return number
 
 
@@ -293,23 +324,26 @@ def render_frame_bgr(
                 f"mask dimensions {mask_bool.shape} differ from frame {frame.shape[:2]}"
             )
         label = object_to_label.get(obj_id, obj_id)
-        color = np.asarray(color_for_label(label), dtype=np.float32)
-        blended[mask_bool] = (
-            blended[mask_bool] * (1.0 - MASK_ALPHA) + color * MASK_ALPHA
+        selected = obj_id == active_obj
+        color = np.asarray(
+            SELECTED_COLOR if selected else color_for_label(label), dtype=np.float32
         )
+        alpha = SELECTED_MASK_ALPHA if selected else MASK_ALPHA
+        blended[mask_bool] = blended[mask_bool] * (1.0 - alpha) + color * alpha
     rendered = blended.astype(np.uint8)
     for obj_id, mask in masks_by_obj.items():
         contours, _ = cv2.findContours(
             mask.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
         )
         label = object_to_label.get(obj_id, obj_id)
-        color = color_for_label(label)
+        selected = obj_id == active_obj
+        color = SELECTED_COLOR if selected else color_for_label(label)
         cv2.drawContours(
             rendered,
             contours,
             -1,
-            lighter_color(color),
-            EDGE_HALO_THICKNESS,
+            (255, 255, 255) if selected else lighter_color(color),
+            SELECTED_HALO_THICKNESS if selected else EDGE_HALO_THICKNESS,
             cv2.LINE_AA,
         )
         cv2.drawContours(
@@ -317,7 +351,7 @@ def render_frame_bgr(
             contours,
             -1,
             color,
-            EDGE_COLOR_THICKNESS,
+            SELECTED_EDGE_THICKNESS if selected else EDGE_COLOR_THICKNESS,
             cv2.LINE_AA,
         )
         ys, xs = np.where(mask)
@@ -416,17 +450,32 @@ def render_frame_bgr(
     return rendered
 
 
+def propagation_legs(mode: str) -> Tuple[str, ...]:
+    legs = {
+        "backward": ("backward",),
+        "forward": ("forward",),
+        "forward_backward": ("forward", "backward"),
+        "backward_forward": ("backward", "forward"),
+    }
+    try:
+        return legs[mode]
+    except KeyError as exc:
+        raise ValueError(f"unknown propagation mode: {mode}") from exc
+
+
+def normalize_propagation_mode(mode: str) -> str:
+    return "forward_backward" if mode == "both" else mode.replace("-", "_")
+
+
 class PropagationRunner:
     def __init__(
         self,
         predictor: Any,
         event_queue: queue.Queue,
-        propagation_direction: str,
         checkpoint_interval: int = 20,
     ):
         self.predictor = predictor
         self.event_queue = event_queue
-        self.propagation_direction = propagation_direction
         self.checkpoint_interval = checkpoint_interval
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
@@ -437,7 +486,13 @@ class PropagationRunner:
     def is_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, session_id: str, start_frame_index: int, generation: int) -> None:
+    def start(
+        self,
+        session_id: str,
+        start_frame_index: int,
+        generation: int,
+        mode: str,
+    ) -> None:
         if self.is_alive:
             raise RuntimeError("propagation is already running")
         self.stop_event = threading.Event()
@@ -447,72 +502,107 @@ class PropagationRunner:
 
         def run() -> None:
             stopped = False
-            next_checkpoint_frame = start_frame_index
-            max_forward_frame = start_frame_index - 1
-            forward = True
             try:
                 # CUDA's current device is thread-local. Bind this worker to the
                 # caller's device before PyTorch or Triton launches any kernels.
                 if cuda_device is not None:
                     torch.cuda.set_device(cuda_device)
-                request = {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "propagation_direction": self.propagation_direction,
-                    "start_frame_index": start_frame_index,
-                }
-                last_frame_index = None
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    for response in self.predictor.handle_stream_request(request):
-                        if self.stop_event.is_set():
-                            stopped = True
-                            break
-                        frame_index = int(response["frame_index"])
-                        if (
-                            forward
-                            and last_frame_index is not None
-                            and frame_index < last_frame_index
-                        ):
-                            self.event_queue.put(
-                                ("direction", generation, -1, start_frame_index)
-                            )
-                            forward = False
-                        last_frame_index = frame_index
-                        self.event_queue.put(
-                            (
-                                "frame",
-                                generation,
-                                frame_index,
-                                normalize_frame_outputs(
-                                    response.get("outputs", {})
-                                ),
-                            )
+                for direction in propagation_legs(mode):
+                    if self.stop_event.is_set():
+                        stopped = True
+                        break
+                    self.event_queue.put(("direction", generation, direction, mode))
+                    next_checkpoint_frame = start_frame_index
+                    max_forward_frame = start_frame_index - 1
+                    min_backward_frame = start_frame_index
+                    if direction == "backward":
+                        checkpoint = self.predictor.handle_request(
+                            {
+                                "type": "save_checkpoint",
+                                "session_id": session_id,
+                                "frame_index": start_frame_index,
+                                "propagation_direction": direction,
+                                "exact_frame": True,
+                            }
                         )
-                        # The bidirectional stream yields its forward half first.
-                        # Ignore decreasing frame indices so the backward half does
-                        # not overwrite forward checkpoints with a different causal
-                        # history.
-                        if forward and frame_index > max_forward_frame:
-                            max_forward_frame = frame_index
-                            if frame_index >= next_checkpoint_frame:
-                                checkpoint = self.predictor.handle_request(
-                                    {
-                                        "type": "save_checkpoint",
-                                        "session_id": session_id,
-                                        "frame_index": frame_index,
-                                    }
+                        self.event_queue.put(
+                            ("checkpoint", generation, checkpoint, None)
+                        )
+                        next_checkpoint_frame -= self.checkpoint_interval
+                    request = {
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                        "propagation_direction": direction,
+                        "start_frame_index": start_frame_index,
+                    }
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        for response in self.predictor.handle_stream_request(request):
+                            if self.stop_event.is_set():
+                                stopped = True
+                                break
+                            frame_index = int(response["frame_index"])
+                            self.event_queue.put(
+                                (
+                                    "frame",
+                                    generation,
+                                    frame_index,
+                                    normalize_frame_outputs(
+                                        response.get("outputs", {})
+                                    ),
                                 )
-                                self.event_queue.put(
-                                    (
-                                        "checkpoint",
-                                        generation,
-                                        checkpoint,
-                                        None,
+                            )
+                            if (
+                                direction == "forward"
+                                and frame_index > max_forward_frame
+                            ):
+                                max_forward_frame = frame_index
+                                if frame_index >= next_checkpoint_frame:
+                                    checkpoint = self.predictor.handle_request(
+                                        {
+                                            "type": "save_checkpoint",
+                                            "session_id": session_id,
+                                            "frame_index": frame_index,
+                                        }
                                     )
-                                )
-                                next_checkpoint_frame = (
-                                    frame_index + self.checkpoint_interval
-                                )
+                                    self.event_queue.put(
+                                        (
+                                            "checkpoint",
+                                            generation,
+                                            checkpoint,
+                                            None,
+                                        )
+                                    )
+                                    next_checkpoint_frame = (
+                                        frame_index + self.checkpoint_interval
+                                    )
+                            elif (
+                                direction == "backward"
+                                and frame_index < min_backward_frame
+                            ):
+                                min_backward_frame = frame_index
+                                if frame_index <= next_checkpoint_frame:
+                                    checkpoint = self.predictor.handle_request(
+                                        {
+                                            "type": "save_checkpoint",
+                                            "session_id": session_id,
+                                            "frame_index": frame_index,
+                                            "propagation_direction": direction,
+                                            "exact_frame": True,
+                                        }
+                                    )
+                                    self.event_queue.put(
+                                        (
+                                            "checkpoint",
+                                            generation,
+                                            checkpoint,
+                                            None,
+                                        )
+                                    )
+                                    next_checkpoint_frame = (
+                                        frame_index - self.checkpoint_interval
+                                    )
+                        if stopped:
+                            break
                 stopped = stopped or self.stop_event.is_set()
                 self.event_queue.put(("done", generation, stopped, None))
             except BaseException as exc:
@@ -550,7 +640,6 @@ class InteractiveApp:
         prompt: str,
         output_dir: Path,
         window_width: int,
-        propagation_direction: str = "both",
         checkpoint_interval: int = 20,
     ):
         self.predictor = predictor
@@ -562,13 +651,12 @@ class InteractiveApp:
         self.frame_count = frame_count
         self.prompt = prompt
         self.output_dir = output_dir
-        self.propagation_direction = propagation_direction
+        self.initial_propagation_mode = "forward"
         self.checkpoint_interval = checkpoint_interval
         self.event_queue: queue.Queue = queue.Queue()
         self.runner = PropagationRunner(
             predictor,
             self.event_queue,
-            propagation_direction,
             checkpoint_interval,
         )
         self.generation = 0
@@ -577,18 +665,18 @@ class InteractiveApp:
         self.probability_cache: Dict[int, Dict[int, float]] = {}
         self.stale_frames: set[int] = set()
         self.display_index = 0
-        self.follow_live = True
         self.playing = True
         self.playback_direction = 1
-        self.playback_origin: Optional[int] = None
-        self.reverse_ready = False
         self.last_play_time = time.monotonic()
+        self.propagation_mode: Optional[str] = None
+        self.last_propagation_mode = self.initial_propagation_mode
         self.active_obj: Optional[int] = None
         self.status = "initializing"
         self.fatal_error: Optional[BaseException] = None
         self.editing = False
         self.edit_frame: Optional[int] = None
         self.draft_points: List[PointEdit] = []
+        self.draft_new_obj_ids: set[int] = set()
         self.confirmed_points: List[PointEdit] = []
         self.commits: List[CommitRecord] = []
         self.preview_signature: Optional[Tuple[Tuple[int, ...], ...]] = None
@@ -598,11 +686,14 @@ class InteractiveApp:
         self.selection_position: Optional[Tuple[int, int, int]] = None
         self.selection_candidates: List[int] = []
         self.selection_offset = 0
-        self.suppress_trackbar = False
+        self.next_obj_id = 1
+        self.hitboxes: Dict[str, Tuple[int, int, int, int]] = {}
+        self.timeline_dragging = False
         self.window_open = False
-        self.display_width = min(video_info.width, window_width)
+        self.display_width = min(window_width, max(video_info.width, 640))
         self.display_scale = self.display_width / video_info.width
         self.display_height = max(1, round(video_info.height * self.display_scale))
+        self.timeline_bounds = (20, max(20, self.display_width - 20))
 
     def record_event(self, event_type: str, **payload: Any) -> None:
         self.sequence += 1
@@ -637,12 +728,14 @@ class InteractiveApp:
         masks, probabilities = normalize_frame_outputs(outputs)
         self.cache[frame_index] = masks
         self.probability_cache[frame_index] = probabilities
+        if masks:
+            self.next_obj_id = max(self.next_obj_id, max(masks) + 1)
 
     def start(self, initial_outputs: Optional[Dict[str, Any]]) -> None:
         self.store_frame_outputs(0, initial_outputs)
         self.record_event("initial_prompt", frame_index=0, text=self.prompt)
         self.save_checkpoint(0)
-        self.start_propagation(0)
+        self.start_propagation(0, self.initial_propagation_mode)
 
     def save_checkpoint(self, frame_index: int) -> Dict[str, Any]:
         response = self.predictor.handle_request(
@@ -650,6 +743,8 @@ class InteractiveApp:
                 "type": "save_checkpoint",
                 "session_id": self.session_id,
                 "frame_index": frame_index,
+                "propagation_direction": "both",
+                "exact_frame": True,
             }
         )
         self.record_checkpoint(response, frame_index)
@@ -665,20 +760,34 @@ class InteractiveApp:
             file=sys.stderr,
         )
 
-    def start_propagation(self, frame_index: int) -> None:
+    def start_propagation(self, frame_index: int, mode: str) -> None:
+        mode = normalize_propagation_mode(mode)
+        if mode not in PROPAGATION_MODES:
+            raise ValueError(f"unknown propagation mode: {mode}")
         self.generation += 1
         self.propagation_complete = False
-        self.reverse_ready = False
-        if self.propagation_direction == "forward":
+        self.propagation_mode = mode
+        self.last_propagation_mode = mode
+        directions = set(propagation_legs(mode))
+        if directions == {"forward"}:
             self.stale_frames.update(
-                index for index in self.cache if index >= frame_index
+                index for index in self.cache if index > frame_index
+            )
+        elif directions == {"backward"}:
+            self.stale_frames.update(
+                index for index in self.cache if index < frame_index
             )
         else:
-            self.stale_frames.update(self.cache)
-        self.runner.start(self.session_id, frame_index, self.generation)
-        self.status = "propagating"
+            self.stale_frames.update(
+                index for index in self.cache if index != frame_index
+            )
+        self.runner.start(self.session_id, frame_index, self.generation, mode)
+        self.status = f"propagating {mode.replace('_', '-')}"
         self.record_event(
-            "propagation_start", frame_index=frame_index, generation=self.generation
+            "propagation_start",
+            frame_index=frame_index,
+            generation=self.generation,
+            mode=mode,
         )
 
     def stop_propagation(self) -> None:
@@ -686,6 +795,7 @@ class InteractiveApp:
             self.runner.request_stop(cancel_model=self.version == "sam3.1")
             self.runner.join()
         self.drain_events()
+        self.propagation_mode = None
 
     def drain_events(self) -> None:
         while True:
@@ -700,65 +810,83 @@ class InteractiveApp:
                 masks, probabilities = extra
                 self.cache[frame_index] = masks
                 self.probability_cache[frame_index] = probabilities
+                if masks:
+                    self.next_obj_id = max(self.next_obj_id, max(masks) + 1)
                 self.stale_frames.discard(frame_index)
-                if self.follow_live and not self.editing:
-                    self.set_display_index(frame_index, programmatic=True)
             elif event_type == "done":
                 stopped = bool(value)
                 self.propagation_complete = not stopped
-                if stopped:
-                    self.status = "paused"
-                elif self.playback_origin is None:
-                    self.follow_live = False
-                    self.playing = False
-                    self.status = "complete - ready for review"
-                else:
-                    if (
-                        self.propagation_direction == "both"
-                        and self.playback_origin == 0
-                    ):
-                        self.reverse_ready = True
-                    self.status = "playing propagated frames"
+                finished_mode = self.propagation_mode
+                self.propagation_mode = None
+                self.status = (
+                    "propagation paused"
+                    if stopped
+                    else f"propagation complete ({finished_mode})"
+                )
                 self.record_event(
-                    "propagation_end", generation=generation, stopped=stopped
+                    "propagation_end",
+                    generation=generation,
+                    stopped=stopped,
+                    mode=finished_mode,
                 )
             elif event_type == "checkpoint":
                 self.record_checkpoint(value, self.display_index)
             elif event_type == "direction":
-                self.reverse_ready = True
-                self.status = "propagating backward"
+                self.status = f"propagating {value}"
             elif event_type == "error":
                 self.fatal_error = value
                 self.status = "error"
 
-    def set_display_index(self, frame_index: int, programmatic: bool) -> None:
+    def playable_frontier(self) -> int:
+        frontier = -1
+        for frame_index in range(self.frame_count):
+            if frame_index not in self.cache:
+                break
+            frontier = frame_index
+        return frontier
+
+    def unprocessed_frames(self) -> List[int]:
+        return [
+            frame_index
+            for frame_index in range(self.frame_count)
+            if frame_index not in self.cache
+        ]
+
+    def set_display_index(self, frame_index: int) -> None:
         if not self.cache:
             return
-        frame_index = max(0, min(frame_index, self.frame_count - 1))
-        if frame_index not in self.cache:
-            frame_index = min(self.cache, key=lambda value: abs(value - frame_index))
+        frontier = self.playable_frontier()
+        if frontier < 0:
+            return
+        frame_index = max(0, min(frame_index, frontier))
         self.display_index = frame_index
-        if programmatic and self.window_open:
-            self.suppress_trackbar = True
-            cv2.setTrackbarPos("frame", WINDOW_NAME, frame_index)
-            self.suppress_trackbar = False
 
-    def on_trackbar(self, frame_index: int) -> None:
-        if self.suppress_trackbar:
+    def seek_timeline(self, x: int) -> None:
+        frontier = self.playable_frontier()
+        if frontier < 0:
             return
-        if self.editing:
-            self.set_display_index(int(self.edit_frame), programmatic=True)
-            return
-        self.follow_live = False
+        left, right = self.timeline_bounds
+        fraction = (min(right, max(left, x)) - left) / max(1, right - left)
+        frame_index = round(fraction * frontier)
         self.playing = False
-        self.playback_origin = None
-        self.set_display_index(frame_index, programmatic=True)
+        self.set_display_index(frame_index)
+        self.status = f"frame {self.display_index}"
 
     def image_coordinates(self, x: int, y: int) -> Tuple[int, int]:
         return (
             min(self.video_info.width - 1, max(0, round(x / self.display_scale))),
             min(self.video_info.height - 1, max(0, round(y / self.display_scale))),
         )
+
+    def clear_object_selection(self, update_status: bool = True) -> None:
+        if self.active_obj is not None:
+            self.record_event("deselect_object", frame_index=self.display_index)
+        self.active_obj = None
+        self.selection_position = None
+        self.selection_candidates = []
+        self.selection_offset = 0
+        if update_status:
+            self.status = "selection cleared"
 
     def select_object(self, x: int, y: int) -> None:
         masks = self.cache.get(self.display_index, {})
@@ -770,18 +898,28 @@ class InteractiveApp:
         candidates.sort(key=lambda obj_id: int(masks[obj_id].sum()))
         position = (self.display_index, x, y)
         if not candidates:
-            self.status = "no object at cursor"
+            self.clear_object_selection()
             return
         if (
             position == self.selection_position
             and candidates == self.selection_candidates
         ):
-            self.selection_offset = (self.selection_offset + 1) % len(candidates)
+            self.selection_offset = (self.selection_offset + 1) % (len(candidates) + 1)
         else:
             self.selection_position = position
             self.selection_candidates = candidates
-            self.selection_offset = 0
-        self.active_obj = candidates[self.selection_offset]
+            self.selection_offset = (
+                len(candidates) if self.active_obj in candidates else 0
+            )
+        self.active_obj = (
+            candidates[self.selection_offset]
+            if self.selection_offset < len(candidates)
+            else None
+        )
+        if self.active_obj is None:
+            self.status = "selection cleared"
+            self.record_event("deselect_object", frame_index=self.display_index)
+            return
         self.status = f"selected obj {self.active_obj}"
         self.record_event(
             "select_object",
@@ -792,14 +930,24 @@ class InteractiveApp:
         )
 
     def add_point(self, x: int, y: int, label: int) -> None:
-        if self.playing:
-            self.status = "pause playback before editing"
+        if self.playing or self.runner.is_alive:
+            self.status = "pause playback and propagation before editing"
             return
         if self.active_obj is None:
-            self.status = "select an object first"
-            return
+            if label == 0:
+                self.status = "add a positive point to create an object"
+                return
+            self.active_obj = self.next_obj_id
+            self.next_obj_id += 1
+            self.draft_new_obj_ids.add(self.active_obj)
+            self.record_event(
+                "create_object_draft",
+                frame_index=self.display_index,
+                obj_id=self.active_obj,
+            )
         if self.editing and self.display_index != self.edit_frame:
-            self.set_display_index(int(self.edit_frame), programmatic=True)
+            self.set_display_index(int(self.edit_frame))
+            self.status = f"returned to draft frame {self.edit_frame}"
             return
         frame_index = int(self.edit_frame) if self.editing else self.display_index
         point_count = sum(
@@ -813,12 +961,8 @@ class InteractiveApp:
             )
             return
         if not self.editing:
-            self.stop_propagation()
             self.editing = True
             self.edit_frame = self.display_index
-            self.follow_live = False
-            self.playing = False
-            self.playback_origin = None
         self.sequence += 1
         point = PointEdit(
             self.sequence, int(self.edit_frame), int(self.active_obj), x, y, label
@@ -837,14 +981,70 @@ class InteractiveApp:
             f"{point_count + 1}/{MAX_PROMPT_POINTS}"
         )
 
+    @staticmethod
+    def point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
+        left, top, right, bottom = rect
+        return left <= x <= right and top <= y <= bottom
+
+    def handle_control_click(self, name: str) -> None:
+        if name == "play_pause":
+            self.playing = False
+            self.status = "playback paused"
+        elif name == "play_backward":
+            self.clear_object_selection(update_status=False)
+            if self.display_index == 0:
+                self.playing = False
+                self.status = "at first frame"
+            else:
+                self.playback_direction = -1
+                self.playing = True
+                self.last_play_time = time.monotonic()
+                self.status = "playing backward"
+        elif name == "play_forward":
+            self.clear_object_selection(update_status=False)
+            self.playback_direction = 1
+            self.playing = True
+            self.last_play_time = time.monotonic()
+            self.status = "playing forward"
+        elif name == "prop_pause":
+            self.stop_propagation()
+            self.status = "propagation paused"
+        elif name.startswith("prop_"):
+            if self.runner.is_alive:
+                self.status = "pause propagation before changing direction"
+                return
+            self.confirm_and_propagate(name.removeprefix("prop_"))
+
     def on_mouse(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
-        del flags, param
+        del param
+        if event == cv2.EVENT_LBUTTONUP:
+            self.timeline_dragging = False
+            return
+        if event == cv2.EVENT_MOUSEMOVE and self.timeline_dragging:
+            if flags & cv2.EVENT_FLAG_LBUTTON:
+                self.seek_timeline(x)
+            return
+        if event == cv2.EVENT_LBUTTONDOWN and self.display_height <= y < (
+            self.display_height + TIMELINE_HEIGHT
+        ):
+            self.log_input("timeline", display_x=x)
+            self.timeline_dragging = True
+            self.seek_timeline(x)
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for name, rect in self.hitboxes.items():
+                if self.point_in_rect(x, y - self.display_height, rect):
+                    self.log_input("control", control=name)
+                    self.handle_control_click(name)
+                    return
         buttons = {
             cv2.EVENT_LBUTTONDOWN: "left",
             cv2.EVENT_MBUTTONDOWN: "middle",
             cv2.EVENT_RBUTTONDOWN: "right",
         }
         if event not in buttons:
+            return
+        if y >= self.display_height:
             return
         source_x, source_y = self.image_coordinates(x, y)
         self.log_input(
@@ -856,6 +1056,9 @@ class InteractiveApp:
             source_y=source_y,
             active_obj=self.active_obj,
         )
+        if self.playing or self.runner.is_alive:
+            self.status = "pause playback and propagation before editing"
+            return
         if event == cv2.EVENT_MBUTTONDOWN:
             self.select_object(source_x, source_y)
         elif event == cv2.EVENT_LBUTTONDOWN:
@@ -917,7 +1120,9 @@ class InteractiveApp:
         if not self.editing or not self.draft_points:
             self.status = "nothing to preview"
             return
-        self.stop_propagation()
+        if self.playing or self.runner.is_alive:
+            self.status = "pause playback and propagation before preview"
+            return
         signature = self.draft_signature()
         if signature == self.preview_signature:
             self.status = "preview"
@@ -940,24 +1145,21 @@ class InteractiveApp:
             return
         point = self.draft_points.pop()
         self.active_obj = point.obj_id
-        self.set_display_index(point.frame_index, programmatic=True)
+        self.set_display_index(point.frame_index)
         self.status = "undo (preview is outdated)"
         self.record_event("undo", point_sequence=point.sequence)
+        if not self.draft_points:
+            self.cancel_edit()
 
-    def confirm(self) -> None:
+    def commit_draft(self) -> Optional[int]:
         if not self.editing:
-            if not self.runner.is_alive and not self.propagation_complete:
-                self.start_propagation(self.display_index)
-            return
-        self.stop_propagation()
+            return None
         if not self.draft_points:
             if self.preview_signature is not None:
                 self.restore_preview_baseline(int(self.edit_frame))
             frame_index = int(self.edit_frame)
             self.reset_edit_state()
-            if not self.propagation_complete:
-                self.start_propagation(frame_index)
-            return
+            return frame_index
         if self.draft_signature() != self.preview_signature:
             self.preview()
         affected_keys = tuple(
@@ -975,21 +1177,23 @@ class InteractiveApp:
             {"type": "clear_checkpoints", "session_id": self.session_id}
         )
         self.save_checkpoint(frame_index)
-        self.start_propagation(frame_index)
-        self.start_playback_cycle(frame_index)
+        return frame_index
 
-    def start_playback_cycle(self, frame_index: int) -> None:
-        self.playback_origin = frame_index
-        self.playback_direction = 1
-        self.follow_live = False
-        self.playing = True
-        self.last_play_time = time.monotonic()
-        self.set_display_index(frame_index, programmatic=True)
+    def confirm_and_propagate(self, mode: str) -> None:
+        if self.runner.is_alive:
+            self.status = "pause propagation before changing direction"
+            return
+        frame_index = int(self.edit_frame) if self.editing else self.display_index
+        if self.editing:
+            self.set_display_index(frame_index)
+            self.commit_draft()
+        self.start_propagation(frame_index, mode)
 
     def reset_edit_state(self) -> None:
         self.editing = False
         self.edit_frame = None
         self.draft_points = []
+        self.draft_new_obj_ids = set()
         self.preview_signature = None
         self.preview_keys = set()
 
@@ -998,15 +1202,18 @@ class InteractiveApp:
             return
         frame_index = int(self.edit_frame)
         had_preview = self.preview_signature is not None
+        cancelled_new_ids = set(self.draft_new_obj_ids)
         self.record_event(
             "cancel_edit",
             frame_index=frame_index,
             point_sequences=[p.sequence for p in self.draft_points],
         )
         self.reset_edit_state()
+        if self.active_obj in cancelled_new_ids:
+            self.active_obj = None
         if had_preview:
             self.restore_preview_baseline(frame_index)
-        self.start_propagation(frame_index)
+        self.status = "edit cancelled"
 
     def clear_all_interactions(self) -> None:
         cleared_confirmed = len(self.confirmed_points)
@@ -1029,7 +1236,7 @@ class InteractiveApp:
             cleared_draft_points=cleared_draft,
         )
         self.save_checkpoint(0)
-        self.start_propagation(0)
+        self.start_propagation(0, self.initial_propagation_mode)
 
     def replay_commit_points(
         self, committed_sequences: set[int], keys: Iterable[Tuple[int, int]]
@@ -1061,23 +1268,23 @@ class InteractiveApp:
         propagation_direction: Optional[str] = None,
         max_frame_num_to_track: Optional[int] = None,
     ) -> None:
-        request = {
-            "type": "propagate_in_video",
-            "session_id": self.session_id,
-            "propagation_direction": (
-                self.propagation_direction
-                if propagation_direction is None
-                else propagation_direction
-            ),
-            "start_frame_index": start_frame_index,
-        }
-        if max_frame_num_to_track is not None:
-            request["max_frame_num_to_track"] = max_frame_num_to_track
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for response in self.predictor.handle_stream_request(request):
-                frame_index = int(response["frame_index"])
-                self.store_frame_outputs(frame_index, response.get("outputs", {}))
-                self.stale_frames.discard(frame_index)
+        mode = normalize_propagation_mode(
+            propagation_direction or self.last_propagation_mode
+        )
+        for direction in propagation_legs(mode):
+            request = {
+                "type": "propagate_in_video",
+                "session_id": self.session_id,
+                "propagation_direction": direction,
+                "start_frame_index": start_frame_index,
+            }
+            if max_frame_num_to_track is not None:
+                request["max_frame_num_to_track"] = max_frame_num_to_track
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                for response in self.predictor.handle_stream_request(request):
+                    frame_index = int(response["frame_index"])
+                    self.store_frame_outputs(frame_index, response.get("outputs", {}))
+                    self.stale_frames.discard(frame_index)
         self.propagation_complete = True
 
     def restore_preview_baseline(self, target_frame_index: int) -> None:
@@ -1091,11 +1298,42 @@ class InteractiveApp:
             }
         )
         if not response.get("is_success", False):
-            raise RuntimeError(
-                f"no checkpoint is available at or before frame {target_frame_index}"
+            self.status = f"rebuilding baseline for frame {target_frame_index}"
+            self.restore_confirmed_state()
+            if target_frame_index > 0:
+                self.synchronous_propagation(
+                    0,
+                    propagation_direction="forward",
+                    max_frame_num_to_track=target_frame_index,
+                )
+            self.propagation_complete = False
+            self.set_display_index(target_frame_index)
+            self.record_event(
+                "preview_baseline_rebuilt",
+                target_frame=target_frame_index,
             )
+            return
         checkpoint_frame = int(response["frame_index"])
-        self.stale_frames.update(range(checkpoint_frame + 1, self.frame_count))
+        checkpoint_direction = response.get("propagation_direction", "forward")
+        if checkpoint_frame > target_frame_index:
+            self.stale_frames.update(range(checkpoint_frame))
+            self.status = (
+                f"replaying {checkpoint_frame - 1}-{target_frame_index} backward "
+                f"from checkpoint {checkpoint_frame}"
+            )
+            self.synchronous_propagation(
+                checkpoint_frame,
+                propagation_direction="backward",
+                max_frame_num_to_track=checkpoint_frame - target_frame_index,
+            )
+        else:
+            if (
+                checkpoint_frame == target_frame_index
+                and checkpoint_direction == "backward"
+            ):
+                self.stale_frames.update(range(checkpoint_frame))
+            else:
+                self.stale_frames.update(range(checkpoint_frame + 1, self.frame_count))
         if checkpoint_frame < target_frame_index:
             replay_start = checkpoint_frame + 1
             self.status = (
@@ -1110,7 +1348,7 @@ class InteractiveApp:
                 max_frame_num_to_track=target_frame_index - replay_start,
             )
         self.propagation_complete = False
-        self.set_display_index(target_frame_index, programmatic=True)
+        self.set_display_index(target_frame_index)
         self.record_event(
             "checkpoint_restored",
             checkpoint_frame=checkpoint_frame,
@@ -1152,6 +1390,235 @@ class InteractiveApp:
             if p.frame_index == self.display_index
         ]
 
+    @staticmethod
+    def draw_arrow_icon(
+        image: np.ndarray,
+        rect: Tuple[int, int, int, int],
+        direction: int,
+        color: Tuple[int, int, int],
+        y_offset: int = 0,
+    ) -> None:
+        left, top, right, bottom = rect
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2 + y_offset
+        half = max(6, min(12, (right - left) // 5))
+        cv2.line(
+            image,
+            (center_x - direction * half, center_y),
+            (center_x + direction * half, center_y),
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        tip_x = center_x + direction * half
+        points = np.array(
+            [
+                (tip_x, center_y),
+                (tip_x - direction * 7, center_y - 6),
+                (tip_x - direction * 7, center_y + 6),
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
+
+    def draw_button(
+        self,
+        image: np.ndarray,
+        name: str,
+        rect: Tuple[int, int, int, int],
+        active: bool,
+        enabled: bool,
+    ) -> None:
+        self.hitboxes[name] = rect
+        background = (190, 125, 25) if active else (52, 52, 52)
+        border = (255, 190, 70) if active else (95, 95, 95)
+        if not enabled and not active:
+            background, border = (35, 35, 35), (55, 55, 55)
+        color = (255, 255, 255) if enabled or active else (105, 105, 105)
+        cv2.rectangle(image, rect[:2], rect[2:], background, cv2.FILLED, cv2.LINE_AA)
+        cv2.rectangle(image, rect[:2], rect[2:], border, 1, cv2.LINE_AA)
+        if name.endswith("pause"):
+            left, top, right, bottom = rect
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            cv2.rectangle(
+                image,
+                (center_x - 7, center_y - 11),
+                (center_x - 3, center_y + 11),
+                color,
+                cv2.FILLED,
+            )
+            cv2.rectangle(
+                image,
+                (center_x + 3, center_y - 11),
+                (center_x + 7, center_y + 11),
+                color,
+                cv2.FILLED,
+            )
+        elif name.endswith("forward_backward"):
+            self.draw_arrow_icon(image, rect, 1, color, -8)
+            self.draw_arrow_icon(image, rect, -1, color, 8)
+        elif name.endswith("backward_forward"):
+            self.draw_arrow_icon(image, rect, -1, color, -8)
+            self.draw_arrow_icon(image, rect, 1, color, 8)
+        elif name.endswith("backward"):
+            self.draw_arrow_icon(image, rect, -1, color)
+        else:
+            self.draw_arrow_icon(image, rect, 1, color)
+
+    def render_controls(self) -> np.ndarray:
+        width = self.display_width
+        panel = np.full((CONTROL_HEIGHT, width, 3), (27, 29, 32), dtype=np.uint8)
+        self.hitboxes = {}
+        frontier = self.playable_frontier()
+        current = min(self.display_index, max(0, frontier))
+        progress_text = f"frame {current} | processed to {max(0, frontier)} | total {self.frame_count}"
+        status = self.status
+        if self.editing and self.edit_frame is not None:
+            status += f" | draft frame {self.edit_frame}"
+        text_size = cv2.getTextSize(progress_text, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0]
+        max_status_width = max(80, width - text_size[0] - 60)
+        while (
+            len(status) > 3
+            and cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)[0][0]
+            > max_status_width
+        ):
+            status = status[:-4] + "..."
+        cv2.putText(
+            panel,
+            status,
+            (20, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (215, 215, 215),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            progress_text,
+            (max(20, width - text_size[0] - 20), 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+        track_left, track_right, track_y = 20, width - 20, 48
+        cv2.line(
+            panel,
+            (track_left, track_y),
+            (track_right, track_y),
+            (70, 70, 70),
+            10,
+            cv2.LINE_AA,
+        )
+        if self.frame_count <= 1:
+            available_right = track_right
+            thumb_x = track_left
+        else:
+            available_right = track_left + round(
+                (track_right - track_left) * max(0, frontier) / (self.frame_count - 1)
+            )
+            thumb_x = track_left + round(
+                (track_right - track_left) * current / (self.frame_count - 1)
+            )
+        self.timeline_bounds = (track_left, max(track_left, available_right))
+        if frontier >= 0:
+            cv2.line(
+                panel,
+                (track_left, track_y),
+                (available_right, track_y),
+                (220, 145, 35),
+                10,
+                cv2.LINE_AA,
+            )
+            cv2.circle(panel, (thumb_x, track_y), 9, (255, 200, 80), cv2.FILLED)
+        cv2.line(
+            panel,
+            (0, TIMELINE_HEIGHT),
+            (width, TIMELINE_HEIGHT),
+            (55, 55, 55),
+            1,
+        )
+
+        row_top = TIMELINE_HEIGHT
+        button_top = row_top + 17
+        button_bottom = row_top + BUTTON_ROW_HEIGHT - 15
+        play_right = round(width * 0.38)
+        cv2.line(
+            panel, (play_right, row_top), (play_right, CONTROL_HEIGHT), (55, 55, 55), 1
+        )
+        cv2.putText(
+            panel,
+            "PLAY",
+            (18, row_top + 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        play_names = ("play_backward", "play_pause", "play_forward")
+        play_left = 78
+        play_gap = 7
+        play_width = max(34, (play_right - play_left - 20 - 2 * play_gap) // 3)
+        active_play = (
+            "play_pause"
+            if not self.playing
+            else ("play_forward" if self.playback_direction > 0 else "play_backward")
+        )
+        for index, name in enumerate(play_names):
+            left = play_left + index * (play_width + play_gap)
+            self.draw_button(
+                panel,
+                name,
+                (left, button_top, left + play_width, button_bottom),
+                name == active_play,
+                True,
+            )
+
+        prop_left = play_right + 18
+        cv2.putText(
+            panel,
+            "PROP",
+            (prop_left, row_top + 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        prop_names = (
+            "prop_pause",
+            "prop_backward",
+            "prop_forward",
+            "prop_forward_backward",
+            "prop_backward_forward",
+        )
+        prop_button_left = prop_left + 66
+        prop_gap = 7
+        prop_width = max(
+            34,
+            (width - prop_button_left - 20 - 4 * prop_gap) // 5,
+        )
+        active_prop = (
+            f"prop_{self.propagation_mode}"
+            if self.runner.is_alive and self.propagation_mode
+            else "prop_pause"
+        )
+        for index, name in enumerate(prop_names):
+            left = prop_button_left + index * (prop_width + prop_gap)
+            enabled = name == "prop_pause" or not self.runner.is_alive
+            self.draw_button(
+                panel,
+                name,
+                (left, button_top, left + prop_width, button_bottom),
+                name == active_prop,
+                enabled,
+            )
+        return panel
+
     def render(self) -> np.ndarray:
         rendered = render_frame_bgr(
             load_frame_bgr(self.frame_dir, self.display_index),
@@ -1160,7 +1627,7 @@ class InteractiveApp:
             points=self.current_points_for_display(),
             active_obj=self.active_obj,
             stale=self.display_index in self.stale_frames,
-            status=self.status,
+            status=None,
         )
         if self.display_scale != 1.0:
             rendered = cv2.resize(
@@ -1168,48 +1635,28 @@ class InteractiveApp:
                 (self.display_width, self.display_height),
                 interpolation=cv2.INTER_AREA,
             )
-        return rendered
+        return np.vstack((rendered, self.render_controls()))
 
     def advance_playback(self) -> None:
-        if not self.playing or self.follow_live or self.editing:
+        if not self.playing:
             return
         now = time.monotonic()
         if now - self.last_play_time < 1.0 / self.video_info.fps:
             return
         self.last_play_time = now
         next_frame = self.display_index + self.playback_direction
-        if 0 <= next_frame < self.frame_count:
-            if next_frame in self.cache and next_frame not in self.stale_frames:
-                self.set_display_index(next_frame, programmatic=True)
+        frontier = self.playable_frontier()
+        if 0 <= next_frame <= frontier:
+            self.set_display_index(next_frame)
             return
-        if (
-            self.playback_direction > 0
-            and self.reverse_ready
-            and self.playback_origin is not None
-        ):
-            self.playback_direction = -1
-            self.set_display_index(int(self.playback_origin), programmatic=True)
-            self.status = "playing backward"
-        elif (
-            self.playback_direction > 0
-            and self.propagation_direction == "forward"
-            and self.propagation_complete
-        ):
+        if self.playback_direction < 0 or self.display_index >= self.frame_count - 1:
             self.playing = False
-            self.playback_origin = None
-            self.status = "complete - ready for review"
-        elif self.playback_direction < 0:
-            self.playing = False
-            self.playback_origin = None
             self.status = "complete - ready for review"
 
     def handle_key(self, key: int) -> bool:
         key_names = {
             8: "Backspace",
-            10: "Enter",
-            13: "Enter",
             27: "Esc",
-            32: "Space",
             127: "Backspace",
         }
         key_name = key_names.get(key)
@@ -1217,7 +1664,23 @@ class InteractiveApp:
             key_name = chr(key) if 32 <= key <= 126 else f"code-{key}"
         self.log_input("keyboard", key=key_name, key_code=key)
         if key in (ord("q"), ord("Q")):
+            missing = self.unprocessed_frames()
+            if missing:
+                preview = ", ".join(str(frame) for frame in missing[:10])
+                suffix = "..." if len(missing) > 10 else ""
+                self.status = (
+                    f"cannot quit: {len(missing)} unprocessed frames "
+                    f"({preview}{suffix})"
+                )
+                tqdm.write(
+                    f"无法退出：还有 {len(missing)} 帧未处理" f"（{preview}{suffix}）",
+                    file=sys.stderr,
+                )
+                return True
             return False
+        if self.playing or self.runner.is_alive:
+            self.status = "pause playback and propagation before editing"
+            return True
         if key == 27:
             self.cancel_edit()
         elif key in (8, 127):
@@ -1226,51 +1689,29 @@ class InteractiveApp:
             self.preview()
         elif key in (ord("c"), ord("C")):
             self.clear_all_interactions()
-        elif key in (10, 13):
-            self.confirm()
-        elif key == ord(" ") and not self.editing:
-            self.follow_live = False
-            self.playback_origin = None
-            if self.runner.is_alive:
-                self.stop_propagation()
-                self.playing = False
-                self.status = "paused"
-            else:
-                self.playing = not self.playing
-            self.last_play_time = time.monotonic()
+        elif key in (10, 13, 32):
+            self.status = "Enter and Space are disabled"
         return True
 
     def finalize(self) -> None:
-        if self.editing:
-            had_preview = self.preview_signature is not None
-            self.record_event(
-                "quit_discard", point_sequences=[p.sequence for p in self.draft_points]
-            )
-            self.reset_edit_state()
-            if had_preview:
-                self.restore_confirmed_state()
-        if self.runner.is_alive:
-            self.runner.join()
-            self.drain_events()
+        self.playing = False
+        self.stop_propagation()
         if self.fatal_error is not None:
             raise RuntimeError("background propagation failed") from self.fatal_error
-        if not self.propagation_complete or len(self.cache) < self.frame_count:
-            start_frame = self.commits[-1].frame_index if self.commits else 0
-            self.synchronous_propagation(start_frame)
-        missing = sorted(set(range(self.frame_count)) - set(self.cache))
+        missing = self.unprocessed_frames()
         if missing:
-            raise RuntimeError(
-                f"final propagation did not produce frames: {missing[:10]}"
-            )
+            raise RuntimeError(f"cannot finalize unprocessed frames: {missing[:10]}")
         self.record_event("finalize", frames=self.frame_count)
         write_interactive_outputs(self)
+        frontier = self.playable_frontier()
+        print(
+            f"处理结果：已处理 {frontier + 1}/{self.frame_count} 帧"
+            f"（可播放范围 0-{frontier}）"
+        )
 
     def run(self) -> None:
         cv2.namedWindow(WINDOW_NAME, WINDOW_FLAGS)
         self.window_open = True
-        cv2.createTrackbar(
-            "frame", WINDOW_NAME, 0, max(0, self.frame_count - 1), self.on_trackbar
-        )
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
         try:
             running = True
@@ -1416,8 +1857,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "source": source,
             "frames_processed": app.frame_count,
             "object_id_to_label": {
-                str(obj_id): label
-                for obj_id, label in sorted(object_to_label.items())
+                str(obj_id): label for obj_id, label in sorted(object_to_label.items())
             },
             "outputs": outputs,
         },
@@ -1430,7 +1870,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "input_video": str(app.video_path),
             "model_version": app.version,
             "text_prompt": app.prompt,
-            "propagation_direction": app.propagation_direction,
+            "propagation_direction": app.initial_propagation_mode,
             "source": source,
             "outputs": outputs,
             "confirmed_points": [
@@ -1471,7 +1911,6 @@ def run_interactive(
     prompt: str,
     output_dir: Path,
     window_width: int,
-    propagation_direction: str,
     checkpoint_interval: int,
 ) -> None:
     response = predictor.handle_request(
@@ -1499,7 +1938,6 @@ def run_interactive(
             prompt,
             output_dir,
             window_width,
-            propagation_direction,
             checkpoint_interval,
         )
         app.start(response.get("outputs", {}))
@@ -1536,16 +1974,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite", action="store_true", help="Replace existing interactive outputs"
     )
     parser.add_argument(
-        "--propagation-direction",
-        choices=("both", "forward"),
-        default="both",
-        help="Propagate from an edited frame in both directions or forward only",
-    )
-    parser.add_argument(
         "--window-width",
-        type=positive_int,
+        type=window_width_int,
         default=1280,
-        help="Maximum interactive image width (default: 1280)",
+        help="Maximum interactive image width, at least 640 (default: 1280)",
     )
     parser.add_argument(
         "--checkpoint-interval",
@@ -1605,7 +2037,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.text_prompt,
                 output_dir,
                 args.window_width,
-                args.propagation_direction,
                 args.checkpoint_interval,
             )
     finally:

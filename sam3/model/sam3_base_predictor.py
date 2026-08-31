@@ -226,6 +226,8 @@ class Sam3BasePredictor:
             return self.save_checkpoint(
                 session_id=request["session_id"],
                 frame_idx=request["frame_index"],
+                propagation_direction=request.get("propagation_direction"),
+                exact_frame=request.get("exact_frame", False),
             )
         elif request_type == "restore_checkpoint":
             return self.restore_checkpoint(
@@ -500,46 +502,76 @@ class Sam3BasePredictor:
             if key not in excluded
         }
 
-    def save_checkpoint(self, session_id, frame_idx):
+    def save_checkpoint(
+        self,
+        session_id,
+        frame_idx,
+        propagation_direction=None,
+        exact_frame=False,
+    ):
         """Save a CPU-only snapshot of a session's mutable inference state."""
         session = self._get_session(session_id)
         self._extend_expiration_time(session)
         state = session["state"]
-        checkpoint_frame = self._checkpoint_frame(state, frame_idx)
+        checkpoint_frame = (
+            int(frame_idx) if exact_frame else self._checkpoint_frame(state, frame_idx)
+        )
         checkpoints = session["checkpoints"]
+        direction = propagation_direction or "forward"
+        if direction not in {"both", "forward", "backward"}:
+            raise ValueError(f"invalid checkpoint direction: {direction}")
+        checkpoint_key = (
+            (direction, checkpoint_frame)
+            if propagation_direction is not None
+            else checkpoint_frame
+        )
         tensor_cache = session["checkpoint_tensor_cache"]
         dead_keys = [
             key for key, entry in tensor_cache.items() if entry.source() is None
         ]
         for key in dead_keys:
             tensor_cache.pop(key, None)
-        created = checkpoint_frame not in checkpoints
+        created = checkpoint_key not in checkpoints
         if created:
-            checkpoints[checkpoint_frame] = self._checkpoint_mutable_state(
+            checkpoints[checkpoint_key] = self._checkpoint_mutable_state(
                 state, tensor_cache
             )
         return {
             "is_success": True,
             "frame_index": checkpoint_frame,
+            "propagation_direction": direction,
             "created": created,
         }
 
     def restore_checkpoint(self, session_id, target_frame_idx):
-        """Restore the newest checkpoint at or before ``target_frame_idx``."""
+        """Restore the nearest checkpoint that can propagate toward the target."""
         session = self._get_session(session_id)
         self._extend_expiration_time(session)
         checkpoints = session["checkpoints"]
-        candidates = [frame for frame in checkpoints if frame <= int(target_frame_idx)]
+        target_frame_idx = int(target_frame_idx)
+        candidates = []
+        for order, key in enumerate(checkpoints):
+            direction, frame = key if isinstance(key, tuple) else ("forward", key)
+            if (
+                direction == "both"
+                or direction == "forward"
+                and frame <= target_frame_idx
+                or direction == "backward"
+                and frame >= target_frame_idx
+            ):
+                candidates.append(
+                    (abs(frame - target_frame_idx), -order, key, direction, frame)
+                )
         if not candidates:
             return {"is_success": False, "frame_index": None}
-        checkpoint_frame = max(candidates)
+        _, _, checkpoint_key, checkpoint_direction, checkpoint_frame = min(candidates)
         state = session["state"]
         immutable = {
             key: state[key] for key in ("input_batch", "constants") if key in state
         }
         state.clear()
         gc.collect()
-        restored = _restore_state_from_cpu(checkpoints[checkpoint_frame], {})
+        restored = _restore_state_from_cpu(checkpoints[checkpoint_key], {})
         state.update(immutable)
         state.update(restored)
         # Backbone features are valid for only the frame that produced them and
@@ -557,6 +589,7 @@ class Sam3BasePredictor:
         return {
             "is_success": True,
             "frame_index": checkpoint_frame,
+            "propagation_direction": checkpoint_direction,
         }
 
     def clear_checkpoints(self, session_id):

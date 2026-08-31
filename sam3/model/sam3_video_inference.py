@@ -30,7 +30,24 @@ logger = get_logger(__name__)
 def _frame_progress(processing_order, num_frames, reverse, **kwargs):
     if not reverse:
         kwargs.update(initial=processing_order.start, total=num_frames)
-    return tqdm(processing_order, **kwargs)
+        return tqdm(processing_order, **kwargs)
+
+    progress = tqdm(
+        total=num_frames,
+        initial=processing_order.start + 1,
+        **kwargs,
+    )
+
+    def count_down():
+        try:
+            for frame_idx in processing_order:
+                yield frame_idx
+                progress.n = frame_idx
+                progress.refresh()
+        finally:
+            progress.close()
+
+    return count_down()
 
 
 class Sam3VideoInference(Sam3VideoBase):
@@ -573,9 +590,9 @@ class Sam3VideoInference(Sam3VideoBase):
 
         if refined_obj_id_to_mask is not None:
             for obj_id, refined_mask in refined_obj_id_to_mask.items():
-                assert refined_mask is not None, (
-                    f"Refined mask data must be provided for obj_id {obj_id}"
-                )
+                assert (
+                    refined_mask is not None
+                ), f"Refined mask data must be provided for obj_id {obj_id}"
                 obj_id_to_mask[obj_id] = refined_mask
 
         return obj_id_to_mask
@@ -864,12 +881,12 @@ class Sam3VideoInference(Sam3VideoBase):
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
         num_frames = inference_state["num_frames"]
-        assert text_str is not None or boxes_xywh is not None, (
-            "at least one type of prompt (text, boxes) must be provided"
-        )
-        assert 0 <= frame_idx < num_frames, (
-            f"{frame_idx=} is out of range for a total of {num_frames} frames"
-        )
+        assert (
+            text_str is not None or boxes_xywh is not None
+        ), "at least one type of prompt (text, boxes) must be provided"
+        assert (
+            0 <= frame_idx < num_frames
+        ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
         # since it's a semantic prompt, we start over
         self.reset_state(inference_state)
@@ -1219,9 +1236,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             "propagation_partial",
             "propagation_fetch",
         ]
-        assert action_type in instance_actions + propagation_actions, (
-            f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
-        )
+        assert (
+            action_type in instance_actions + propagation_actions
+        ), f"Invalid action type: {action_type}, must be one of {instance_actions + propagation_actions}"
         action = {
             "type": action_type,
             "frame_idx": frame_idx,
@@ -1389,12 +1406,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
     ):
         if points is not None:
             # Tracker instance prompts
-            assert text_str is None and boxes_xywh is None, (
-                "When points are provided, text_str and boxes_xywh must be None."
-            )
-            assert obj_id is not None, (
-                "When points are provided, obj_id must be provided."
-            )
+            assert (
+                text_str is None and boxes_xywh is None
+            ), "When points are provided, text_str and boxes_xywh must be None."
+            assert (
+                obj_id is not None
+            ), "When points are provided, obj_id must be provided."
             return self.add_tracker_new_points(
                 inference_state,
                 frame_idx,
@@ -1510,9 +1527,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 tracker_states = self._get_tracker_inference_states_by_obj_ids(
                     inference_state, [obj_id]
                 )
-                assert len(tracker_states) == 1, (
-                    f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
-                )
+                assert (
+                    len(tracker_states) == 1
+                ), f"[rank={self.rank}] Multiple Tracker inference states found for the same object id."
                 tracker_state = tracker_states[0]
 
             # log
