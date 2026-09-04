@@ -68,7 +68,7 @@ def test_filtered_candidates_keep_only_supported_statuses_and_thresholds() -> No
     ]
 
 
-def test_select_prompts_uses_one_positive_and_supported_negative_joints() -> None:
+def test_select_prompts_uses_spread_positives_and_supported_negative_joints() -> None:
     candidates = [
         processor.JointCandidate("left", "visible", 1, "pos", 2, 2, (2, 2), 0.8, 30),
         processor.JointCandidate("left", "visible", 2, "best", 3, 3, (3, 3), 0.8, 40),
@@ -85,10 +85,32 @@ def test_select_prompts_uses_one_positive_and_supported_negative_joints() -> Non
 
     assert [(point.kind, point.label) for point in points] == [
         ("joint_positive", 1),
+        ("joint_positive", 1),
         ("target_occluded_negative", 0),
         ("opposite_visible_negative", 0),
     ]
     assert points[0].joint.joint_name == "best"
+    assert points[1].joint.joint_name == "pos"
+
+
+def test_positive_prompts_are_capped_and_spatially_distributed() -> None:
+    candidates = [
+        processor.JointCandidate(
+            "left", "visible", index, f"joint_{index}", x, y, (x, y), 0.8, reliability
+        )
+        for index, x, y, reliability in (
+            (0, 5, 5, 100),
+            (1, 6, 5, 90),
+            (2, 20, 5, 80),
+            (3, 5, 20, 70),
+        )
+    ]
+
+    points = processor.select_frame_prompts(
+        candidates, {}, np.ones((25, 25), dtype=bool), "left", 0.5, 5
+    )
+
+    assert [point.joint.joint_index for point in points] == [0, 2, 3]
 
 
 def test_negative_prompts_require_a_same_frame_positive() -> None:
@@ -115,17 +137,18 @@ def test_positive_outside_the_mask_is_never_submitted() -> None:
     assert points == []
 
 
-def test_nearby_negative_is_dropped_in_favor_of_positive() -> None:
+def test_negative_near_any_positive_is_dropped() -> None:
     candidates = [
         processor.JointCandidate("left", "visible", 1, "pos", 5, 5, (5, 5), 0.8, 30),
-        processor.JointCandidate("right", "visible", 2, "neg", 8, 5, (8, 5), 0.8, 30),
+        processor.JointCandidate("left", "visible", 2, "pos2", 15, 5, (15, 5), 0.8, 29),
+        processor.JointCandidate("right", "visible", 3, "neg", 18, 5, (18, 5), 0.8, 30),
     ]
 
     points = processor.select_frame_prompts(
-        candidates, {}, np.ones((12, 12), dtype=bool), "left", 0.5, 5
+        candidates, {}, np.ones((12, 24), dtype=bool), "left", 0.5, 5
     )
 
-    assert [point.kind for point in points] == ["joint_positive"]
+    assert [point.kind for point in points] == ["joint_positive", "joint_positive"]
 
 
 def test_arm_negative_is_on_forearm_side_and_clear_of_joints() -> None:
@@ -199,13 +222,33 @@ def test_parser_defaults_to_agreed_thresholds_and_sam3() -> None:
     )
 
     assert args.version == "sam3"
+    assert args.segmentation_passes == 2
     assert args.detection_confidence_threshold == 0.7
     assert args.reliability_distance_threshold_px == 25
     assert args.arm_distance_ratio == 0.5
     assert not hasattr(args, "recovery_frames")
 
+    with pytest.raises(SystemExit):
+        processor.build_parser().parse_args(
+            [
+                "--input-dir",
+                "input",
+                "--output-dir",
+                "output",
+                "--hand-side",
+                "left",
+                "--segmentation-passes",
+                "0",
+            ]
+        )
 
-def test_two_pass_process_writes_outputs_and_normalized_points(tmp_path: Path) -> None:
+
+@pytest.mark.parametrize(
+    ("segmentation_passes", "expected_point_requests"), [(1, 0), (2, 3), (3, 6)]
+)
+def test_iterative_process_writes_outputs_and_normalized_points(
+    tmp_path: Path, segmentation_passes: int, expected_point_requests: int
+) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
     joints_dir = input_dir / "MANO_wilor_occlusion"
@@ -258,6 +301,8 @@ def test_two_pass_process_writes_outputs_and_normalized_points(tmp_path: Path) -
             self.requests.append(request)
             if request["type"] == "start_session":
                 return {"session_id": "fake"}
+            if request["type"] in {"save_checkpoint", "restore_checkpoint"}:
+                return {"is_success": True, "frame_index": request["frame_index"]}
             return {
                 "frame_index": request.get("frame_index", 0),
                 "outputs": self.outputs(),
@@ -283,6 +328,8 @@ def test_two_pass_process_writes_outputs_and_normalized_points(tmp_path: Path) -
             str(output_dir),
             "--hand-side",
             "left",
+            "--segmentation-passes",
+            str(segmentation_passes),
         ]
     )
 
@@ -290,7 +337,10 @@ def test_two_pass_process_writes_outputs_and_normalized_points(tmp_path: Path) -
 
     metadata = json.loads((output_dir / "metadata.json").read_text())
     assert metadata["status"] == "success"
-    assert metadata["prompted_frames"] == 3
+    assert metadata["requested_segmentation_passes"] == segmentation_passes
+    assert metadata["completed_segmentation_passes"] == segmentation_passes
+    assert metadata["prompted_frames"] == (0 if segmentation_passes == 1 else 3)
+    assert len(metadata["passes"]) == segmentation_passes
     assert metadata["target_obj_id"] == 7
     assert all(
         (output_dir / name).is_file()
@@ -301,11 +351,12 @@ def test_two_pass_process_writes_outputs_and_normalized_points(tmp_path: Path) -
         for request in predictor.requests
         if request["type"] == "add_prompt" and "points" in request
     ]
-    assert len(point_requests) == 3
-    assert point_requests[0]["points"] == [
-        [3 / 16, 3 / 12],
-        [12 / 16, 8 / 12],
-    ]
-    assert point_requests[0]["point_labels"] == [1, 0]
+    assert len(point_requests) == expected_point_requests
+    if point_requests:
+        assert point_requests[0]["points"] == [
+            [3 / 16, 3 / 12],
+            [12 / 16, 8 / 12],
+        ]
+        assert point_requests[0]["point_labels"] == [1, 0]
     result_info = processor.probe_video(output_dir / "result.mp4")
     assert (result_info["width"], result_info["height"]) == (48, 12)

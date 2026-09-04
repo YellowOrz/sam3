@@ -6,15 +6,17 @@
 初始化帧，使用 ``left hand`` 或 ``right hand`` 文本提示锁定一个 SAM 实例，
 再向前、向后传播得到基线掩码。随后根据每帧的基线掩码生成点提示：
 
-* 目标手未被遮挡且位于基线掩码内的关节中，可靠距离最大者作为正点；
+* 目标手未被遮挡且位于基线掩码内的关节中，选择最多 3 个
+  可靠且空间分散的正点；
 * 目标手被遮挡且位于基线掩码内的关节中，可靠距离最大者作为负点；
 * 反侧手未被遮挡且位于基线掩码内的关节中，可靠距离最大者作为负点；
 * 位于腕关节前臂方向、远离所有目标手关节的掩码像素可以作为负点。
 
 正点必须位于基线掩码内，不允许用掩码外关节恢复漏分。只有同一帧存在
-正点时才会提交负点；一帧的所有正负点通过一次请求提交。添加逐帧提示后，
-SAM 再传播一次生成最终掩码。``result.mp4`` 在原视频上并排显示候选关节、
-带实际提示点的基线掩码和最终掩码。
+正点时才会提交负点；一帧的所有正负点通过一次请求提交。第 1 次分割只用
+文本提示；从第 2 次开始，每次都根据上一次分割掩码重新计算点提示，再从
+无点提示的基线状态执行分割。``result.mp4`` 在原视频上并排显示候选关节、
+最后一次分割所依据的掩码及提示点，以及最终掩码。
 
 TODO：
 * 关联视频中同侧的多只手。
@@ -29,6 +31,7 @@ TODO：
         --output-dir /path/to/output \
         --hand-side left \
         --version sam3 \
+        --segmentation-passes 2 \
         --device cuda:0
 """
 
@@ -78,6 +81,7 @@ else:  # Direct execution adds scripts/, not the repo root.
 LOGGER = logging.getLogger("sam3_wilor_hand_processor")
 JOINTS_PATH = Path("MANO_wilor_occlusion/hand_joints_occlusion.jsonl")
 MCP_INDICES = (5, 9, 13, 17)
+MAX_POSITIVE_POINTS = 3
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,33 @@ def choose_best(candidates: Sequence[JointCandidate]) -> Optional[JointCandidate
     )
 
 
+def choose_spread_positives(
+    candidates: Sequence[JointCandidate], max_points: int = MAX_POSITIVE_POINTS
+) -> List[JointCandidate]:
+    """Keep the most reliable joint, then add joints farthest from those chosen."""
+    remaining = list(candidates)
+    first = choose_best(remaining)
+    if first is None:
+        return []
+    selected = [first]
+    remaining.remove(first)
+    while remaining and len(selected) < max_points:
+        best = max(
+            remaining,
+            key=lambda joint: (
+                min(
+                    (joint.x - chosen.x) ** 2 + (joint.y - chosen.y) ** 2
+                    for chosen in selected
+                ),
+                joint.reliability_score_px,
+                -joint.joint_index,
+            ),
+        )
+        selected.append(best)
+        remaining.remove(best)
+    return selected
+
+
 def target_geometry(
     frame: Dict[str, Any],
     target_side: str,
@@ -315,23 +346,20 @@ def select_frame_prompts(
     min_negative_distance_px: float,
 ) -> List[PromptPoint]:
     inside = [joint for joint in candidates if mask[joint.y, joint.x]]
-    positive_joint = choose_best(
+    positive_joints = choose_spread_positives(
         [
             joint
             for joint in inside
             if joint.side == target_side and joint.status == "visible"
         ]
     )
-    if positive_joint is None:
+    if not positive_joints:
         return []
 
-    positive = PromptPoint(
-        positive_joint.x,
-        positive_joint.y,
-        1,
-        "joint_positive",
-        positive_joint,
-    )
+    positives = [
+        PromptPoint(joint.x, joint.y, 1, "joint_positive", joint)
+        for joint in positive_joints
+    ]
     negative_joints = (
         (
             "target_occluded_negative",
@@ -367,9 +395,12 @@ def select_frame_prompts(
     negatives = [
         point
         for point in negatives
-        if (point.x - positive.x) ** 2 + (point.y - positive.y) ** 2 >= min_distance_sq
+        if all(
+            (point.x - positive.x) ** 2 + (point.y - positive.y) ** 2 >= min_distance_sq
+            for positive in positives
+        )
     ]
-    return [positive] + negatives
+    return positives + negatives
 
 
 def choose_initial_frame(
@@ -723,6 +754,7 @@ def open_video_writer(
 def write_outputs(
     frame_dir: Path,
     baseline_mask_dir: Path,
+    prompt_mask_dir: Path,
     final_mask_dir: Path,
     candidates_by_frame: Sequence[Sequence[JointCandidate]],
     prompts_by_frame: Sequence[Sequence[PromptPoint]],
@@ -731,6 +763,8 @@ def write_outputs(
     width: int,
     height: int,
     fps: float,
+    prompt_source_pass: int,
+    final_pass: int,
 ) -> None:
     baseline_writer = open_video_writer(
         output_dir / "baseline_masks.mkv", "FFV1", fps, (width, height), False
@@ -749,6 +783,7 @@ def write_outputs(
             if frame is None:
                 raise RuntimeError(f"cannot read extracted frame {frame_index}")
             baseline = read_mask_png(baseline_mask_dir / f"{frame_index:06d}.png")
+            prompt_mask = read_mask_png(prompt_mask_dir / f"{frame_index:06d}.png")
             final = read_mask_png(final_mask_dir / f"{frame_index:06d}.png")
             baseline_writer.write(baseline.astype(np.uint8))
             final_writer.write(final.astype(np.uint8))
@@ -756,11 +791,17 @@ def write_outputs(
             candidate_panel = frame.copy()
             draw_candidates(candidate_panel, candidates, target_side)
             draw_header(candidate_panel, f"frame={frame_index} filtered joints")
-            baseline_panel = overlay_mask(frame, baseline)
+            baseline_panel = overlay_mask(frame, prompt_mask)
             draw_prompts(baseline_panel, prompts_by_frame[frame_index])
-            draw_header(baseline_panel, "baseline + submitted prompts")
+            if final_pass == 1:
+                prompt_header = "pass 1 SAM mask (no point prompts)"
+            else:
+                prompt_header = (
+                    f"pass {prompt_source_pass} + prompts for pass {final_pass}"
+                )
+            draw_header(baseline_panel, prompt_header)
             final_panel = overlay_mask(frame, final)
-            draw_header(final_panel, "refined SAM mask")
+            draw_header(final_panel, f"pass {final_pass} SAM mask")
             result_writer.write(
                 np.concatenate((candidate_panel, baseline_panel, final_panel), axis=1)
             )
@@ -827,6 +868,7 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
         "initial_frame_index": initial_frame,
         "initial_frame_reason": initial_reason,
         "parameters": {
+            "segmentation_passes": args.segmentation_passes,
             "detection_confidence_threshold": args.detection_confidence_threshold,
             "reliability_distance_threshold_px": args.reliability_distance_threshold_px,
             "arm_distance_ratio": args.arm_distance_ratio,
@@ -841,11 +883,13 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
         with tempfile.TemporaryDirectory(prefix="sam3_wilor_") as temporary:
             temporary_dir = Path(temporary)
             frame_dir = temporary_dir / "frames"
-            baseline_dir = temporary_dir / "baseline"
-            final_dir = temporary_dir / "final"
             frame_dir.mkdir()
-            baseline_dir.mkdir()
-            final_dir.mkdir()
+            pass_dirs = [
+                temporary_dir / f"pass_{pass_index:02d}"
+                for pass_index in range(1, args.segmentation_passes + 1)
+            ]
+            for pass_dir in pass_dirs:
+                pass_dir.mkdir()
             decoded_frames = extract_png_frames(video_path, frame_dir, None)
             if decoded_frames != len(frames):
                 raise ValueError(
@@ -892,12 +936,23 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
                 obj_id,
                 width,
                 height,
-                baseline_dir,
+                pass_dirs[0],
                 initial_response.get("outputs", {}),
             )
-            candidates_by_frame, prompts_by_frame = build_prompt_plan(
+            if args.segmentation_passes > 2:
+                predictor.handle_request(
+                    {
+                        "type": "save_checkpoint",
+                        "session_id": session_id,
+                        "frame_index": initial_frame,
+                        "propagation_direction": "both",
+                        "exact_frame": True,
+                    }
+                )
+
+            candidates_by_frame, computed_prompts = build_prompt_plan(
                 frames,
-                baseline_dir,
+                pass_dirs[0],
                 args.hand_side,
                 width,
                 height,
@@ -906,15 +961,50 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
                 args.arm_distance_ratio,
                 args.min_opposite_point_distance_px,
             )
-            prompted_frames = apply_prompt_plan(
-                predictor,
-                session_id,
-                obj_id,
-                prompts_by_frame,
-                width,
-                height,
-            )
-            if prompted_frames:
+            prompts_by_frame: List[List[PromptPoint]] = [[] for _ in range(len(frames))]
+            final_dir = pass_dirs[0]
+            prompt_source_dir = pass_dirs[0]
+            prompt_source_pass = 1
+            completed_passes = 1
+            pass_summaries = [
+                {"pass_index": 1, "prompted_frames": 0, "point_counts": {}}
+            ]
+
+            for pass_index in range(2, args.segmentation_passes + 1):
+                if pass_index > 2:
+                    restored = predictor.handle_request(
+                        {
+                            "type": "restore_checkpoint",
+                            "session_id": session_id,
+                            "frame_index": initial_frame,
+                        }
+                    )
+                    if not restored.get("is_success", False):
+                        raise RuntimeError("failed to restore the text-only baseline")
+                iteration_prompts = computed_prompts
+                prompted_frames = apply_prompt_plan(
+                    predictor,
+                    session_id,
+                    obj_id,
+                    iteration_prompts,
+                    width,
+                    height,
+                )
+                point_counts: Dict[str, int] = {}
+                for points in iteration_prompts:
+                    for point in points:
+                        point_counts[point.kind] = point_counts.get(point.kind, 0) + 1
+                if not prompted_frames:
+                    LOGGER.info(
+                        "Stopping before pass %d because no valid prompts remain",
+                        pass_index,
+                    )
+                    break
+
+                prompts_by_frame = iteration_prompts
+                prompt_source_dir = final_dir
+                prompt_source_pass = completed_passes
+                final_dir = pass_dirs[pass_index - 1]
                 propagate_to_mask_dir(
                     predictor,
                     session_id,
@@ -925,12 +1015,31 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
                     height,
                     final_dir,
                 )
-            else:
-                for source in baseline_dir.iterdir():
-                    shutil.copy2(source, final_dir / source.name)
+                completed_passes = pass_index
+                pass_summaries.append(
+                    {
+                        "pass_index": pass_index,
+                        "prompted_frames": prompted_frames,
+                        "point_counts": point_counts,
+                    }
+                )
+                if pass_index < args.segmentation_passes:
+                    candidates_by_frame, computed_prompts = build_prompt_plan(
+                        frames,
+                        final_dir,
+                        args.hand_side,
+                        width,
+                        height,
+                        args.detection_confidence_threshold,
+                        args.reliability_distance_threshold_px,
+                        args.arm_distance_ratio,
+                        args.min_opposite_point_distance_px,
+                    )
+
             write_outputs(
                 frame_dir,
-                baseline_dir,
+                pass_dirs[0],
+                prompt_source_dir,
                 final_dir,
                 candidates_by_frame,
                 prompts_by_frame,
@@ -939,12 +1048,12 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
                 width,
                 height,
                 float(video_info["fps"]),
+                prompt_source_pass,
+                completed_passes,
             )
 
-        point_counts: Dict[str, int] = {}
-        for points in prompts_by_frame:
-            for point in points:
-                point_counts[point.kind] = point_counts.get(point.kind, 0) + 1
+        final_point_counts = pass_summaries[-1]["point_counts"]
+        final_prompted_frames = pass_summaries[-1]["prompted_frames"]
         metadata.update(
             {
                 "status": "success",
@@ -952,8 +1061,11 @@ def process_video(predictor: Any, args: argparse.Namespace) -> None:
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "frames_processed": len(frames),
                 "target_obj_id": obj_id,
-                "prompted_frames": prompted_frames,
-                "point_counts": point_counts,
+                "requested_segmentation_passes": args.segmentation_passes,
+                "completed_segmentation_passes": completed_passes,
+                "passes": pass_summaries,
+                "prompted_frames": final_prompted_frames,
+                "point_counts": final_point_counts,
                 "frames": [
                     {
                         "frame_index": frame_index,
@@ -1011,6 +1123,13 @@ def nonnegative_float(value: str) -> float:
     return number
 
 
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Refine one SAM hand-video mask with WiLoR joint prompts."
@@ -1019,6 +1138,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--hand-side", required=True, choices=["left", "right"])
     parser.add_argument("--version", default="sam3", choices=["sam3", "sam3.1"])
+    parser.add_argument(
+        "--segmentation-passes",
+        type=positive_int,
+        default=2,
+        help="Total segmentation passes: 1 is text-only, later passes recompute prompts",
+    )
     parser.add_argument(
         "--checkpoint",
         default="~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt",

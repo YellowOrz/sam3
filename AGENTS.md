@@ -7,6 +7,7 @@
 ## 自定义视频脚本
 
 - `process_dataset_videos.py`：递归查找 `color.mp4`，用统一文本提示执行 SAM 3/3.1 分割并保留目录结构。先用 `--list-only` 核对输入；示例：`python scripts/process_dataset_videos.py --input-root DATA --output-root OUT --version sam3.1 --prompt hand --device cuda:0`。
+- `process_hand_video_with_wilor_prompts.py`：处理单个目录中的 `color.mp4` 和 `MANO_wilor_occlusion/hand_joints_occlusion.jsonl`，用 WiLoR 关节迭代修正指定侧手的 SAM 分割。正点必须是落在上一轮目标掩码内的可见目标手关节；`--segmentation-passes` 默认为 2，设为 1 时仅运行文本分割。示例：`uv run scripts/process_hand_video_with_wilor_prompts.py --input-dir DATA --output-dir OUT --hand-side left --version sam3 --segmentation-passes 2 --device cuda:0`。
 - `compare_dataset_videos.py`：按共同的 `result.mp4` 相对路径，将多个提示词输出拼成带标签的对比视频。至少传入两个输出根目录，并用 `--output-dir` 指定目标；自动布局不合适时传 `--grid 2x2`。
 - `qualitative_test_interactive.py`：在桌面窗口中逐帧检查、修正并双向传播实例掩码，输出无损掩码、结果视频和元数据。运行：`python scripts/qualitative_test_interactive.py --video INPUT.mp4 --output-dir OUT --device cuda:0`；需图形环境与 CUDA。
 - `mirror_color_videos.sh`：通过 FFmpeg 批量水平镜像 `color.mp4`，并在目标目录保留相对路径。运行：`./scripts/mirror_color_videos.sh INPUT_ROOT OUTPUT_ROOT`；输入与输出目录不可相同。
