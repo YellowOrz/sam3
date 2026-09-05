@@ -74,7 +74,6 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -83,23 +82,32 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+if __package__:
+    from scripts.video_utils import (
+        as_numpy,
+        color_for_label,
+        COLORS,
+        expand_path,
+        lighter_color,
+        parse_device,
+        positive_int,
+        utc_now as _utc_now,
+    )
+else:
+    from video_utils import (  # type: ignore[no-redef]
+        as_numpy,
+        color_for_label,
+        COLORS,
+        expand_path,
+        lighter_color,
+        parse_device,
+        positive_int,
+        utc_now as _utc_now,
+    )
+
 WINDOW_NAME = "SAM 3 interactive video"
 WINDOW_FLAGS = cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL
 MAX_PROMPT_POINTS = 16
-COLORS = (
-    (60, 60, 255),
-    (60, 220, 60),
-    (255, 100, 60),
-    (60, 220, 220),
-    (220, 60, 220),
-    (220, 180, 60),
-    (120, 60, 255),
-    (255, 160, 60),
-    (60, 160, 255),
-    (180, 255, 60),
-    (255, 60, 160),
-    (160, 60, 255),
-)
 MASK_ALPHA = 0.10
 SELECTED_MASK_ALPHA = 0.20
 SELECTED_COLOR = (255, 255, 0)
@@ -154,32 +162,7 @@ class CommitRecord:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def expand_path(value: str) -> Path:
-    return Path(value).expanduser().absolute()
-
-
-def parse_device(value: str) -> Tuple[str, int]:
-    if value == "cuda":
-        return "cuda:0", 0
-    if not value.startswith("cuda:"):
-        raise argparse.ArgumentTypeError("device must look like 'cuda:0'")
-    try:
-        index = int(value.split(":", 1)[1])
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("device must look like 'cuda:0'") from exc
-    if index < 0:
-        raise argparse.ArgumentTypeError("CUDA device index must be non-negative")
-    return value, index
-
-
-def positive_int(value: str) -> int:
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("value must be greater than zero")
-    return number
+    return _utc_now("milliseconds")
 
 
 def window_width_int(value: str) -> int:
@@ -242,14 +225,6 @@ def load_frame_bgr(frame_dir: Path, frame_index: int) -> np.ndarray:
     return frame
 
 
-def as_numpy(value: Any) -> np.ndarray:
-    if value is None:
-        return np.empty((0,), dtype=np.float32)
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().numpy()
-    return np.asarray(value)
-
-
 def normalize_masks(outputs: Optional[Dict[str, Any]]) -> Dict[int, np.ndarray]:
     if not outputs:
         return {}
@@ -290,16 +265,6 @@ def normalize_frame_outputs(
         int(obj_id): float(probability)
         for obj_id, probability in zip(obj_ids, probabilities)
     }
-
-
-def color_for_label(label: int) -> Tuple[int, int, int]:
-    return COLORS[(label - 1) % len(COLORS)]
-
-
-def lighter_color(
-    color: Tuple[int, int, int], amount: float = 0.45
-) -> Tuple[int, int, int]:
-    return tuple(round(channel + (255 - channel) * amount) for channel in color)
 
 
 def render_frame_bgr(

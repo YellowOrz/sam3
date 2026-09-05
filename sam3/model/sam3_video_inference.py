@@ -470,6 +470,7 @@ class Sam3VideoInference(Sam3VideoBase):
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
+            out_tracker_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
         else:
@@ -544,6 +545,7 @@ class Sam3VideoInference(Sam3VideoBase):
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
+            "out_tracker_probs": out_tracker_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),

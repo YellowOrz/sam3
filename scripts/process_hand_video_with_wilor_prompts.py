@@ -9,11 +9,11 @@
 * 目标手未被遮挡且位于基线掩码内的关节中，选择最多 3 个
   可靠且空间分散的正点；
 * 目标手被遮挡且位于基线掩码内的关节中，可靠距离最大者作为负点；
-* 反侧手未被遮挡且位于基线掩码内的关节中，可靠距离最大者作为负点；
+* 反侧手未被遮挡的关节中，可靠距离最大者作为负点；
 * 位于腕关节前臂方向、远离所有目标手关节的掩码像素可以作为负点。
 
-正点必须位于基线掩码内，不允许用掩码外关节恢复漏分。只有同一帧存在
-正点时才会提交负点；一帧的所有正负点通过一次请求提交。第 1 次分割只用
+正点必须位于基线掩码内。只有同一帧存在正点时才会提交负点；一帧的
+所有正负点通过一次请求提交。第 1 次分割只用
 文本提示；从第 2 次开始，每次都根据上一次分割掩码重新计算点提示，再从
 无点提示的基线状态执行分割。``result.mp4`` 在原视频上并排显示候选关节、
 最后一次分割所依据的掩码及提示点，以及最终掩码。
@@ -23,7 +23,7 @@ TODO：
 * 如果简单腕部几何规则产生误判，为前臂检测增加扩张检测框、最小连通区域
   和跨帧持续性检查。
 * 比较基线与修正掩码的质量，并增加带时序平滑的回退机制。
-* 评估位于基线掩码外的反侧手负点，以及逐帧传播、逐帧修正的在线模式。
+* 评估逐帧传播、逐帧修正的在线模式。
 
 运行示例：
     python scripts/process_hand_video_with_wilor_prompts.py \
@@ -51,26 +51,26 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.process_dataset_videos import (
+    from scripts.video_utils import (
         color_for_label,
         expand_path,
         extract_png_frames,
         lighter_color,
         MASK_ALPHA,
-        normalize_outputs,
+        normalize_output_arrays as normalize_outputs,
         parse_device,
         probe_video,
         utc_now,
         write_json,
     )
 else:  # Direct execution adds scripts/, not the repo root.
-    from process_dataset_videos import (  # type: ignore[no-redef]
+    from video_utils import (  # type: ignore[no-redef]
         color_for_label,
         expand_path,
         extract_png_frames,
         lighter_color,
         MASK_ALPHA,
-        normalize_outputs,
+        normalize_output_arrays as normalize_outputs,
         parse_device,
         probe_video,
         utc_now,
@@ -376,7 +376,7 @@ def select_frame_prompts(
             choose_best(
                 [
                     joint
-                    for joint in inside
+                    for joint in candidates
                     if joint.side != target_side and joint.status == "visible"
                 ]
             ),
@@ -709,7 +709,7 @@ def draw_plus(
 
 def draw_prompts(frame: np.ndarray, prompts: Sequence[PromptPoint]) -> None:
     for point in prompts:
-        if point.kind == "joint_positive":
+        if point.label:
             color = (40, 220, 40)
         elif point.kind == "arm_negative":
             color = (0, 165, 255)
@@ -1161,7 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reliability-distance-threshold-px", type=nonnegative_float, default=25.0
     )
-    parser.add_argument("--arm-distance-ratio", type=nonnegative_float, default=0.5)
+    parser.add_argument("--arm-distance-ratio", type=nonnegative_float, default=0.25)
     parser.add_argument(
         "--min-opposite-point-distance-px", type=nonnegative_float, default=5.0
     )

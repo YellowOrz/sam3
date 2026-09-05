@@ -682,6 +682,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
+            out_sam2_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
         else:
@@ -792,6 +793,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
+            "out_tracker_probs": out_sam2_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),
@@ -913,6 +915,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
+                    "out_tracker_probs": np.zeros(0, dtype=np.float32),
                     "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
@@ -944,6 +947,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
+                    "out_tracker_probs": np.zeros(0, dtype=np.float32),
                     "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
@@ -1008,7 +1012,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             offset += count
 
         # ========== Phase 6: Apply non-overlapping per frame, collect final results ==========
-        final_results = []  # List of (frame_idx, obj_ids, probs, boxes, masks)
+        final_results = []  # (frame_idx, obj_ids, probs, tracker_probs, boxes, masks)
 
         for idx, frame_i in enumerate(frames_with_objects):
             data = frame_data[frame_i]
@@ -1043,7 +1047,14 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 ) > 0
 
             final_results.append(
-                (frame_i, out_obj_ids, out_probs, out_boxes, out_masks)
+                (
+                    frame_i,
+                    out_obj_ids,
+                    out_probs,
+                    out_sam2_probs,
+                    out_boxes,
+                    out_masks,
+                )
             )
 
         # ========== Phase 6.5: Compute centers for prod ==========
@@ -1053,7 +1064,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 "Sam3MultiplexTracking._postprocess_output_batched.prod_outputs"
             ):
                 # Concatenate all masks for batched center computation
-                all_masks = torch.cat([r[4] for r in final_results], dim=0)
+                all_masks = torch.cat([r[5] for r in final_results], dim=0)
                 if all_masks.shape[0] > 0:
                     y_coords = torch.arange(
                         H_video, device=all_masks.device, dtype=torch.float32
@@ -1078,6 +1089,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
+                    "out_tracker_probs": np.zeros(0, dtype=np.float32),
                     "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": data[5],
@@ -1090,8 +1102,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # ========== Phase 7: Concatenate for batched GPU→CPU copy ==========
         final_obj_ids = torch.cat([r[1] for r in final_results], dim=0)
         final_probs = torch.cat([r[2] for r in final_results], dim=0)
-        final_boxes = torch.cat([r[3] for r in final_results], dim=0)
-        final_masks = torch.cat([r[4] for r in final_results], dim=0)
+        final_tracker_probs = torch.cat([r[3] for r in final_results], dim=0)
+        final_boxes = torch.cat([r[4] for r in final_results], dim=0)
+        final_masks = torch.cat([r[5] for r in final_results], dim=0)
 
         total_objects = final_obj_ids.shape[0]
 
@@ -1113,6 +1126,12 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     pin_memory=True,
                 ),
                 "out_probs": torch.zeros(
+                    batched_buffer_size,
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "out_tracker_probs": torch.zeros(
                     batched_buffer_size,
                     dtype=torch.float32,
                     device="cpu",
@@ -1145,6 +1164,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
 
         self.buffer_cpu_batched["out_obj_ids"][:total_objects].copy_(final_obj_ids)
         self.buffer_cpu_batched["out_probs"][:total_objects].copy_(final_probs)
+        self.buffer_cpu_batched["out_tracker_probs"][:total_objects].copy_(
+            final_tracker_probs
+        )
         self.buffer_cpu_batched["out_boxes_xywh"][:total_objects].copy_(final_boxes)
         self.buffer_cpu_batched["out_binary_masks"][:total_objects].copy_(final_masks)
 
@@ -1155,7 +1177,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
         # Create mapping from frame index to (offset, count) in the buffer
         frame_to_offset_count = {}
         offset = 0
-        for frame_i, obj_ids, _, _, _ in final_results:
+        for frame_i, obj_ids, _, _, _, _ in final_results:
             count = obj_ids.shape[0]
             frame_to_offset_count[frame_i] = (offset, count)
             offset += count
@@ -1168,6 +1190,7 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                 output_dict = {
                     "out_obj_ids": np.zeros(0, dtype=np.int64),
                     "out_probs": np.zeros(0, dtype=np.float32),
+                    "out_tracker_probs": np.zeros(0, dtype=np.float32),
                     "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
                     "out_binary_masks": np.zeros((0, H_video, W_video), dtype=bool),
                     "frame_stats": frame_stats,
@@ -1184,6 +1207,11 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
                     .numpy()
                     .copy(),
                     "out_probs": self.buffer_cpu_batched["out_probs"][
+                        buf_offset : buf_offset + num_objects
+                    ]
+                    .numpy()
+                    .copy(),
+                    "out_tracker_probs": self.buffer_cpu_batched["out_tracker_probs"][
                         buf_offset : buf_offset + num_objects
                     ]
                     .numpy()

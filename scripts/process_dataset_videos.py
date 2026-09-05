@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run SAM 3/3.1 text-prompted video segmentation over color.mp4 sequences.
 
-The input tree is searched recursively for files named exactly ``color.mp4``.
-Other videos (for example depth previews or pre-rendered mask overlays) are
-ignored. Each input video is decoded to a temporary lossless PNG directory because the
-SAM 3 image-directory loader is substantially more memory efficient than its
+If the input directory directly contains ``color.mp4``, it is treated as one
+sequence. Otherwise, the input tree is searched recursively for files named exactly
+``color.mp4``. Each video is decoded to a temporary lossless PNG directory because
+the SAM 3 image-directory loader is substantially more memory efficient than its
 direct OpenCV video loader.
 
 Example:
@@ -23,143 +23,79 @@ import shutil
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+if __package__:
+    from scripts.video_utils import (
+        color_for_label,
+        expand_path,
+        extract_png_frames,
+        lighter_color,
+        normalize_output_arrays,
+        parse_device,
+        positive_int,
+        probe_video as _probe_video,
+        utc_now,
+        write_json,
+    )
+else:
+    from video_utils import (  # type: ignore[no-redef]
+        color_for_label,
+        expand_path,
+        extract_png_frames,
+        lighter_color,
+        normalize_output_arrays,
+        parse_device,
+        positive_int,
+        probe_video as _probe_video,
+        utc_now,
+        write_json,
+    )
+
 
 LOGGER = logging.getLogger("sam3_dataset_processor")
 # BGR colors for OpenCV rendering. Label zero is the background and never uses
 # this palette.
-COLORS = (
-    (60, 60, 255),
-    (60, 220, 60),
-    (255, 100, 60),
-    (60, 220, 220),
-    (220, 60, 220),
-    (220, 180, 60),
-    (120, 60, 255),
-    (255, 160, 60),
-    (60, 160, 255),
-    (180, 255, 60),
-    (255, 60, 160),
-    (160, 60, 255),
-)
 MASK_ALPHA = 0.30
 EDGE_HALO_THICKNESS = 2
 EDGE_COLOR_THICKNESS = 1
 
 
-def utc_now() -> str:
-    """Return a compact ISO-8601 timestamp in UTC."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def expand_path(value: str) -> Path:
-    # Keep symlink components exactly as provided instead of resolving them to
-    # their targets. ``absolute()`` only anchors relative paths to the current
-    # working directory.
-    return Path(value).expanduser().absolute()
-
-
-def parse_device(value: str) -> Tuple[str, int]:
-    """Validate a CUDA device string and return it with its numeric index."""
-    if value == "cuda":
-        return "cuda:0", 0
-    if not value.startswith("cuda:"):
-        raise argparse.ArgumentTypeError("device must look like 'cuda:0'")
-    try:
-        index = int(value.split(":", 1)[1])
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("device must look like 'cuda:0'") from exc
-    if index < 0:
-        raise argparse.ArgumentTypeError("CUDA device index must be non-negative")
-    return value, index
-
-
-def positive_int(value: str) -> int:
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("value must be greater than zero")
-    return number
-
-
 def discover_color_videos(input_root: Path) -> List[Path]:
-    """Find only color.mp4 inputs, in deterministic relative-path order."""
+    """Find a direct color.mp4 or recursively discover dataset sequences."""
+    direct_video = input_root / "color.mp4"
+    if direct_video.is_file():
+        return [direct_video]
     return sorted(
         (path for path in input_root.rglob("color.mp4") if path.is_file()),
         key=lambda path: path.relative_to(input_root).as_posix(),
     )
 
 
+def output_dir_for(video_path: Path, input_root: Path, output_root: Path) -> Path:
+    if video_path.parent == input_root:
+        return output_root
+    return output_root / video_path.parent.relative_to(input_root)
+
+
+def processing_directions(direction: str) -> Tuple[str, ...]:
+    return ("forward", "backward") if direction == "both" else (direction,)
+
+
+def directional_output_dir(
+    output_dir: Path, requested_direction: str, direction: str
+) -> Path:
+    if requested_direction != "both":
+        return output_dir
+    return output_dir / direction
+
+
 def probe_video(video_path: Path) -> Dict[str, Any]:
-    cap = cv2.VideoCapture(str(video_path))
-    try:
-        if not cap.isOpened():
-            raise RuntimeError(f"cannot open video: {video_path}")
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = float(cap.get(cv2.CAP_PROP_FPS))
-    finally:
-        cap.release()
-
-    if width <= 0 or height <= 0:
-        raise RuntimeError(f"invalid video dimensions for {video_path}")
-    if fps <= 0:
-        LOGGER.warning("Invalid FPS for %s; falling back to 30", video_path)
-        fps = 30.0
-    return {
-        "width": width,
-        "height": height,
-        "frame_count": frame_count,
-        "fps": fps,
-    }
-
-
-def extract_png_frames(
-    video_path: Path,
-    frame_dir: Path,
-    max_frames: Optional[int],
-) -> int:
-    """Decode one color video to sequential, lossless PNG files."""
-    cap = cv2.VideoCapture(str(video_path))
-    count = 0
-    try:
-        if not cap.isOpened():
-            raise RuntimeError(f"cannot open video: {video_path}")
-        while max_frames is None or count < max_frames:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_path = frame_dir / f"{count:06d}.png"
-            written = cv2.imwrite(
-                str(frame_path),
-                frame,
-                [cv2.IMWRITE_PNG_COMPRESSION, 1],
-            )
-            if not written:
-                raise RuntimeError(f"failed to write temporary frame: {frame_path}")
-            count += 1
-    finally:
-        cap.release()
-
-    if count == 0:
-        raise RuntimeError(f"video contains no readable frames: {video_path}")
-    return count
-
-
-def write_json(path: Path, payload: Dict[str, Any]) -> None:
-    """Atomically replace a JSON status file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    with temporary_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    temporary_path.replace(path)
+    return _probe_video(video_path, fallback_fps=30.0)
 
 
 def expected_frame_count(video_info: Dict[str, Any], max_frames: Optional[int]) -> int:
@@ -177,6 +113,7 @@ def is_complete(
     prompt: str,
     model_version: str,
     expected_frames: int,
+    direction: str,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
@@ -192,6 +129,7 @@ def is_complete(
         and metadata.get("input_video") == str(video_path)
         and metadata.get("prompt") == prompt
         and metadata.get("model_version") == model_version
+        and metadata.get("propagation_direction", "forward") == direction
         and metadata.get("frames_processed") == expected_frames
         and result_path.is_file()
         and masks_path.is_file()
@@ -219,48 +157,10 @@ def prepare_output_dir(output_dir: Path) -> Tuple[Path, Path, Path]:
     return masks_path, result_path, metadata_path
 
 
-def as_numpy(value: Any) -> np.ndarray:
-    if value is None:
-        return np.empty((0,), dtype=np.float32)
-    if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
-    return np.asarray(value)
-
-
 def normalize_outputs(
-    outputs: Dict[str, Any]
+    outputs: Dict[str, Any],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    obj_ids = as_numpy(outputs.get("out_obj_ids")).reshape(-1)
-    probs = as_numpy(outputs.get("out_probs")).reshape(-1)
-    masks = as_numpy(outputs.get("out_binary_masks"))
-    if masks.size == 0:
-        masks = np.empty((0, 0, 0), dtype=bool)
-    elif masks.ndim == 4 and masks.shape[1] == 1:
-        masks = masks[:, 0]
-    elif masks.ndim == 2:
-        masks = masks[None]
-    if masks.ndim != 3:
-        raise RuntimeError(f"unexpected mask shape: {masks.shape}")
-    if len(obj_ids) != len(masks):
-        raise RuntimeError(
-            f"object/mask count mismatch: {len(obj_ids)} IDs and {len(masks)} masks"
-        )
-    if len(probs) not in (0, len(obj_ids)):
-        raise RuntimeError(
-            f"object/score count mismatch: {len(obj_ids)} IDs and {len(probs)} scores"
-        )
-    return obj_ids, probs, masks
-
-
-def color_for_label(label: int) -> Tuple[int, int, int]:
-    return COLORS[(label - 1) % len(COLORS)]
-
-
-def lighter_color(
-    color: Tuple[int, int, int], amount: float = 0.45
-) -> Tuple[int, int, int]:
-    """Return a lighter BGR color while preserving the instance color family."""
-    return tuple(round(channel + (255 - channel) * amount) for channel in color)
+    return normalize_output_arrays(outputs)
 
 
 def build_label_and_overlay(
@@ -403,6 +303,7 @@ def propagate_and_write(
     height: int,
     fps: float,
     prompt: str,
+    direction: str,
 ) -> Dict[int, int]:
     result_fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     result_writer = cv2.VideoWriter(
@@ -422,25 +323,98 @@ def propagate_and_write(
         raise RuntimeError(f"cannot create lossless mask video: {masks_path}")
 
     object_to_label: Dict[int, int] = {}
-    next_frame_index = 0
     request = {
         "type": "propagate_in_video",
         "session_id": session_id,
-        "propagation_direction": "forward",
-        "start_frame_index": 0,
+        "propagation_direction": direction,
+        "start_frame_index": 0 if direction == "forward" else frame_count - 1,
         "max_frame_num_to_track": frame_count,
     }
     try:
-        for response in predictor.handle_stream_request(request):
-            frame_index = int(response["frame_index"])
-            if frame_index < next_frame_index:
-                raise RuntimeError(
-                    f"model returned out-of-order frame {frame_index} after "
-                    f"{next_frame_index - 1}"
+        if direction == "backward":
+            with tempfile.TemporaryDirectory(
+                prefix="sam3_backward_outputs_"
+            ) as temporary:
+                output_cache = Path(temporary)
+                previous_frame_index = frame_count
+                for response in predictor.handle_stream_request(request):
+                    frame_index = int(response["frame_index"])
+                    if not 0 <= frame_index < frame_count:
+                        continue
+                    if frame_index >= previous_frame_index:
+                        raise RuntimeError(
+                            f"model returned out-of-order frame {frame_index} "
+                            "while propagating backward"
+                        )
+                    previous_frame_index = frame_index
+                    obj_ids, probs, masks = normalize_outputs(
+                        response.get("outputs", empty_outputs())
+                    )
+                    np.savez(
+                        output_cache / f"{frame_index:06d}.npz",
+                        out_obj_ids=obj_ids,
+                        out_probs=probs,
+                        out_binary_masks=masks,
+                    )
+
+                for frame_index in range(frame_count):
+                    cached_path = output_cache / f"{frame_index:06d}.npz"
+                    if cached_path.is_file():
+                        with np.load(cached_path) as cached:
+                            outputs = dict(cached.items())
+                            write_frame_outputs(
+                                frame_dir,
+                                mask_writer,
+                                result_writer,
+                                frame_index,
+                                outputs,
+                                object_to_label,
+                                prompt,
+                            )
+                    else:
+                        write_frame_outputs(
+                            frame_dir,
+                            mask_writer,
+                            result_writer,
+                            frame_index,
+                            empty_outputs(),
+                            object_to_label,
+                            prompt,
+                        )
+        else:
+            next_frame_index = 0
+            for response in predictor.handle_stream_request(request):
+                frame_index = int(response["frame_index"])
+                if not 0 <= frame_index < frame_count:
+                    continue
+                if frame_index < next_frame_index:
+                    raise RuntimeError(
+                        f"model returned out-of-order frame {frame_index} after "
+                        f"{next_frame_index - 1}"
+                    )
+                while next_frame_index < frame_index:
+                    write_frame_outputs(
+                        frame_dir,
+                        mask_writer,
+                        result_writer,
+                        next_frame_index,
+                        empty_outputs(),
+                        object_to_label,
+                        prompt,
+                    )
+                    next_frame_index += 1
+                write_frame_outputs(
+                    frame_dir,
+                    mask_writer,
+                    result_writer,
+                    frame_index,
+                    response.get("outputs", empty_outputs()),
+                    object_to_label,
+                    prompt,
                 )
-            if frame_index >= frame_count:
-                continue
-            while next_frame_index < frame_index:
+                next_frame_index = frame_index + 1
+
+            while next_frame_index < frame_count:
                 write_frame_outputs(
                     frame_dir,
                     mask_writer,
@@ -451,28 +425,6 @@ def propagate_and_write(
                     prompt,
                 )
                 next_frame_index += 1
-            write_frame_outputs(
-                frame_dir,
-                mask_writer,
-                result_writer,
-                frame_index,
-                response.get("outputs", empty_outputs()),
-                object_to_label,
-                prompt,
-            )
-            next_frame_index = frame_index + 1
-
-        while next_frame_index < frame_count:
-            write_frame_outputs(
-                frame_dir,
-                mask_writer,
-                result_writer,
-                next_frame_index,
-                empty_outputs(),
-                object_to_label,
-                prompt,
-            )
-            next_frame_index += 1
     finally:
         mask_writer.release()
         result_writer.release()
@@ -488,11 +440,17 @@ def process_video(
     model_version: str,
     max_frames: Optional[int],
     overwrite: bool,
+    direction: str,
 ) -> str:
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
     if not overwrite and is_complete(
-        output_dir, video_path, prompt, model_version, requested_frames
+        output_dir,
+        video_path,
+        prompt,
+        model_version,
+        requested_frames,
+        direction,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -505,6 +463,7 @@ def process_video(
         "input_relative_path": relative_video,
         "prompt": prompt,
         "model_version": model_version,
+        "propagation_direction": direction,
         "source": video_info,
         "started_at": utc_now(),
         "frames_processed": 0,
@@ -532,7 +491,7 @@ def process_video(
                 {
                     "type": "add_prompt",
                     "session_id": session_id,
-                    "frame_index": 0,
+                    "frame_index": 0 if direction == "forward" else frame_count - 1,
                     "text": prompt,
                 }
             )
@@ -547,6 +506,7 @@ def process_video(
                 height=int(video_info["height"]),
                 fps=float(video_info["fps"]),
                 prompt=prompt,
+                direction=direction,
             )
 
         metadata.update(
@@ -560,17 +520,17 @@ def process_video(
                     for obj_id, label in sorted(object_to_label.items())
                 },
                 "outputs": {
-                    "instance_masks_video": "masks.mkv",
+                    "instance_masks_video": masks_path.name,
                     "instance_masks_codec": "FFV1",
                     "instance_masks_pixel_format": "gray8",
-                    "visualization_video": "result.mp4",
+                    "visualization_video": result_path.name,
                     "label_dtype": "uint8",
                     "background_label": 0,
                 },
             }
         )
         write_json(metadata_path, metadata)
-        LOGGER.info("Completed %s -> %s", relative_video, output_dir)
+        LOGGER.info("Completed %s -> %s", relative_video, result_path)
         return "success"
     except Exception as exc:
         metadata.update(
@@ -602,15 +562,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input-root", default="~/Datasets")
     parser.add_argument("--output-root", default="~/sam3_outputs")
-    parser.add_argument(
-        "--version", default="sam3", choices=["sam3", "sam3.1"]
-    )
+    parser.add_argument("--version", default="sam3", choices=["sam3", "sam3.1"])
     parser.add_argument(
         "--checkpoint",
         default="~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt",
         help="Checkpoint path (auto-downloads from HuggingFace if omitted)",
     )
     parser.add_argument("--prompt", required=True, help="Shared text prompt")
+    parser.add_argument(
+        "--direction",
+        choices=["forward", "backward", "both"],
+        default="forward",
+        help=(
+            "Propagation/playback direction. 'both' writes independent results "
+            "below forward/ and backward/ (default: forward)"
+        ),
+    )
     parser.add_argument(
         "--device",
         type=parse_device,
@@ -684,33 +651,36 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     from sam3 import build_sam3_predictor
 
-    build_kwargs = dict(
-        version=args.version, compile=False, async_loading_frames=True
-    )
+    build_kwargs = dict(version=args.version, compile=False, async_loading_frames=True)
     if checkpoint is not None:
         build_kwargs["checkpoint_path"] = str(checkpoint)
     predictor = build_sam3_predictor(**build_kwargs)
     counts = {"success": 0, "skipped": 0, "failed": 0}
     try:
+        directions = processing_directions(args.direction)
         for index, video_path in enumerate(videos, start=1):
-            relative_parent = video_path.parent.relative_to(input_root)
-            output_dir = output_root / relative_parent
+            base_output_dir = output_dir_for(video_path, input_root, output_root)
             LOGGER.info("[%d/%d] Processing %s", index, len(videos), video_path)
-            try:
-                status = process_video(
-                    predictor=predictor,
-                    video_path=video_path,
-                    output_dir=output_dir,
-                    input_root=input_root,
-                    prompt=args.prompt,
-                    model_version=args.version,
-                    max_frames=args.max_frames,
-                    overwrite=args.overwrite,
+            for direction in directions:
+                output_dir = directional_output_dir(
+                    base_output_dir, args.direction, direction
                 )
-                counts[status] += 1
-            except Exception:
-                counts["failed"] += 1
-                LOGGER.exception("Sequence failed: %s", video_path)
+                try:
+                    status = process_video(
+                        predictor=predictor,
+                        video_path=video_path,
+                        output_dir=output_dir,
+                        input_root=input_root,
+                        prompt=args.prompt,
+                        model_version=args.version,
+                        max_frames=args.max_frames,
+                        overwrite=args.overwrite,
+                        direction=direction,
+                    )
+                    counts[status] += 1
+                except Exception:
+                    counts["failed"] += 1
+                    LOGGER.exception("Sequence failed (%s): %s", direction, video_path)
     finally:
         predictor.shutdown()
 

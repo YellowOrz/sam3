@@ -25,6 +25,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+if __package__:
+    from scripts.video_utils import expand_path
+else:
+    from video_utils import expand_path  # type: ignore[no-redef]
+
 
 LOGGER = logging.getLogger("sam3_video_comparison")
 FPS_TOLERANCE = 1e-3
@@ -45,11 +50,6 @@ class SequenceInputs:
     relative_dir: Path
     videos: Tuple[Path, ...]
     info: VideoInfo
-
-
-def expand_path(value: str) -> Path:
-    """Expand a user path without resolving symlink components."""
-    return Path(value).expanduser().absolute()
 
 
 def parse_grid(value: str) -> Grid:

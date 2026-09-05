@@ -137,6 +137,24 @@ def test_positive_outside_the_mask_is_never_submitted() -> None:
     assert points == []
 
 
+def test_opposite_hand_negative_does_not_need_to_be_inside_mask() -> None:
+    candidates = [
+        processor.JointCandidate("left", "visible", 1, "pos", 5, 5, (5, 5), 0.8, 30),
+        processor.JointCandidate(
+            "right", "visible", 2, "other", 15, 5, (15, 5), 0.8, 30
+        ),
+    ]
+    mask = np.zeros((12, 20), dtype=bool)
+    mask[5, 5] = True
+
+    points = processor.select_frame_prompts(candidates, {}, mask, "left", 0.25, 5)
+
+    assert [point.kind for point in points] == [
+        "joint_positive",
+        "opposite_visible_negative",
+    ]
+
+
 def test_negative_near_any_positive_is_dropped() -> None:
     candidates = [
         processor.JointCandidate("left", "visible", 1, "pos", 5, 5, (5, 5), 0.8, 30),
@@ -225,7 +243,7 @@ def test_parser_defaults_to_agreed_thresholds_and_sam3() -> None:
     assert args.segmentation_passes == 2
     assert args.detection_confidence_threshold == 0.7
     assert args.reliability_distance_threshold_px == 25
-    assert args.arm_distance_ratio == 0.5
+    assert args.arm_distance_ratio == 0.25
     assert not hasattr(args, "recovery_frames")
 
     with pytest.raises(SystemExit):
