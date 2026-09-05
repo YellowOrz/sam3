@@ -28,6 +28,13 @@ logger = get_logger(__name__)
 
 
 def _frame_progress(processing_order, num_frames, reverse, **kwargs):
+    """! @brief 为正向或反向传播创建与真实帧号一致的进度迭代器。
+
+    @param processing_order 本次传播需要处理的帧索引序列。
+    @param num_frames 视频总帧数。
+    @param reverse 是否按时间倒序传播。
+    @return 逐帧产生索引的迭代器。
+    """
     if not reverse:
         kwargs.update(initial=processing_order.start, total=num_frames)
         return tqdm(processing_order, **kwargs)
@@ -51,6 +58,11 @@ def _frame_progress(processing_order, num_frames, reverse, **kwargs):
 
 
 class Sam3VideoInference(Sam3VideoBase):
+    """! @brief SAM 3 视频分割的主编排模型。
+
+    每帧调用父类完成“文本/几何检测 + 已有 masklet 跟踪 + 关联与更新”，本类
+    管理视频级状态、提示、流式输出和结果后处理。
+    """
     TEXT_ID_FOR_TEXT = 0
     TEXT_ID_FOR_VISUAL = 1
 
@@ -62,11 +74,14 @@ class Sam3VideoInference(Sam3VideoBase):
         compile_model=False,
         **kwargs,
     ):
-        """
-        hotstart_delay: int, the delay (in #frames) before the model starts to yield output, 0 to disable hotstart delay.
-        hotstart_unmatch_thresh: int, remove the object if it has this many unmatched frames within its hotstart_delay period.
-            If `hotstart_delay` is set to 0, this parameter is ignored.
-        hotstart_dup_thresh: int, remove the object if it has overlapped with another object this many frames within its hotstart_delay period.
+        """! @brief 初始化视频级推理配置。
+
+        @param image_size 视觉编码器输入边长。
+        @param image_mean,image_std 帧预处理的归一化参数。
+        @param compile_model 是否在第一次传播前编译热点模块。
+
+        ``hotstart_*`` 配置来自父类：模型可延迟若干帧输出，以在视频起始阶段
+        淘汰持续失配或重复的对象。
         """
         super().__init__(**kwargs)
         self.image_size = image_size
@@ -83,7 +98,15 @@ class Sam3VideoInference(Sam3VideoBase):
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
-        """Initialize an inference state from `resource_path` (an image or a video)."""
+        """! @brief 从视频资源创建一次推理所需的全部可变状态。
+
+        @param resource_path 视频、帧目录或图片。
+        @param offload_video_to_cpu 是否将帧保留在 CPU。
+        @param offload_state_to_cpu 是否将跟踪状态保留在 CPU。
+        @return 独立的 ``inference_state`` 字典。
+
+        状态由输入帧、提示、检测/跟踪缓存和对象元数据组成；它是会话隔离的边界。
+        """
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
@@ -102,7 +125,7 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["orig_width"] = orig_width
         # values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
-        # inputs on each frame
+        # ``BatchedDatapoint`` 复用同一份全部帧，帧级方法只按索引读取当前帧。
         self._construct_initial_input_batch(inference_state, images)
         # initialize extra states
         inference_state["tracker_inference_states"] = []
@@ -115,7 +138,10 @@ class Sam3VideoInference(Sam3VideoBase):
 
     @torch.inference_mode()
     def reset_state(self, inference_state):
-        """Revert `inference_state` to what it was right after initialization."""
+        """! @brief 将状态恢复到“帧已加载、尚无提示”的初始状态。
+
+        @param inference_state 要重置的视频状态。
+        """
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
         for t in range(inference_state["num_frames"]):
@@ -137,7 +163,14 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["action_history"].clear()  # for logging user actions
 
     def _construct_initial_input_batch(self, inference_state, images):
-        """Construct an initial `BatchedDatapoint` instance as input."""
+        """! @brief 构造检测器使用的批输入和每帧提示占位符。
+
+        @param inference_state 正在初始化的视频状态。
+        @param images 已 resize、归一化的全部帧。
+
+        文本槽位 0 是用户文本，槽位 1 是视觉提示标记；每帧各有一个 ``FindStage``，
+        因而检测器可在不复制整段视频的情况下选择当前帧。
+        """
         # 1) img_batch
         num_frames = len(images)
         device = self.device
@@ -176,7 +209,7 @@ class Sam3VideoInference(Sam3VideoBase):
         input_batch = copy_data_to_device(input_batch, device, non_blocking=True)
         inference_state["input_batch"] = input_batch
 
-        # construct the placeholder interactive prompts and tracking queries
+        # 空几何提示使无框提示的帧也能走统一的检测器调用路径。
         bs = 1
         inference_state["constants"]["empty_geometric_prompt"] = Prompt(
             box_embeddings=torch.zeros(0, bs, 4, device=device),
@@ -202,10 +235,14 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["visual_prompt_mask"] = None
 
     def _get_visual_prompt(self, inference_state, frame_idx, boxes_cxcywh, box_labels):
-        """
-        Handle the case of visual prompt. Currently, in the inference API we do not
-        explicitly distinguish between initial box as visual prompt vs subsequent boxes
-        or boxes after inference for refinement.
+        """! @brief 将首次单框输入解释为视觉提示，其余框保留为几何细化提示。
+
+        @param frame_idx 框所在帧。
+        @param boxes_cxcywh 归一化中心点格式的累计框。
+        @param box_labels 框的正负标签。
+        @return 去除视觉框后的几何框、标签和新增的 ``Prompt``（若有）。
+
+        首个框只用于提取目标外观 embedding，不能同时再作为几何框重复编码。
         """
         # If the frame hasn't had any inference results before (prompting or propagation),
         # we treat the first added box prompt as a visual prompt; otherwise, we treat
@@ -247,6 +284,13 @@ class Sam3VideoInference(Sam3VideoBase):
     def _get_processing_order(
         self, inference_state, start_frame_idx, max_frame_num_to_track, reverse
     ):
+        """! @brief 计算单向传播的帧范围和访问顺序。
+
+        @return ``(processing_order, end_frame_idx)``。
+
+        未指定起点时，以最早已经产生提示/输出的帧为锚点；反向传播从锚点前一帧
+        开始，避免再次覆盖该锚点的即时结果。
+        """
         num_frames = inference_state["num_frames"]
         previous_stages_out = inference_state["previous_stages_out"]
         if all(out is None for out in previous_stages_out) and start_frame_idx is None:
@@ -280,12 +324,18 @@ class Sam3VideoInference(Sam3VideoBase):
         max_frame_num_to_track=None,
         reverse=False,
     ):
+        """! @brief 按一个时间方向执行整段视频的检测、跟踪与流式输出。
+
+        @param inference_state 当前视频状态。
+        @param start_frame_idx 传播锚点；为空则选最早提示帧。
+        @param max_frame_num_to_track 最大跟踪范围。
+        @param reverse 是否反向传播。
+        @yield ``(frame_idx, outputs)``，输出已还原到原视频尺寸。
+
+        模型实际逐帧推进；``hotstart_delay`` 可暂存前几帧，等对象稳定后再输出，
+        从而避免起始帧的短暂误检形成 masklet。
         """
-        Propagate the prompts to get grounding results for the entire video. This method
-        is a generator and yields inference outputs for all frames in the range specified
-        by `start_frame_idx`, `max_frame_num_to_track`, and `reverse`.
-        """
-        # compile the model (it's a no-op if the model is already compiled)
+        # 首次 add_prompt 保持 eager，用以填充 decoder 缓冲；传播时才开始编译。
         # note that it's intentionally added to `self.propagate_in_video`, so that the first
         # `self.add_prompt` call will be done in eager mode to fill in the decoder buffers
         # such as positional encoding cache)
@@ -298,7 +348,7 @@ class Sam3VideoInference(Sam3VideoBase):
             reverse=reverse,
         )
 
-        # Store max_frame_num_to_track in feature_cache for downstream methods
+        # 检测器也要了解传播边界，才能让分布式帧调度与本次跟踪范围一致。
         inference_state["feature_cache"]["tracking_bounds"] = {
             "max_frame_num_to_track": max_frame_num_to_track,
             "propagate_in_video_start_frame_idx": start_frame_idx,
@@ -319,6 +369,7 @@ class Sam3VideoInference(Sam3VideoBase):
             desc="propagate_in_video",
             disable=self.rank > 0,
         ):
+            # 每帧同时生成新检测并传播旧对象，随后在父类中完成关联和 memory 更新。
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
 
             if self.hotstart_delay > 0:
@@ -385,9 +436,14 @@ class Sam3VideoInference(Sam3VideoBase):
                 yield yield_frame_idx, postprocessed_out
 
     def _run_single_frame_inference(self, inference_state, frame_idx, reverse):
-        """
-        Perform inference on a single frame and get its inference results. This would
-        also update `inference_state`.
+        """! @brief 执行一帧的检测—跟踪联合推理，并原地更新视频状态。
+
+        @param frame_idx 当前帧索引。
+        @param reverse 是否反向时间传播。
+        @return 含对象掩码、检测分数、跟踪分数和状态统计的内部结果。
+
+        允许新增检测仅取决于文本或本帧几何提示；没有提示的后续帧仍会传播已有
+        对象，但不会凭空创建新的对象 ID。
         """
         # prepare inputs
         input_batch = inference_state["input_batch"]
@@ -396,7 +452,7 @@ class Sam3VideoInference(Sam3VideoBase):
         has_geometric_prompt = (
             inference_state["per_frame_geometric_prompt"][frame_idx] is not None
         )
-        # run inference for the current frame
+        # 父类将检测器和 tracker 合并为一个原子帧步骤，避免两者使用不一致的状态。
         (
             obj_id_to_mask,
             obj_id_to_score,
@@ -425,7 +481,7 @@ class Sam3VideoInference(Sam3VideoBase):
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new
         inference_state["tracker_metadata"] = tracker_metadata_new
-        # use a dummy string in "previous_stages_out" to indicate this frame has outputs
+        # 标记帧已计算，使后续的默认传播起点可以复用该信息。
         inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
 
         if self.rank == 0:
@@ -464,7 +520,15 @@ class Sam3VideoInference(Sam3VideoBase):
         suppressed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
-        obj_id_to_mask = out["obj_id_to_mask"]  # low res masks
+        """! @brief 过滤内部对象并生成客户端可用的原尺寸掩码和归一化框。
+
+        @param out 当前帧的内部对象掩码和分数。
+        @param removed_obj_ids,suppressed_obj_ids,unconfirmed_obj_ids 不应展示的对象集合。
+        @return NumPy 格式的对象 ID、分数、``xywh`` 框和二值掩码。
+
+        非重叠约束在这里再次作用于最终显示掩码；它不改变 tracker 已存的 memory。
+        """
+        obj_id_to_mask = out["obj_id_to_mask"]  # 内部低分辨率/视频分辨率布尔 mask
         curr_obj_ids = sorted(obj_id_to_mask.keys())
         H_video, W_video = inference_state["orig_height"], inference_state["orig_width"]
         if len(curr_obj_ids) == 0:
@@ -493,7 +557,8 @@ class Sam3VideoInference(Sam3VideoBase):
             )
 
             assert out_binary_masks.dtype == torch.bool
-            keep = out_binary_masks.any(dim=(1, 2)).cpu()  # remove masks with 0 areas
+            # 先删除空 mask，再移除热启动、遮挡或确认逻辑要求隐藏的对象。
+            keep = out_binary_masks.any(dim=(1, 2)).cpu()
             # hide outputs for those object IDs in `obj_ids_to_hide`
             obj_ids_to_hide = []
             if suppressed_obj_ids is not None:
@@ -561,7 +626,12 @@ class Sam3VideoInference(Sam3VideoBase):
         removed_obj_ids=None,
         unconfirmed_obj_ids=None,
     ):
-        # Filter out suppressed, removed, and unconfirmed objects from the cache
+        """! @brief 缓存一帧对交互细化可见的对象掩码。
+
+        被抑制、移除或尚未确认的对象不会进入缓存，避免后续交互把临时对象当作
+        已存在的 tracker 输出。
+        """
+        # 缓存是浅拷贝：只过滤对象映射，不复制可能很大的掩码 Tensor。
         filtered_obj_id_to_mask = obj_id_to_mask.copy()
 
         objects_to_exclude = set()
@@ -582,6 +652,10 @@ class Sam3VideoInference(Sam3VideoBase):
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
     ):
+        """! @brief 以缓存输出为基底，合并本轮交互细化得到的对象掩码。
+
+        @return 传给 tracker 的 ``obj_id -> mask`` 映射。
+        """
         if (
             "cached_frame_outputs" in inference_state
             and frame_idx in inference_state["cached_frame_outputs"]
@@ -600,7 +674,10 @@ class Sam3VideoInference(Sam3VideoBase):
         return obj_id_to_mask
 
     def _compile_model(self):
-        """Compile the SAM model with torch.compile for speedup."""
+        """! @brief 按需编译检测器和 tracker 的热点前向图。
+
+        编译仅影响性能与首次传播延迟，不改变视频推理的数据流或算法结果。
+        """
         is_compiled = getattr(self, "_model_is_compiled", False)
         if is_compiled or not self.compile_model:
             return
@@ -873,12 +950,14 @@ class Sam3VideoInference(Sam3VideoBase):
         boxes_xywh=None,
         box_labels=None,
     ):
-        """
-        Add text, point or box prompts on a single frame. This method returns the inference
-        outputs only on the prompted frame.
+        """! @brief 写入提示并只计算提示帧，作为后续时序传播的锚点。
 
-        Note that text prompts are NOT associated with a particular frame (i.e. they apply
-        to all frames). However, we only run inference on the frame specified in `frame_idx`.
+        @param text_str 全视频共享的语义文本；``visual`` 表示只使用视觉框提示。
+        @param boxes_xywh 归一化 ``xywh`` 框，可作为视觉提示或几何细化提示。
+        @return ``(frame_idx, outputs)``，其中 ``outputs`` 是提示帧的即时结果。
+
+        每次添加语义提示都会重置旧状态：文本语义定义的是一次新的开放词汇检索；
+        之后的 ``propagate_in_video`` 才负责向其它帧扩展。
         """
         logger.debug("Running add_prompt on frame %d", frame_idx)
 
@@ -890,10 +969,10 @@ class Sam3VideoInference(Sam3VideoBase):
             0 <= frame_idx < num_frames
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
-        # since it's a semantic prompt, we start over
+        # SAM 3 的文本提示是全视频条件，替换它必须丢弃旧的检测和 mask memory。
         self.reset_state(inference_state)
 
-        # 1) add text prompt
+        # 文本写到所有帧的 stage，但仅在当前帧立即执行检测。
         if text_str is not None and text_str != "visual":
             inference_state["text_prompt"] = text_str
             inference_state["input_batch"].find_text_batch[0] = text_str
@@ -905,7 +984,7 @@ class Sam3VideoInference(Sam3VideoBase):
         for t in range(inference_state["num_frames"]):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
 
-        # 2) handle box prompt
+        # 框坐标从 API 的 xywh 转为检测器使用的 cxcywh；两者都要求归一化到 [0, 1]。
         assert (boxes_xywh is not None) == (box_labels is not None)
         if boxes_xywh is not None:
             boxes_xywh = torch.as_tensor(boxes_xywh, dtype=torch.float32)
@@ -995,6 +1074,12 @@ class Sam3VideoInference(Sam3VideoBase):
 
 
 class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
+    """! @brief 带对象级交互细化的 SAM 3 视频推理实现，也是默认构建的模型类型。
+
+    在首次传播后，新增/细化/删除对象无需重新运行所有帧的开放词汇检测：本类根据
+    动作历史选择仅传播受影响对象，或直接读取已有缓存。
+    """
+
     def __init__(
         self,
         use_prev_mem_frame=False,
@@ -1002,12 +1087,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         refinement_detector_cond_frame_removal_window=16,
         **kwargs,
     ):
-        """
-        use_prev_mem_frame: bool, whether to condition on previous memory frames for adding points
-        use_stateless_refinement: bool, whether to enable stateless refinement behavior
-        refinement_detector_cond_frame_removal_window: int, we remove a detector conditioning frame if it
-            is within this many frames of a user refined frame. Set to a large value (e.g. 10000) to
-            always remove detector conditioning frames if there is any user refinement in the video.
+        """! @brief 配置交互细化时如何使用已有的 tracker memory。
+
+        @param use_prev_mem_frame 添加细化提示时是否使用上一帧 memory。
+        @param use_stateless_refinement 是否使用无状态细化策略。
+        @param refinement_detector_cond_frame_removal_window 用户细化帧附近要移除的检测条件帧窗口。
         """
         super().__init__(**kwargs)
         self.use_prev_mem_frame = use_prev_mem_frame
@@ -1017,6 +1101,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         )
 
     def _init_new_tracker_state(self, inference_state):
+        """! @brief 以当前视频尺寸和检测器特征缓存创建一个新的对象 tracker 状态。"""
         return self.tracker.init_state(
             cached_features=inference_state["feature_cache"],
             video_height=inference_state["orig_height"],
@@ -1033,7 +1118,18 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         max_frame_num_to_track=None,
         reverse=False,
     ):
-        # step 1: check which type of propagation to run, should be the same for all GPUs.
+        """! @brief 按动作历史选择全量传播、受影响对象局部传播或缓存读取。
+
+        @param inference_state 当前视频状态。
+        @param start_frame_idx 本次单向传播锚点。
+        @param max_frame_num_to_track 最大传播范围。
+        @param reverse 是否反向。
+        @yield 每帧的后处理实例输出。
+
+        初次提示后必须全量运行检测+跟踪；后续仅交互细化部分对象时，复用已缓存的
+        原始视频分割（VG）结果，只运行这些对象的 tracker，可显著减少开销。
+        """
+        # 所有 rank 解析同一历史，确保选择相同路径并保持集体通信一致。
         propagation_type, obj_ids = self.parse_action_history_for_propagation(
             inference_state
         )
@@ -1044,7 +1140,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             frame_idx=start_frame_idx,
         )
 
-        # step 2: run full VG propagation
+        # 全量路径回到父类，逐帧重新运行 detector、关联器和 tracker。
         if propagation_type == "propagation_full":
             logger.debug(f"Running full VG propagation (reverse={reverse}).")
             yield from super().propagate_in_video(
@@ -1055,7 +1151,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             )
             return
 
-        # step 3: run Tracker partial propagation or direct fetch existing predictions
+        # 局部路径只更新交互对象；fetch 路径完全不跑网络，只把缓存重新后处理后返回。
         assert propagation_type in ["propagation_partial", "propagation_fetch"]
         logger.debug(
             f"Running Tracker propagation for objects {obj_ids} and merging it with existing VG predictions (reverse={reverse})."
@@ -1071,7 +1167,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
         tracker_metadata = inference_state["tracker_metadata"]
 
-        # if fetch just return from output
+        # 两个方向都已完成且没有新动作时，缓存已经是完整答案。
         if propagation_type == "propagation_fetch":
             for frame_idx in _frame_progress(
                 processing_order, inference_state["num_frames"], reverse
@@ -1119,7 +1215,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         for frame_idx in _frame_progress(
             processing_order, inference_state["num_frames"], reverse
         ):
-            # run Tracker propagation
+            # 局部路径先确保本帧视觉特征可用，再仅推进被细化对象的 tracker state。
             if propagation_type == "propagation_partial":
                 self._prepare_backbone_feats(inference_state, frame_idx, reverse)
                 obj_ids_local, low_res_masks_local, tracker_scores_local = (
@@ -1131,7 +1227,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     )
                 )
 
-                # broadcast refined object tracker scores and masks to all GPUs
+                # 对象可能分布在不同 rank，先广播低分辨率结果再由 rank 0 合并输出。
                 # handle multiple objects that can be located on different GPUs
                 refined_obj_data = {}  # obj_id -> (score, mask_video_res)
 
@@ -1228,9 +1324,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
     def add_action_history(
         self, inference_state, action_type, frame_idx=None, obj_ids=None
     ):
-        """
-        action_history is used to automatically decide what to do during propagation.
-        action_type: one of ["add", "remove", "refine"] + ["propagation_full", "propagation_partial", "propagation_fetch"]
+        """! @brief 记录对象操作或传播操作，供下一次传播选择最小计算路径。
+
+        @param action_type ``add``、``remove``、``refine`` 或三种 ``propagation_*``。
+        @param frame_idx 操作/传播锚点帧。
+        @param obj_ids 被影响的对象 ID。
         """
         instance_actions = ["add", "remove", "refine"]
         propagation_actions = [
@@ -1257,18 +1355,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         return False
 
     def parse_action_history_for_propagation(self, inference_state):
-        """
-        Parse the actions in history before the last propagation and prepare for the next propagation.
-        We support multiple actions (add/remove/refine) between two propagations. If we had an action
-        history similar to this ["propagate", "add", "refine", "remove", "add"], the next propagation
-        would remove the removed object, and also propagate the two added/refined objects.
+        """! @brief 将最近动作归约为下一次传播所需的最小工作集。
 
-        Returns:
-            propagation_type: one of ["propagation_full", "propagation_partial", "propagation_fetch"]
-                - "propagation_full": run VG propagation for all objects
-                - "propagation_partial": run Tracker propagation for selected objects, useful for add/refine actions
-                - "propagation_fetch": fetch existing VG predictions without running any propagation
-            obj_ids: list of object ids to run Tracker propagation on if propagation_type is "propagation_partial".
+        @return ``(propagation_type, obj_ids)``：全量 VG、对象级局部 tracker 或缓存读取。
+
+        首次传播没有任何历史，必须全量运行。若上次已覆盖一侧时间轴，则下一次会
+        覆盖另一侧；两个方向均完成且无新交互时只读取缓存。
         """
         action_history = inference_state["action_history"]
         if len(action_history) == 0:
@@ -1315,9 +1407,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         return propagation_type, obj_ids
 
     def remove_object(self, inference_state, obj_id, is_user_action=False):
-        """
-        We try to remove object from tracker states on every GPU, it will do nothing
-        for states without this object.
+        """! @brief 删除对象的 tracker state、全局元数据和缓存输出。
+
+        @param obj_id 要删除的持久对象 ID。
+        @param is_user_action 是否将删除记录进交互动作历史。
         """
         obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
         assert obj_rank is not None, f"Object {obj_id} not found in any GPU."
@@ -1352,8 +1445,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     del frame_cache[obj_id]
 
     def _get_gpu_id_by_obj_id(self, inference_state, obj_id):
-        """
-        Locate GPU ID for a given object.
+        """! @brief 查找持有指定对象 tracker 状态的 rank。
+
+        @return GPU rank；对象不存在时为 ``None``。
         """
         obj_ids_per_gpu = inference_state["tracker_metadata"]["obj_ids_per_gpu"]
         for rank, obj_ids in enumerate(obj_ids_per_gpu):
@@ -1362,10 +1456,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         return None  # object not found in any GPU
 
     def _get_tracker_inference_states_by_obj_ids(self, inference_state, obj_ids):
-        """
-        Get the Tracker inference states that contain the given object ids.
-        This is used to run partial Tracker propagation on a single object/bucket.
-        Possibly multiple or zero states can be returned.
+        """! @brief 取得包含任一目标对象的本地 tracker 状态 bucket。
+
+        @return 可能为空的 tracker state 列表；一个对象组不会复制到其他 rank。
         """
         states = [
             state
@@ -1375,6 +1468,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         return states
 
     def _prepare_backbone_feats(self, inference_state, frame_idx, reverse):
+        """! @brief 为局部 tracker 传播准备当前帧的 detector/tracker 共享视觉特征。
+
+        局部细化无需采纳新的检测结果，但仍调用 detector 前向以填充当前帧的
+        ``feature_cache``，供 tracker 的 memory attention 使用。
+        """
         input_batch = inference_state["input_batch"]
         feature_cache = inference_state["feature_cache"]
         num_frames = inference_state["num_frames"]
@@ -1406,8 +1504,17 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         obj_id=None,
         rel_coordinates=True,
     ):
+        """! @brief 分派语义/框提示或对象级点提示。
+
+        @param points 非空时，必须携带 ``obj_id``，走 tracker 的实例细化路径。
+        @param text_str,boxes_xywh 点为空时，走父类的 SAM 3 全视频语义/视觉提示路径。
+        @return 提示帧的后处理实例输出。
+
+        这一区分很关键：文本和框能触发开放词汇检测并可能发现新对象；点提示只修正
+        一个明确对象，后续可进行局部 tracker 传播。
+        """
         if points is not None:
-            # Tracker instance prompts
+            # 点属于给定对象的条件信息，不能与会重置全局语义状态的文本/框混用。
             assert (
                 text_str is None and boxes_xywh is None
             ), "When points are provided, text_str and boxes_xywh must be None."
@@ -1424,7 +1531,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 use_prev_mem_frame=self.use_prev_mem_frame,
             )
         else:
-            # SAM3 prompts
+            # 文本/框提示仍复用父类的“重置后检测提示帧”语义。
             return super().add_prompt(
                 inference_state,
                 frame_idx,
@@ -1444,11 +1551,15 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         rel_coordinates=True,
         use_prev_mem_frame=False,
     ):
-        """Add a new point prompt to Tracker. Suppporting instance refinement to existing
-        objects by passing existing obj_id or adding a new object by passing a new obj_id.
-        use_prev_mem_frame=False to disable cross attention to previous memory frames.
-        Every GPU returns the same results, and results should contain all masks including
-        these masks not refined or not added by the current user points.
+        """! @brief 以点提示新增对象或细化现有对象，并返回提示帧的完整实例结果。
+
+        @param obj_id 已有 ID 表示细化；未出现的 ID 表示创建新 tracklet。
+        @param points,labels 该对象的正负点提示。
+        @param use_prev_mem_frame 是否让点提示注意力读取上一帧 memory。
+        @return ``(frame_idx, outputs)``；rank 0 返回全部可见对象。
+
+        新对象会选择负载最小的 GPU 并以点提示初始化 tracker 状态；已有对象只修改
+        所在 rank 的状态，低分辨率结果再广播给其他 rank 以保持输出一致。
         """
         assert obj_id is not None, "obj_id must be provided to add new points"
         tracker_metadata = inference_state["tracker_metadata"]
@@ -1458,7 +1569,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
         obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
 
-        # prepare feature
+        # 点交互也需要当前帧视觉特征；复用 detector 的缓存而不是单独跑 tracker backbone。
         self._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
 
         object_has_been_refined = self._has_object_been_refined(inference_state, obj_id)
@@ -1475,7 +1586,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             obj_rank = None
 
         if obj_rank is None:
-            # new object, we assign it a GPU and create a new inference state if limit allows
+            # 新对象按当前对象数做负载均衡；达到上限时返回空结果而不破坏已有跟踪。
             num_prev_obj = np.sum(tracker_metadata["num_obj_per_gpu"])
             if num_prev_obj >= self.max_num_objects:
                 logger.warning(
@@ -1524,7 +1635,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 inference_state, "add", frame_idx=frame_idx, obj_ids=[obj_id]
             )
         else:
-            # existing object, for refinement
+            # 细化只接触保存该对象的一个 tracker state，不重算无关对象。
             if self.rank == obj_rank:
                 tracker_states = self._get_tracker_inference_states_by_obj_ids(
                     inference_state, [obj_id]
@@ -1600,7 +1711,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 tracker_state, obj_id, frame_idx
             )
 
-        # fetch results from states and gather across GPUs
+        # 将变化对象与缓存的未变化对象合并，得到与全量输出相同的客户端视图。
         # Use optimized caching approach to avoid reprocessing unmodified objects
         if self.rank == obj_rank and len(obj_ids) > 0:
             new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(
@@ -1647,7 +1758,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             return frame_idx, None  # no output on other GPUs
 
     def _gather_obj_id_to_mask_across_gpus(self, inference_state, obj_id_to_mask_local):
-        """Gather obj_id_to_mask from all GPUs. Optionally resize the masks to the video resolution."""
+        """! @brief 收集各 rank 的对象掩码映射，供 rank 0 组合完整帧输出。
+
+        @param obj_id_to_mask_local 当前 rank 的对象掩码。
+        @return 所有 rank 按对象 ID 合并后的掩码映射。
+        """
         tracker_metadata = inference_state["tracker_metadata"]
 
         # concatenate the output masklets from all local inference states

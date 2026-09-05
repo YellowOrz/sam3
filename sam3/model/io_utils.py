@@ -37,9 +37,17 @@ def load_resource_as_video_frames(
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
 ) -> tuple[Any, int, int]:
-    """
-    Load video frames from either a video or an image (as a single-frame video).
-    Alternatively, if input is a list of PIL images, convert its format
+    """! @brief 将输入资源规范化为视频帧张量序列。
+
+    @param resource_path 视频文件、按帧图片目录、单张图片或 ``PIL.Image`` 列表。
+    @param image_size 模型输入的正方形边长。
+    @param offload_video_to_cpu 是否将解码后的帧保留在 CPU，按需传至 GPU。
+    @param async_loading_frames 是否使用异步帧加载。
+    @param video_loader_type 视频解码后端。
+    @return ``(frames, original_height, original_width)``；``frames`` 已 resize、归一化。
+
+    所有后续视频推理都以这里生成的帧序列为准；原始尺寸仅用于把最终掩码
+    和边界框还原到输入视频坐标系。
     """
     if isinstance(resource_path, list):
         # pyrefly: ignore [bad-assignment]
@@ -53,6 +61,7 @@ def load_resource_as_video_frames(
             orig_width,
             orig_height,
         )  # For some reason, this method returns these swapped
+        # PIL 输入也走与磁盘视频相同的 resize、float16 与标准化约定。
         images = []
         for img_pil in resource_path:
             img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
@@ -103,7 +112,10 @@ def load_image_as_single_frame_video(
     img_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
 ) -> tuple[torch.Tensor, int, int]:
-    """Load an image as a single-frame video."""
+    """! @brief 将单张图片包装为只有一帧的视频输入。
+
+    @return 形状为 ``(1, C, image_size, image_size)`` 的归一化帧及原始高宽。
+    """
     images, image_height, image_width = _load_img_as_tensor(image_path, image_size)
     images = images.unsqueeze(0).half()
 
@@ -134,9 +146,12 @@ def load_video_frames(
     async_loading_frames=False,
     video_loader_type="cv2",
 ):
-    """
-    Load the video frames from video_path. The frames are resized to image_size as in
-    the model and are loaded to GPU if offload_video_to_cpu=False. This is used by the demo.
+    """! @brief 根据资源类型选择图片目录或视频文件的解码路径。
+
+    @param video_path 视频路径或帧目录。
+    @return resize、归一化后的帧序列及原始视频尺寸。
+
+    这里不做模型推理；它只保证不同输入载体最终具有相同的逐帧张量接口。
     """
     assert isinstance(video_path, str)
     if video_path.startswith("<load-dummy-video"):
@@ -198,8 +213,13 @@ def load_video_frames_from_image_folder(
     img_std,
     async_loading_frames,
 ):
-    """
-    Load the video frames from a directory of image files ("<frame_index>.<img_ext>" format)
+    """! @brief 从图片目录按帧号读取视频帧。
+
+    @param image_folder 包含视频帧图片的目录。
+    @return 帧加载器或帧张量，以及原始视频高宽。
+
+    优先按文件名中的整数帧号排序；不符合该格式时退回字典序，避免静默改变
+    时序输入。
     """
     frame_names = [
         p

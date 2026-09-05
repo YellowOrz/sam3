@@ -95,14 +95,13 @@
 ### 4.2 一个必须先修正的分数误区
 
 当前流式公开输出的 `out_probs` 来自 `obj_id_to_score`，它是实例首次检测时的
-分数，并非逐帧掩码质量。内部的逐帧 `obj_id_to_tracker_score` 虽用于若干逻辑，
-却没有出现在 `_postprocess_output()` 的最终返回值中；内部 tracker 的
-`iou_score`、`object_score_logits`、`eff_iou_score` 也没有完整暴露。
+分数，并非逐帧掩码质量。逐帧 `obj_id_to_tracker_score` 现在会通过
+`_postprocess_output()` 以 `out_tracker_probs` 返回；但内部 tracker 的
+`iou_score`、`object_score_logits`、`eff_iou_score` 仍没有完整暴露。
 
-因此不能直接写成“每帧选择 `out_probs` 较高的方向”。P0 实现应最小化修改
-接口，额外输出下列诊断量，同时保持现有字段兼容：
+因此不能直接写成“每帧选择 `out_probs` 较高的方向”。P0 可以使用
+`out_tracker_probs`，但仍应最小化接口修改，额外输出下列尚未暴露的诊断量：
 
-- `out_tracker_probs`；
 - predicted IoU / mask quality；
 - object presence logit；
 - mask stability；

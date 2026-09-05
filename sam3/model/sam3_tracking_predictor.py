@@ -13,9 +13,10 @@ from tqdm.auto import tqdm
 
 
 class Sam3TrackerPredictor(Sam3TrackerBase):
-    """
-    The demo class that extends the `Sam3TrackerBase` to handle user interactions
-    and manage inference states, with support for multi-object tracking.
+    """! @brief SAM 2 风格的 masklet 跟踪器，供 SAM 3 视频模型作为时序后端使用。
+
+    它管理对象 ID、点/掩码条件帧和每帧 mask memory；``Sam3VideoBase`` 不直接让
+    它遍历整段视频，而是每次只推进一帧，从而插入 SAM 3 检测和关联逻辑。
     """
 
     def __init__(
@@ -39,6 +40,12 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         # checkpoint_file=None,
         **kwargs,
     ):
+        """! @brief 配置交互式 tracker 的 memory 清理、点数上限和输出后处理。
+
+        @param clear_non_cond_mem_around_input 校正提示后是否删除邻近非条件 memory。
+        @param fill_hole_area 输出 mask 可填补的小洞面积上限。
+        @param always_start_from_first_ann_frame 是否固定从首个条件帧开始传播。
+        """
         super().__init__(**kwargs)
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
@@ -65,7 +72,16 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         offload_state_to_cpu=False,
         async_loading_frames=False,
     ):
-        """Initialize a inference state."""
+        """! @brief 初始化一个对象分片的 tracker 状态。
+
+        @param cached_features 来自 SAM 3 检测器的当前帧 backbone 特征缓存。
+        @param video_height,video_width 原视频尺寸，用于输出还原。
+        @param num_frames 视频帧数。
+        @return 可保存点、mask memory 和每帧输出的 tracker 状态字典。
+
+        SAM 3 的视频模型通常传入 ``cached_features`` 和视频元数据，而不是让 tracker
+        再次自行加载视频帧。
+        """
         inference_state = {}
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
@@ -98,7 +114,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             inference_state["video_height"] = video_height
             inference_state["video_width"] = video_width
             inference_state["num_frames"] = num_frames
-        # inputs on each frame
+        # 每个对象分别保留提示，传播前再按对象 batch 维度合并。
         inference_state["point_inputs_per_obj"] = {}
         inference_state["mask_inputs_per_obj"] = {}
         # visual features on a small number of recently visited frames for quick interactions
@@ -190,7 +206,15 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         normalize_coords=True,
         box=None,
     ):
-        """Add new points to a frame."""
+        """! @brief 在对象的指定帧写入正负点或框，并计算该条件帧的临时结果。
+
+        @param obj_id 调用方对象 ID；首次出现时映射到 tracker 内部 batch 槽位。
+        @param rel_coordinates 点/框是否为 0 到 1 的相对坐标。
+        @return 条件帧索引、对象 ID 和该帧 mask 输出。
+
+        框会编码为两个特殊点；临时结果要在 ``propagate_in_video_preflight`` 中与其他
+        对象合并并正式写入 memory。
+        """
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
         point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]
         mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]
@@ -671,12 +695,18 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
 
     @torch.inference_mode()
     def propagate_in_video_preflight(self, inference_state, run_mem_encoder=True):
-        """Prepare inference_state and consolidate temporary outputs before tracking."""
-        # Tracking has started and we don't allow adding new objects until session is reset.
+        """! @brief 在传播前合并每对象的临时条件结果，并建立正式 memory。
+
+        @param run_mem_encoder 是否为刚合并的条件帧编码 mask memory。
+
+        此阶段是交互提示与连续传播的分界：完成后不再允许添加新对象，且同一帧的
+        条件输出会覆盖旧的非条件输出。
+        """
+        # 对象 batch 维度一旦开始传播便固定，避免历史 memory 与对象 ID 对不上。
         inference_state["tracking_has_started"] = True
         batch_size = self._get_obj_num(inference_state)
 
-        # Consolidate per-object temporary outputs in "temp_output_dict_per_obj" and
+        # 将不同对象在同一条件帧的临时结果拼成一个 batch，保证 memory encoder 一致。
         # add them into "output_dict".
         temp_output_dict_per_obj = inference_state["temp_output_dict_per_obj"]
         output_dict = inference_state["output_dict"]
@@ -759,6 +789,10 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
     def _get_processing_order(
         self, inference_state, start_frame_idx, max_frame_num_to_track, reverse
     ):
+        """! @brief 计算 tracker 的单向帧访问顺序。
+
+        @return 要传播的帧索引序列；条件帧本身也包含在序列中。
+        """
         num_frames = inference_state["num_frames"]
         # set start index, end index, and processing order
         if self.always_start_from_first_ann_frame:
@@ -798,7 +832,17 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         run_mem_encoder=True,
         propagate_preflight=False,
     ):
-        """Propagate the input points across frames to track in the entire video."""
+        """! @brief 从条件帧逐帧传播 tracker 的对象 mask 和 memory。
+
+        @param start_frame_idx 传播起点。
+        @param max_frame_num_to_track 最大传播范围。
+        @param reverse 是否反向。
+        @param run_mem_encoder 是否在每帧写入新 memory。
+        @yield 帧索引、对象 ID、低/高分辨率 mask 和对象质量分数。
+
+        在 SAM 3 视频主路径中，此函数每次只被请求一帧；完整视频循环由
+        ``Sam3VideoInference`` 控制，以便每帧先运行开放词汇检测。
+        """
         if propagate_preflight:
             self.propagate_in_video_preflight(inference_state)
         # NOTE: This is a copy from the parent class, except that we return object scores as well.
@@ -826,7 +870,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         for frame_idx in tqdm(
             processing_order, desc="propagate in video", disable=tqdm_disable
         ):
-            # We skip those frames already in consolidated outputs (these are frames
+            # 条件帧已有可信输出，不要再用历史 memory 覆盖用户/检测器刚提供的约束。
             # that received input clicks or mask). Note that we cannot directly run
             # batched forward on them via `_run_single_frame_inference` because the
             # number of clicks on each object might be different.
@@ -1009,8 +1053,16 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         inference_state["first_ann_frame_idx"] = None
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
-        """Compute the image features on a given frame."""
-        # Look up in the cache
+        """! @brief 取得当前帧视觉特征，并扩展到对象 batch 维度。
+
+        @param frame_idx 当前帧索引。
+        @param batch_size 本 tracker 状态中对象数。
+        @return 图像、FPN 特征、位置编码和特征尺寸。
+
+        优先使用 SAM 3 检测器在同一帧已缓存的 ``tracker_backbone_out``，避免视觉
+        backbone 被 detector 与 tracker 各算一次。
+        """
+        # SAM 3 联合路径先写缓存；仅独立 tracker 用法才可能在这里发生 cache miss。
         image, backbone_out = inference_state["cached_features"].get(
             frame_idx, (None, None)
         )
@@ -1061,8 +1113,13 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         prev_sam_mask_logits=None,
         use_prev_mem_frame=True,
     ):
-        """Run tracking on a single frame based on current inputs and previous memory."""
-        # Retrieve correct image features
+        """! @brief 使用当前视觉特征和历史 memory 预测一个对象 batch 的单帧掩码。
+
+        @param is_init_cond_frame 当前帧是否是直接接收提示的条件帧。
+        @param run_mem_encoder 是否立即为预测结果写入 memory。
+        @return tracker 的内部输出字典（mask logits、object pointer、memory 等）。
+        """
+        # 特征优先复用 SAM 3 检测器缓存，只有独立 tracker 用法才会自行提取。
         (
             image,
             _,
@@ -1125,12 +1182,15 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         object_score_logits,
         is_mask_from_pts,
     ):
+        """! @brief 将当前帧最终 mask 编码为后续帧可读取的 memory。
+
+        @param high_res_masks 已按全局约束处理的高分辨率 mask logits。
+        @param object_score_logits 对象存在性分数。
+        @return mask memory 特征及其位置编码。
+
+        非重叠/抑制改变 mask 后必须重新编码 memory，否则下一帧会注意到过时区域。
         """
-        Run the memory encoder on `high_res_masks`. This is usually after applying
-        non-overlapping constraints to object scores. Since their scores changed, their
-        memory also need to be computed again with the memory encoder.
-        """
-        # Retrieve correct image features
+        # memory encoder 与 tracker 前向读取同一帧视觉特征。
         image, _, current_vision_feats, _, feat_sizes = self._get_image_feature(
             inference_state, frame_idx, batch_size
         )
@@ -1154,9 +1214,9 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         return maskmem_features, maskmem_pos_enc
 
     def _get_maskmem_pos_enc(self, inference_state, current_out):
-        """
-        `maskmem_pos_enc` is the same across frames and objects, so we cache it as
-        a constant in the inference session to reduce session storage size.
+        """! @brief 缓存所有帧/对象共享的 memory 位置编码，减少会话存储。
+
+        @return 当前输出所需的位置编码引用。
         """
         model_constants = inference_state["constants"]
         # "out_maskmem_pos_enc" should be either a list of tensors or None

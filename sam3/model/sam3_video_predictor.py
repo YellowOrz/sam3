@@ -23,6 +23,12 @@ logger = get_logger(__name__)
 
 
 class Sam3VideoPredictor(Sam3BasePredictor):
+    """! @brief 单进程 SAM 3 视频预测器。
+
+    该类负责构建处于 eval 模式的 ``Sam3VideoInference``，继承的基类负责将
+    外部请求路由到模型。实际的逐帧检测、关联与跟踪在 ``self.model`` 内执行。
+    """
+
     def __init__(
         self,
         checkpoint_path=None,
@@ -35,11 +41,20 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         apply_temporal_disambiguation: bool = True,
         compile: bool = False,
     ):
+        """! @brief 加载 SAM 3 视频模型并配置帧加载方式。
+
+        @param checkpoint_path 可选权重路径。
+        @param async_loading_frames 是否异步解码帧。
+        @param video_loader_type 视频解码后端。
+        @param apply_temporal_disambiguation 是否启用时序消歧策略。
+        @param compile 是否延迟编译主要推理图。
+        """
         super().__init__()
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
         from sam3.model_builder import build_sam3_video_model
 
+        # 预测器的会话状态在基类中保存；模型实例本身可被多个会话共享。
         self.model = (
             build_sam3_video_model(
                 checkpoint_path=checkpoint_path,
@@ -61,7 +76,12 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         obj_id: int = 0,
         is_user_action: bool = True,
     ):
-        """Remove an object from tracking (SAM3 uses a simpler remove_object API)."""
+        """! @brief 从当前视频状态中删除一个对象的全部跟踪记录。
+
+        @param session_id 目标会话。
+        @param obj_id 要删除的内部对象 ID。
+        @return 成功标志。
+        """
         session = self._get_session(session_id)
         inference_state = session["state"]
 
@@ -109,7 +129,17 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
 
 class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
+    """! @brief 为 SAM 3 视频推理建立 SPMD 多 GPU 进程组的预测器。
+
+    rank 0 接收请求和返回输出；其余 rank 与 rank 0 同步执行相同的帧级流程，
+    各自保存一部分对象的跟踪状态。
+    """
+
     def __init__(self, *model_args, gpus_to_use=None, **model_kwargs):
+        """! @brief 初始化本 rank 的模型及必要时的 worker 进程。
+
+        @param gpus_to_use 参与视频推理的 CUDA 设备编号。
+        """
         if gpus_to_use is None:
             # if not specified, use only the current GPU by default
             gpus_to_use = [torch.cuda.current_device()]
@@ -129,6 +159,7 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
         self.rank_str = f"rank={self.rank} with world_size={self.world_size}"
+        # 每个 rank 绑定一张卡；对象维度在后续帧级流程中按 rank 分片。
         self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
         torch.cuda.set_device(self.device)
         self.has_shutdown = False

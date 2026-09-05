@@ -686,23 +686,25 @@ def build_sam3_video_model(
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
-    """
-    Build SAM3 dense tracking model.
+    """! @brief 构建 SAM 3 视频分割的“检测器 + 时序跟踪器”模型。
 
-    Args:
-        checkpoint_path: Optional path to checkpoint file
-        bpe_path: Path to the BPE tokenizer file
+    @param checkpoint_path 可选的模型权重路径；未提供时可从 Hugging Face 获取。
+    @param load_from_HF 是否在未指定权重时下载官方权重。
+    @param apply_temporal_disambiguation 是否启用跨帧消歧、重检测等时序启发式策略。
+    @param device 模型所在设备。
+    @param compile 是否在首次传播时用 ``torch.compile`` 编译主要推理模块。
+    @return 已加载权重、但尚未绑定视频会话的 ``Sam3VideoInference`` 实例。
 
-    Returns:
-        Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
+    检测器在每帧根据文本/几何提示产生候选掩码；跟踪器则把已确认对象的
+    mask memory 传播到相邻帧。二者由 ``Sam3VideoInference`` 统一编排。
     """
     if bpe_path is None:
         bpe_path = _DEFAULT_BPE_PATH
 
-    # Build Tracker module
+    # 跟踪器保存每个对象的 mask memory，负责把对象状态沿时间轴传播。
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
 
-    # Build Detector components
+    # 检测器负责从图像特征、文本特征和几何提示中提出当前帧的新对象候选。
     visual_neck = _create_vision_backbone()
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
@@ -738,7 +740,7 @@ def build_sam3_video_model(
         supervise_joint_box_scores=has_presence_token,
     )
 
-    # Build the main SAM3 video model
+    # 将检测器与跟踪器组合；默认分支启用论文/演示所用的时序稳定化启发式。
     if apply_temporal_disambiguation:
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
@@ -815,6 +817,11 @@ def build_sam3_video_model(
 
 
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
+    """! @brief 构建面向请求 API 的 SAM 3 视频预测器。
+
+    @param gpus_to_use 用于 SPMD 推理的 CUDA 设备编号；``None`` 表示当前设备。
+    @return 负责会话管理和多 GPU 调度的 ``Sam3VideoPredictorMultiGPU``。
+    """
     return Sam3VideoPredictorMultiGPU(
         *model_args, gpus_to_use=gpus_to_use, **model_kwargs
     )

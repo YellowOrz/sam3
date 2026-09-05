@@ -263,6 +263,13 @@ def _associate_det_trk_compilable(
 
 
 class Sam3VideoBase(nn.Module):
+    """! @brief 将逐帧开放词汇检测与 SAM 2 masklet 跟踪拼接的核心模型。
+
+    一帧推理固定分为：检测器提出候选 → tracker 传播已有对象 → 依据掩码 IoU
+    关联二者并制定增删/重条件化计划 → 写入更新后的 memory → 生成可见输出。
+    在多 GPU 下，对象状态按 rank 分片，rank 0 制定计划并广播。
+    """
+
     def __init__(
         self,
         detector: nn.Module,
@@ -309,6 +316,16 @@ class Sam3VideoBase(nn.Module):
         reconstruction_bbox_iou_thresh=0.0,
         reconstruction_bbox_det_score=0.0,
     ):
+        """! @brief 初始化检测、关联、对象生命周期和输出稳定化的阈值。
+
+        @param detector 当前帧的 SAM 3 检测模块。
+        @param tracker 保存 mask memory 的 SAM 2 跟踪模块。
+        @param score_threshold_detection 检测候选的最低置信度。
+        @param assoc_iou_thresh 检测掩码与已有 masklet 的关联 IoU 阈值。
+        @param new_det_thresh 创建新对象的检测分数阈值。
+        @param hotstart_delay 输出前的观测帧数，用于抑制刚出现的不稳定对象。
+        @param max_num_objects 全部 GPU 上允许跟踪的对象总数。
+        """
         super().__init__()
         self.detector = detector
         self.tracker = tracker
@@ -393,19 +410,22 @@ class Sam3VideoBase(nn.Module):
         is_image_only: bool = False,
         allow_new_detections: bool = True,
     ):
-        """
-        This function handles one-step inference for the DenseTracking model in an SPMD manner.
-        At a high-level, all GPUs execute the same function calls as if it's done on a single GPU,
-        while under the hood, some function calls involve distributed computation based on sharded
-        SAM2 states.
+        """! @brief 完成视频推理的一个原子帧步骤：检测、传播、关联、更新、输出。
 
-        - `input_batch` contains image and other inputs on the entire video; it should be identical across GPUs
-        - `tracker_states_local` holds the local masklet information in this GPU shard
-        - `tracker_metadata_prev` manages the metadata for SAM2 objects, such as which masklet is hold on which GPUs
-          it contains both global and local masklet information
+        @param frame_idx 当前真实帧索引。
+        @param reverse 是否沿时间倒序传播。
+        @param input_batch 全视频输入，所有 rank 必须一致。
+        @param geometric_prompt 当前帧的框/点视觉提示。
+        @param tracker_states_local 本 rank 持有的对象跟踪状态分片。
+        @param tracker_metadata_prev 上一帧的全局对象元数据。
+        @param feature_cache 文本和视觉特征缓存。
+        @return 对象掩码、检测分数、更新后的局部状态/元数据及帧统计。
+
+        各 GPU 调用顺序相同，但只持有一部分对象；跨 GPU 的掩码收集与更新计划
+        广播使结果等价于单卡上维护同一组对象。
         """
 
-        # Step 1: run backbone and detector in a distributed manner -- this is done via Sam3ImageOnVideoMultiGPU,
+        # 第一步的结果只包含“当前可检测到什么”，尚未决定它是否为已有对象。
         # a MultiGPU model (assigned to `self.detector`) that shards frames in a round-robin manner.
         # It returns a "det_out" dict for `frame_idx` and fills SAM2 backbone features for `frame_idx`
         # into `feature_cache`. Despite its distributed inference under the hood, the results would be
@@ -420,7 +440,7 @@ class Sam3VideoBase(nn.Module):
             allow_new_detections=allow_new_detections,
         )
 
-        # Step 2: each GPU propagates its local SAM2 states to get the SAM2 prediction masks.
+        # 第二步只读取已有 memory 进行传播；memory 更新必须等关联和抑制规则完成后再做。
         # the returned `tracker_low_res_masks_global` contains the concatenated masklet predictions
         # gathered from all GPUs (as if they are propagated on a single GPU). Note that this step only
         # runs the SAM2 propagation step, but doesn't encode new memory for the predicted masks;
@@ -438,7 +458,7 @@ class Sam3VideoBase(nn.Module):
             )
         )
 
-        # Step 3: based on detection outputs and the propagated SAM2 prediction masks, we make plans
+        # 第三步由 rank 0 将检测和跟踪结果关联，统一决定新增、删除、重条件化和负载分配。
         # for SAM2 masklet updates (i.e. which objects to add and remove, how to load-balance them, etc).
         # We also run SAM2 memory encoder globally in this step to resolve non-overlapping constraints.
         # **This step should involve all the heuristics needed for any updates.** Most of the update
@@ -465,7 +485,7 @@ class Sam3VideoBase(nn.Module):
             "det_to_matched_trk_obj_ids", {}
         )
 
-        # Step 4: based on `tracker_update_plan`, each GPU executes the update w.r.t. its local SAM2 inference states
+        # 第四步所有 rank 执行同一计划，但只修改自己持有的对象分片。
         tracker_states_local_new = self.run_tracker_update_execution_phase(
             frame_idx=frame_idx,
             num_frames=num_frames,
@@ -479,7 +499,7 @@ class Sam3VideoBase(nn.Module):
             feature_cache=feature_cache,
         )
 
-        # Step 5: finally, build the outputs for this frame (it only needs to be done on GPU 0 since
+        # 第五步只在 rank 0 组装客户端输出；其他 rank 的占位结果不会离开进程组。
         # only GPU 0 will send outputs to the server).
         if self.rank == 0:
             obj_id_to_mask = self.build_outputs(
@@ -553,7 +573,18 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         allow_new_detections: bool,
     ):
-        # Step 1: if text feature is not cached in `feature_cache`, compute and cache it
+        """! @brief 计算当前帧的文本条件检测结果，并缓存 tracker 所需视觉特征。
+
+        @param frame_idx 当前帧索引。
+        @param geometric_prompt 当前帧的额外视觉/几何条件。
+        @param feature_cache 跨帧复用文本特征和仅保留相邻帧的视觉特征。
+        @param allow_new_detections 为 false 时保留检测前向但禁止创建新对象。
+        @return ``bbox``、``mask``、``scores`` 组成的阈值后检测结果。
+
+        这是检测器唯一的逐帧入口：同一次 detector 前向还返回 SAM 2 tracker
+        使用的 FPN 特征，避免对图像 backbone 重复计算。
+        """
+        # 文本在同一会话中通常不变；仅在提示改动后重新编码并替换缓存。
         text_batch_key = tuple(input_batch.find_text_batch)
         if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
             # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
@@ -566,7 +597,7 @@ class Sam3VideoBase(nn.Module):
         else:
             text_outputs = feature_cache["text"][text_batch_key]
 
-        # Step 2: run backbone, detector, and post-processing with NMS
+        # detector 的多 GPU 前向还携带时序边界，保证帧分片不越过本次传播范围。
         if "multigpu_buffer" not in feature_cache:
             # "multigpu_buffer" is a buffer cache used by `self.detector` and it needs
             # to be passed to `forward_video_grounding_multigpu` for every call
@@ -613,7 +644,7 @@ class Sam3VideoBase(nn.Module):
             "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
         }
 
-        # Step 3: build SAM2 backbone features and store them in `feature_cache`
+        # 将 detector FPN 投影到 tracker 期望的格式，并只缓存当前帧以控制显存。
         backbone_cache = {}
         sam_mask_decoder = self.tracker.sam_mask_decoder
         tracker_backbone_fpn = [
@@ -647,7 +678,14 @@ class Sam3VideoBase(nn.Module):
         tracker_states_local: List[Any],
         tracker_metadata_prev: Dict[str, npt.NDArray],
     ):
-        # Step 1: propagate the local SAM2 states to get the current frame's prediction
+        """! @brief 传播各 rank 的已有对象，并在多 GPU 间汇集低分辨率掩码。
+
+        @return 所有对象拼接后的低分辨率 mask logits 与对象质量分数。
+
+        这里故意不写入新的 mask memory；因为新检测、遮挡和非重叠规则可能会
+        改写本帧掩码，必须使用最终掩码编码 memory。
+        """
+        # 每个 rank 仅传播自己的对象，随后按 ``num_obj_per_gpu`` 的既定顺序 all-gather。
         # `low_res_masks_local` of the existing masklets on this GPU
         # - obj_ids_local: List[int] -- list of object IDs
         # - low_res_masks_local: Tensor -- (num_local_obj, H_mask, W_mask)
@@ -761,18 +799,25 @@ class Sam3VideoBase(nn.Module):
         tracker_states_local: List[Any],
         is_image_only: bool = False,
     ):
+        """! @brief 在 rank 0 依据检测/跟踪关联生成对象更新计划，并广播给所有 rank。
+
+        @return ``tracker_update_plan`` 与更新后的全局对象元数据。
+
+        计划包含新检测应分配的对象 ID/GPU、失配对象、重新条件化对象和对象上限
+        导致的丢弃信息；执行阶段不再重新做决策，以避免各 rank 分歧。
+        """
         # initialize new metadata from previous metadata (its values will be updated later)
         tracker_metadata_new = self._create_planning_metadata(tracker_metadata_prev)
 
         # Initialize reconditioned_obj_ids early to avoid UnboundLocalError
         reconditioned_obj_ids = set()
 
-        # Step 1: make the update plan and resolve heuristics on GPU 0
+        # 只有 rank 0 决策，随后广播 Python 对象计划，避免各卡因浮点细节产生不同 ID。
         det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
         det_scores_np: npt.NDArray = det_out["scores"].float().cpu().numpy()
         det_bbox_xyxy: Tensor = det_out["bbox"]
         if self.rank == 0:
-            # a) match detector and tracker masks and find new objects
+            # 以 IoU 关联本帧检测与传播 masklet；未匹配的高分检测才可能新增对象。
             (
                 new_det_fa_inds,
                 unmatched_trk_obj_ids,
@@ -816,7 +861,7 @@ class Sam3VideoBase(nn.Module):
                 prev_workload_per_gpu=prev_workload_per_gpu,
             )
 
-            # b) handle hotstart heuristics to remove objects
+            # 热启动记录短时间内的失配/重复，推迟输出前先淘汰不稳定对象。
             # here `rank0_metadata` contains metadata stored on (and only accessible to) GPU 0;
             # we avoid broadcasting them to other GPUs to save communication cost, assuming
             # that `rank0_metadata` is not needed by other GPUs
@@ -840,7 +885,7 @@ class Sam3VideoBase(nn.Module):
                 obj_ids_newly_removed = set()
             tracker_metadata_new["rank0_metadata"] = rank0_metadata_new
 
-        # Step 2: broadcast the update plan to other GPUs
+        # 所有 rank 必须收到完全一致的计划，否则后续集体通信的对象维度会失配。
         NUM_BROADCAST_ITEMS = 9
         if self.rank == 0 and self.world_size > 1:
             # `num_obj_per_gpu_on_rank0` is used for metadata consistency check on other GPUs
@@ -1196,6 +1241,13 @@ class Sam3VideoBase(nn.Module):
         feature_cache: Dict,
         tracker_metadata_new=None,
     ):
+        """! @brief 按已广播的计划修改本 rank 的 tracker 状态并写入 mask memory。
+
+        @return 更新后的本地 tracker 状态列表。
+
+        执行顺序为删除对象、可选重条件化、加入新对象、传播/合并当前帧结果，最后
+        使用全局非重叠约束后的掩码编码 memory。
+        """
         # initialize tracking scores with detection scores
         new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
         new_det_obj_ids: npt.NDArray = tracker_update_plan["new_det_obj_ids"]
@@ -1272,6 +1324,13 @@ class Sam3VideoBase(nn.Module):
         #  as `None`.
         det_to_matched_trk_obj_ids: dict = None,
     ):
+        """! @brief 将跟踪掩码和本帧新检测组合为原视频分辨率的对象掩码。
+
+        @return ``obj_id -> bool mask`` 映射，仅在 rank 0 构造。
+
+        已重条件化的对象会优先使用高置信检测掩码，确保输出与刚写入的纠正信息
+        一致，而不是仍显示传播前的旧预测。
+        """
         new_det_fa_inds: npt.NDArray = tracker_update_plan["new_det_fa_inds"]
         new_det_obj_ids: npt.NDArray = tracker_update_plan["new_det_obj_ids"]
         obj_id_to_mask = {}  # obj_id --> output mask tensor
@@ -1431,8 +1490,16 @@ class Sam3VideoBase(nn.Module):
         # by default, we disable memory encoding until we gather all outputs
         run_mem_encoder: bool = False,
     ):
-        """
-        inference_states: List of inference states, each state corresponds to a different set of objects.
+        """! @brief 在本 rank 对持有的每组对象只传播当前一帧。
+
+        @param inference_states 本 rank 的 tracker 状态；每项可包含一组对象。
+        @param frame_idx 当前帧索引。
+        @param reverse 是否倒序传播。
+        @param run_mem_encoder 是否同时编码 memory，常规路径为 false。
+        @return 对象 ID、低分辨率掩码 logits 和对象质量分数。
+
+        该函数限制每次 tracker 调用只推进一帧，使检测、关联和 memory 更新可以在
+        同一个外层帧循环中严格交错执行。
         """
         obj_ids_local = []
         low_res_masks_list = []
@@ -1441,7 +1508,7 @@ class Sam3VideoBase(nn.Module):
             if len(inference_state["obj_ids"]) == 0:
                 continue  # skip propagation on empty inference states
 
-            # propagate one frame
+            # ``max_frame_num_to_track=0`` 仍会产出起始帧，因此恰好完成一帧更新。
             num_frames_propagated = 0
             # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             for out in self.tracker.propagate_in_video(
@@ -1504,23 +1571,16 @@ class Sam3VideoBase(nn.Module):
         trk_masks: Tensor,
         trk_obj_ids: npt.NDArray,
     ):
-        """
-        Match detections on the current frame with the existing masklets.
+        """! @brief 按 mask IoU 将本帧检测与已有 tracklet 关联。
 
-        Args:
-          - det_masks: (N, H, W) tensor of predicted masks
-          - det_scores_np: (N,) array of detection scores
-          - trk_masks: (M, H, W) tensor of track masks
-          - trk_obj_ids: (M,) array of object IDs corresponding to trk_masks
+        @param det_masks 检测器输出的 ``(N,H,W)`` mask logits。
+        @param det_scores_np 检测器对象分数。
+        @param trk_masks 跟踪器传播的 ``(M,H,W)`` mask logits。
+        @param trk_obj_ids ``trk_masks`` 对应的持久对象 ID。
+        @return 新检测索引、失配/空对象、检测到对象的匹配关系及高置信重条件化关系。
 
-        Returns:
-          - new_det_fa_inds: array of new object indices.
-          - unmatched_trk_obj_ids: array of existing masklet object IDs that are not matched
-            to any detections on this frame (for unmatched, we only count masklets with >0 area)
-          - det_to_matched_trk_obj_ids: dict[int, npt.NDArray]: mapping from detector's detection indices
-            to the list of matched tracklet object IDs
-          - trk_id_to_max_iou_high_conf_det: dict mapping track obj_id to the highest-IoU high-conf detection idx
-          - empty_trk_obj_ids: array of existing masklet object IDs with zero area in SAM2 prediction
+        匹配关系不是一对一：一个检测可覆盖多个 tracklet，用于处理检测器将相邻
+        实例合并的情况；后续抑制策略再决定哪些对象可见。
         """
         iou_threshold = self.assoc_iou_thresh
         iou_threshold_trk = self.trk_assoc_iou_thresh
@@ -1761,8 +1821,13 @@ class Sam3VideoBase(nn.Module):
         tracker_metadata: Dict[str, Any],
         low_res_masks: Tensor,
     ):
-        """
-        Run Sam2 memory encoder, enforcing non-overlapping constraints globally.
+        """! @brief 用本帧最终掩码编码 SAM 2 的 mask memory 并写回本地状态。
+
+        @param tracker_inference_states 本 rank 的对象状态分片。
+        @param low_res_masks 全局对象顺序的最终 mask logits。
+
+        先在全局对象维度应用非重叠/面积约束，再按 rank 和状态切片写入 memory；
+        因此下一帧看到的是经过关联和抑制后的稳定状态。
         """
         if len(tracker_inference_states) == 0:
             return
@@ -1779,7 +1844,7 @@ class Sam3VideoBase(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        # We first apply non-overlapping constraints before memory encoding. This may include some suppression heuristics.
+        # memory 必须编码最终掩码，否则被遮挡/抑制的对象会把错误区域带到下一帧。
         if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
             # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             high_res_masks = self.tracker._suppress_object_pw_area_shrinkage(
@@ -1849,7 +1914,16 @@ class Sam3VideoBase(nn.Module):
         orig_vid_width: int,
         feature_cache: Dict,
     ):
-        """Add a new object to SAM2 inference states."""
+        """! @brief 将未匹配的高置信检测初始化为新的 SAM 2 tracklet。
+
+        @param new_obj_ids 本 rank 被分配的新持久对象 ID。
+        @param new_obj_masks 检测器产生的掩码 logits。
+        @param feature_cache 当前帧的 tracker backbone 特征。
+        @return 加入新 tracker 状态后的本 rank 状态列表。
+
+        每个新对象的检测掩码先调整到 tracker 输入分辨率，再作为 conditioning mask
+        写入第一帧 memory；从下一帧起它与已有对象走同一传播路径。
+        """
         prev_tracker_state = (
             tracker_states_local[0] if len(tracker_states_local) > 0 else None
         )
@@ -1883,7 +1957,7 @@ class Sam3VideoBase(nn.Module):
         ).squeeze(1)
         new_obj_masks = new_obj_masks > 0
 
-        # add object one by one
+        # ``init_state`` 共享当前帧 backbone 缓存，避免为新对象重复提取视觉特征。
         for new_obj_id, new_mask in zip(new_obj_ids, new_obj_masks):
             # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             self.tracker.add_new_mask(

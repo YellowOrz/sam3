@@ -169,13 +169,11 @@ def _restore_state_from_cpu(value, memo):
 
 
 class Sam3BasePredictor:
-    """
-    Base class for SAM3 video predictors. Provides:
-    - Session management (start, reset, close)
-    - Request dispatch (handle_request / handle_stream_request)
-    - Common add_prompt / propagate_in_video / remove_object / reset_session / close_session
+    """! @brief SAM 3 视频推理请求层的基类。
 
-    Subclasses must set `self.model` and `self._all_inference_states` before use.
+    它将无状态的字典请求转换为模型调用，并以 ``session_id`` 隔离每段视频的
+    ``inference_state``。子类只需提供实际的视频模型；提示、传播和会话生命周期
+    均在此处统一处理。
     """
 
     def __init__(self):
@@ -187,7 +185,13 @@ class Sam3BasePredictor:
 
     @torch.inference_mode()
     def handle_request(self, request):
-        """Dispatch a request based on its type."""
+        """! @brief 分派会立即返回结果的会话请求。
+
+        @param request 含 ``type`` 的请求字典，例如 ``start_session``、``add_prompt``。
+        @return 对应操作的结果字典。
+
+        ``propagate_in_video`` 是逐帧生成器，必须通过 ``handle_stream_request`` 调用。
+        """
         request_type = request["type"]
         if request_type == "start_session":
             return self.start_session(
@@ -251,7 +255,11 @@ class Sam3BasePredictor:
 
     @torch.inference_mode()
     def handle_stream_request(self, request):
-        """Dispatch a stream request based on its type."""
+        """! @brief 分派会产生逐帧输出的流式请求。
+
+        @param request 当前仅支持 ``propagate_in_video``。
+        @yield 每帧的索引和已后处理的实例输出。
+        """
         request_type = request["type"]
         if request_type == "propagate_in_video":
             yield from self.propagate_in_video(
@@ -276,7 +284,17 @@ class Sam3BasePredictor:
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
     ):
-        """Start a new inference session on a video directory or path."""
+        """! @brief 解码视频并创建独立的推理会话。
+
+        @param resource_path 视频文件、帧目录或单张图片路径。
+        @param session_id 可选的调用方会话 ID；缺省时自动生成 UUID。
+        @param offload_video_to_cpu 是否把已解码视频帧放在 CPU。
+        @param offload_state_to_cpu 是否把跟踪状态放在 CPU（模型支持时）。
+        @return 含 ``session_id`` 的结果字典。
+
+        此步骤只准备帧和状态，不运行检测或时序传播；两者分别由添加提示和
+        ``propagate_in_video`` 触发。
+        """
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -301,6 +319,7 @@ class Sam3BasePredictor:
             init_kwargs["async_loading_frames"] = self.async_loading_frames
         if hasattr(self, "video_loader_type"):
             init_kwargs["video_loader_type"] = self.video_loader_type
+        # 状态内含帧、提示、特征缓存和跟踪器 memory，绝不能在不同视频间复用。
         inference_state = self.model.init_state(**init_kwargs)
 
         if not session_id:
@@ -331,12 +350,23 @@ class Sam3BasePredictor:
         obj_id: Optional[int] = None,
         rel_coordinates: bool = True,
     ):
-        """Add text, box and/or point prompt on a specific video frame."""
+        """! @brief 在指定帧写入文本、框或点提示，并计算该帧的即时分割结果。
+
+        @param session_id 目标视频会话。
+        @param frame_idx 提示锚定的帧索引。
+        @param text 全视频共享的语义文本提示。
+        @param points,point_labels 点提示及其正负标签。
+        @param bounding_boxes,bounding_box_labels 归一化 ``xywh`` 框及标签。
+        @return 含提示帧索引和实例掩码/框的结果字典。
+
+        外层 API 接受 Python 列表；此处先转换为 Tensor，再按底层模型实际支持的
+        参数过滤，以兼容 SAM 3 和 SAM 3.1 的不同签名。
+        """
         session = self._get_session(session_id)
         inference_state = session["state"]
         self._extend_expiration_time(session)
 
-        # Convert lists to tensors if needed
+        # 请求层保持 JSON 友好；模型层只接收带明确 dtype 的 Tensor。
         if points is not None and not isinstance(points, torch.Tensor):
             points = torch.tensor(points, dtype=torch.float32)
         if point_labels is not None and not isinstance(point_labels, torch.Tensor):
@@ -364,7 +394,7 @@ class Sam3BasePredictor:
         if obj_id is not None:
             kwargs["obj_id"] = obj_id
 
-        # Filter kwargs to only pass what the model accepts
+        # 两个版本的 add_prompt 签名不同，避免将不支持的交互参数传入模型。
         # (SAM3 has a simpler add_prompt than SAM3.1)
         import inspect
 
@@ -432,7 +462,17 @@ class Sam3BasePredictor:
         output_prob_thresh=0.5,
         **kwargs,
     ):
-        """Propagate the added prompts to get results on all video frames."""
+        """! @brief 从提示帧向前、向后或双向逐帧传播实例掩码。
+
+        @param session_id 目标视频会话。
+        @param propagation_direction ``forward``、``backward`` 或 ``both``。
+        @param start_frame_idx 可选传播起点；缺省时由模型选取最早提示帧。
+        @param max_frame_num_to_track 限制传播帧数；``None`` 表示可达的全部帧。
+        @yield ``{frame_index, outputs}``，其中输出为原视频分辨率的实例结果。
+
+        双向模式是两次独立的单向传播，不在此层融合结果；调用方若需要融合，
+        应依据对象 ID 和掩码自行处理。
+        """
         try:
             session = self._get_session(session_id)
             inference_state = session["state"]
@@ -457,7 +497,7 @@ class Sam3BasePredictor:
                 if k in sig.parameters:
                     propagate_kwargs[k] = v
 
-            # Forward propagation
+            # ``reverse`` 只改变模型内部的处理顺序；对客户端仍返回真实帧索引。
             if propagation_direction in ["both", "forward"]:
                 for frame_idx, outputs in self.model.propagate_in_video(
                     **propagate_kwargs,
@@ -475,7 +515,11 @@ class Sam3BasePredictor:
             logger.info(f"propagation ended in session {session_id}")
 
     def reset_session(self, session_id):
-        """Reset the session to its initial state."""
+        """! @brief 清空提示、特征缓存和跟踪 memory，但保留已解码视频帧。
+
+        @param session_id 目标视频会话。
+        @return 成功标志。
+        """
         session = self._get_session(session_id)
         inference_state = session["state"]
         self._extend_expiration_time(session)
@@ -605,7 +649,13 @@ class Sam3BasePredictor:
         run_gc_collect=True,
         clear_cache_threshold: int = _CLEAR_CACHE_THRESHOLD,
     ):
-        """Close a session. Idempotent.
+        """! @brief 关闭会话并按需释放 Python/CUDA 占用的状态。
+
+        @param session_id 目标视频会话。
+        @param run_gc_collect 是否运行垃圾回收并在内存压力下清空 CUDA 缓存。
+        @return 成功标志和可选 GPU 内存快照。
+
+        此操作可重入：重复关闭同一会话不会恢复或修改其他会话。
 
         ``run_gc_collect=True`` (the default) also returns the session's
         freed CUDA tensors back to the device by calling
