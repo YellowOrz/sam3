@@ -1,82 +1,20 @@
 #!/usr/bin/env python3
-"""使用独立的正序、倒序 SAM 推理结果汇总目标手分割。
+"""Zero-training SAM3 bidirectional memory fusion.
 
-处理流程：
+Independent forward/backward sessions export encoded memories. Each frame reads
+past forward and future backward memories with a fixed budget, then uses the
+original SAM3 decoder once. The source banks are never updated by fused masks.
 
-1. 递归查找输入目录中的 ``color.mp4``；如果输入目录本身包含该文件，则只处理
-   这一段视频。
-2. 正序从第一帧处理到最后一帧；倒序从最后一帧处理到第一帧。两个方向使用
-   完全独立的 session，不共享 tracker 状态或实例 ID。``add_prompt`` 的结果作为
-   锚点帧结果直接保存，后续传播从相邻帧开始，保证每帧只处理一次。正式批处理
-   推荐 ``--backward-mode physical``，即真正反向编号后再做 forward propagation。
-3. 根据整段视频的 mask 重叠和质量分数匹配两个方向的目标实例。
-4. 使用 Viterbi 在 Forward、Backward 和目标不可见三种状态间选择时序稳定的
-   最终路径。可选的 P0-C 会在高不确定区间两侧寻找可信锚点，建立新 session
-   向区间内部重传播；新候选未通过验收时不会替换原结果。
+Examples:
+    python scripts/process_bidirectional_videos.py --input-root DATA \
+        --output-root OUT --prompt "left hand" --backward-mode physical
+    python scripts/process_bidirectional_videos.py --input-root DATA \
+        --output-root OUT --prompt "left hand" --chunk-frames 120 --context-frames 30
 
-Viterbi 汇总逻辑：
-
-* 每一帧有三个候选状态：``F`` 使用正序 mask，``B`` 使用倒序 mask，``O`` 表示
-  目标不可见并输出空 mask。它不是对 F/B 做逐像素平均、并集或交集，而是为每帧
-  选择一张完整候选 mask。
-* F/B 的“当前帧分数”（发射分数）由模型置信度和面积稳健性组成。面积越接近该
-  方向整段视频的非空 mask 面积中位数，面积分越高；空的 F/B 候选不可选择。
-* O 是保守的空目标状态：只有 F/B 都为空，或所有非空候选的最高模型分数不超过
-  ``--empty-score-threshold`` 时才允许选择，防止轻易把目标标成不可见。
-* 相邻帧的“连续性分数”（转移分数）奖励 mask IoU 高、质心移动小的路径；从
-  F 切到 B、从 B 切到 F 或进入/离开 O 都会受到惩罚，避免逐帧贪心造成闪烁。
-* 动态规划会累计整段视频的发射分数和转移分数，保存每个状态的最佳前驱，最后
-  从末帧回溯得到全局总分最高的状态序列。因此某一帧不一定选择当帧分数最高的
-  方向，而会兼顾前后帧的一致性。
-* ``frames.jsonl`` 记录最终选择的状态、各候选分数、方向切换原因和不确定性；
-  ``result.mp4`` 的 Fused 面板显示 Viterbi 选择结果，Difference 面板显示 F/B
-  分歧，便于检查切换是否合理。
-
-默认的 ``--backward-mode verify`` 会同时运行两种倒序实现：
-
-* ``physical``：将无损临时帧真正反向编号，再通过 forward API 处理；
-* ``api``：保持原帧编号，调用 SAM 的 backward API。
-
-两种结果达到等价门槛时采用较简单的 API backward 结果；不等价时脚本停止，
-并保存 ``backward_equivalence.json`` 及两套候选供人工选择。临时 PNG 只用于
-模型加载，任务结束后自动删除，不会在输出目录生成 PNG mask。
-
-基本用法：
-
-    python scripts/process_bidirectional_videos.py \
-        --input-root DATA \
-        --output-root OUT \
-        --prompt "left hand" \
-        --version sam3 \
-        --device cuda:0 \
-        --backward-mode physical
-
-使用交互分割产生的 FFV1 ``masks.mkv`` 评测：
-
-    python scripts/process_bidirectional_videos.py \
-        --input-root DATA \
-        --output-root OUT \
-        --prompt "right hand" \
-        --ground-truth-root GT_ROOT \
-        --ground-truth-label 1
-
-校准阈值后开启保守双锚点修复：
-
-    python scripts/process_bidirectional_videos.py \
-        --input-root DATA \
-        --output-root OUT \
-        --prompt "left hand" \
-        --repair-uncertain
-
-主要输出：
-
-* ``forward/masks.mkv``、``backward/masks.mkv``：两个方向的全部实例标签；
-* ``masks.mkv``：汇总后的目标实例二值 mask；
-* ``result.mp4``：Forward、Backward、Fused、Difference 的 2×2 对比视频；
-* ``frames.jsonl``：逐帧选择方向、分数、切换原因和不确定性；
-* ``audit.json``：无需 GT 的正反向分歧统计；
-* ``evaluation.json``：提供 GT 时生成的 J、F、J&F 和 oracle 指标；
-* ``metadata.json``：完整参数、输出结构、实例匹配和修复记录。
+chunk-frames=0 processes the full sequence. Otherwise each independent window
+contains a unique output core and optional context on either side. Outputs are
+lossless masks, a four-panel comparison, per-frame memory provenance and optional
+GT evaluation. No Viterbi or mask averaging is used. Standard SAM3 only, one GPU.
 """
 
 import argparse
@@ -89,7 +27,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -111,7 +49,7 @@ if __package__:
     )
 else:
     from process_dataset_videos import discover_color_videos, output_dir_for
-    from video_utils import (  # type: ignore[no-redef]
+    from video_utils import (
         as_numpy,
         expand_path,
         extract_png_frames,
@@ -123,29 +61,8 @@ else:
         write_json,
     )
 
-
 LOGGER = logging.getLogger("sam3_bidirectional_processor")
-SCHEMA_VERSION = 1
-SOURCES = ("F", "B", "O")
-
-
-@dataclass(frozen=True)
-class FusionConfig:
-    model_weight: float = 1.0
-    shape_weight: float = 0.25
-    temporal_iou_weight: float = 1.25
-    centroid_weight: float = 0.25
-    switch_penalty: float = 0.20
-    empty_transition_penalty: float = 0.35
-    empty_score_threshold: float = 0.20
-    disagreement_iou_threshold: float = 0.35
-    disagreement_min_frames: int = 5
-    recovery_iou_threshold: float = 0.60
-    recovery_min_frames: int = 3
-    anchor_iou_threshold: float = 0.80
-    anchor_score_threshold: float = 0.60
-    anchor_search_frames: int = 90
-    repair_min_gain: float = 0.10
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -155,13 +72,7 @@ class DirectionResult:
     detector_scores: List[Dict[int, float]]
     tracker_scores: List[Dict[int, float]]
     primary_obj_id: Optional[int] = None
-
-
-@dataclass(frozen=True)
-class PathResult:
-    sources: Tuple[str, ...]
-    score: float
-    frame_scores: Tuple[Dict[str, float], ...]
+    memories: Dict[int, Dict[int, Dict[str, Any]]] = field(default_factory=dict)
 
 
 def unit_interval(value: str) -> float:
@@ -171,37 +82,11 @@ def unit_interval(value: str) -> float:
     return number
 
 
-def nonnegative_float(value: str) -> float:
-    number = float(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return number
-
-
 def mask_iou(first: np.ndarray, second: np.ndarray) -> float:
     union = np.logical_or(first, second).sum()
     if union == 0:
         return 1.0
     return float(np.logical_and(first, second).sum() / union)
-
-
-def mask_centroid(mask: np.ndarray) -> Optional[Tuple[float, float]]:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return None
-    return float(xs.mean()), float(ys.mean())
-
-
-def stability_from_mask(mask: np.ndarray) -> float:
-    """A geometry proxy, not SAM's internal logit stability score."""
-    area = int(mask.sum())
-    if area == 0:
-        return 0.0
-    contours, _ = cv2.findContours(
-        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    perimeter = sum(cv2.arcLength(contour, True) for contour in contours)
-    return float(np.clip(4.0 * math.pi * area / max(perimeter * perimeter, 1.0), 0, 1))
 
 
 def output_frame(
@@ -243,6 +128,7 @@ def run_direction(
     *,
     propagation_direction: str = "forward",
     reverse_index: bool = False,
+    memory_dir: Optional[Path] = None,
 ) -> DirectionResult:
     """Run one isolated session, processing the prompt frame exactly once."""
     frames: List[Dict[int, np.ndarray]] = [{} for _ in range(frame_count)]
@@ -250,6 +136,8 @@ def run_direction(
     tracker_scores: List[Dict[int, float]] = [{} for _ in range(frame_count)]
     start_index = frame_count - 1 if propagation_direction == "backward" else 0
     session_id: Optional[str] = None
+    memories = {}
+    capture_started = False
     try:
         session = predictor.handle_request(
             {
@@ -260,6 +148,9 @@ def run_direction(
             }
         )
         session_id = session["session_id"]
+        if memory_dir is not None:
+            predictor.begin_memory_capture(session_id, memory_dir)
+            capture_started = True
         prompt_response = predictor.handle_request(
             {
                 "type": "add_prompt",
@@ -279,8 +170,6 @@ def run_direction(
         tracker_scores[prompt_source_index] = prompt_tracker
 
         remaining_frames = frame_count - 1
-        if remaining_frames == 0:
-            return DirectionResult(name, frames, detector_scores, tracker_scores)
         propagation_start = (
             start_index if propagation_direction == "backward" else start_index + 1
         )
@@ -291,7 +180,8 @@ def run_direction(
             "start_frame_index": propagation_start,
             "max_frame_num_to_track": remaining_frames,
         }
-        for response in predictor.handle_stream_request(request):
+        responses = predictor.handle_stream_request(request) if remaining_frames else ()
+        for response in responses:
             returned_index = int(response["frame_index"])
             source_index = (
                 frame_count - 1 - returned_index if reverse_index else returned_index
@@ -304,10 +194,22 @@ def run_direction(
             tracker_scores[source_index] = tracker
     finally:
         if session_id is not None:
-            predictor.handle_request(
-                {"type": "close_session", "session_id": session_id}
-            )
-    return DirectionResult(name, frames, detector_scores, tracker_scores)
+            try:
+                if capture_started:
+                    exported = predictor.finish_memory_capture(session_id)
+                    for index, records in exported.items():
+                        mapped = frame_count - 1 - index if reverse_index else index
+                        memories[mapped] = {
+                            obj_id: {**entry, "frame_index": mapped, "direction": name}
+                            for obj_id, entry in records.items()
+                        }
+            finally:
+                predictor.handle_request(
+                    {"type": "close_session", "session_id": session_id}
+                )
+    return DirectionResult(
+        name, frames, detector_scores, tracker_scores, memories=memories
+    )
 
 
 def track_ids(result: DirectionResult) -> List[int]:
@@ -448,457 +350,6 @@ def primary_track(
     return masks, scores
 
 
-def shape_scores(masks: Sequence[np.ndarray]) -> List[float]:
-    nonzero = [float(mask.sum()) for mask in masks if mask.any()]
-    median = float(np.median(nonzero)) if nonzero else 0.0
-    values = []
-    for mask in masks:
-        area = float(mask.sum())
-        if area == 0 or median == 0:
-            values.append(0.0)
-        else:
-            values.append(float(math.exp(-abs(math.log(area / median)))))
-    return values
-
-
-def transition_score(
-    previous_mask: np.ndarray,
-    current_mask: np.ndarray,
-    previous_source: str,
-    current_source: str,
-    config: FusionConfig,
-) -> float:
-    previous_empty = not previous_mask.any()
-    current_empty = not current_mask.any()
-    if previous_empty and current_empty:
-        score = config.temporal_iou_weight
-    elif previous_empty or current_empty:
-        score = -config.empty_transition_penalty
-    else:
-        score = config.temporal_iou_weight * mask_iou(previous_mask, current_mask)
-        previous_centroid = mask_centroid(previous_mask)
-        current_centroid = mask_centroid(current_mask)
-        assert previous_centroid is not None and current_centroid is not None
-        diagonal = math.hypot(*previous_mask.shape)
-        distance = math.dist(previous_centroid, current_centroid) / max(diagonal, 1.0)
-        score -= config.centroid_weight * distance
-    if previous_source != current_source:
-        score -= config.switch_penalty
-    return score
-
-
-def viterbi_select(
-    masks_by_source: Mapping[str, Sequence[np.ndarray]],
-    scores_by_source: Mapping[str, Sequence[float]],
-    config: FusionConfig,
-) -> PathResult:
-    frame_count = len(next(iter(masks_by_source.values())))
-    states = tuple(masks_by_source)
-    if frame_count == 0:
-        return PathResult((), 0.0, ())
-    shape_by_source = {
-        source: shape_scores(masks) if source != "O" else [1.0] * frame_count
-        for source, masks in masks_by_source.items()
-    }
-    dp = np.full((frame_count, len(states)), -np.inf, dtype=np.float64)
-    parents = np.full((frame_count, len(states)), -1, dtype=np.int32)
-    frame_scores: List[Dict[str, float]] = []
-
-    for frame_index in range(frame_count):
-        scores_for_frame = {}
-        nonempty_scores = [
-            scores_by_source[source][frame_index]
-            for source in states
-            if source != "O" and masks_by_source[source][frame_index].any()
-        ]
-        both_empty = all(
-            not masks_by_source[source][frame_index].any()
-            for source in states
-            if source != "O"
-        )
-        allow_empty = both_empty or (
-            nonempty_scores and max(nonempty_scores) <= config.empty_score_threshold
-        )
-        for state_index, source in enumerate(states):
-            if source == "O":
-                emission = 0.5 if allow_empty else -np.inf
-            else:
-                mask = masks_by_source[source][frame_index]
-                if not mask.any():
-                    emission = -np.inf
-                else:
-                    emission = (
-                        config.model_weight * scores_by_source[source][frame_index]
-                        + config.shape_weight * shape_by_source[source][frame_index]
-                    )
-            scores_for_frame[source] = float(emission)
-            if frame_index == 0:
-                dp[frame_index, state_index] = emission
-                continue
-            best_score = -np.inf
-            best_parent = -1
-            for previous_index, previous_source in enumerate(states):
-                candidate_score = dp[frame_index - 1, previous_index]
-                if not np.isfinite(candidate_score) or not np.isfinite(emission):
-                    continue
-                candidate_score += emission + transition_score(
-                    masks_by_source[previous_source][frame_index - 1],
-                    masks_by_source[source][frame_index],
-                    previous_source,
-                    source,
-                    config,
-                )
-                if candidate_score > best_score:
-                    best_score = candidate_score
-                    best_parent = previous_index
-            dp[frame_index, state_index] = best_score
-            parents[frame_index, state_index] = best_parent
-        frame_scores.append(scores_for_frame)
-
-    state_index = int(np.argmax(dp[-1]))
-    if not np.isfinite(dp[-1, state_index]):
-        raise RuntimeError("no valid Viterbi path")
-    path = [states[state_index]]
-    for frame_index in range(frame_count - 1, 0, -1):
-        state_index = int(parents[frame_index, state_index])
-        if state_index < 0:
-            raise RuntimeError("broken Viterbi backpointer")
-        path.append(states[state_index])
-    path.reverse()
-    return PathResult(tuple(path), float(np.max(dp[-1])), tuple(frame_scores))
-
-
-def uncertainty_values(
-    forward_masks: Sequence[np.ndarray],
-    backward_masks: Sequence[np.ndarray],
-    forward_scores: Sequence[float],
-    backward_scores: Sequence[float],
-) -> List[float]:
-    values = []
-    for forward, backward, forward_score, backward_score in zip(
-        forward_masks, backward_masks, forward_scores, backward_scores
-    ):
-        disagreement = 1.0 - mask_iou(forward, backward)
-        low_quality = 1.0 - max(forward_score, backward_score)
-        if not forward.any() and not backward.any():
-            disagreement = 0.0
-        values.append(float(np.clip(max(disagreement, low_quality), 0, 1)))
-    return values
-
-
-def uncertain_intervals(
-    forward_masks: Sequence[np.ndarray],
-    backward_masks: Sequence[np.ndarray],
-    forward_scores: Sequence[float],
-    backward_scores: Sequence[float],
-    config: FusionConfig,
-) -> List[Tuple[int, int]]:
-    flagged = []
-    for forward, backward, forward_score, backward_score in zip(
-        forward_masks, backward_masks, forward_scores, backward_scores
-    ):
-        disagreement = mask_iou(forward, backward) < config.disagreement_iou_threshold
-        independent_failure = (
-            min(forward_score, backward_score) < config.empty_score_threshold
-            or (forward.any() != backward.any())
-            or abs(stability_from_mask(forward) - stability_from_mask(backward)) > 0.35
-        )
-        flagged.append(disagreement and independent_failure)
-    intervals = []
-    index = 0
-    while index < len(flagged):
-        if not flagged[index]:
-            index += 1
-            continue
-        start = index
-        while index < len(flagged) and flagged[index]:
-            index += 1
-        if index - start < config.disagreement_min_frames:
-            continue
-        recovery_start = None
-        recovery_run = 0
-        while index < len(flagged):
-            recovered = (
-                mask_iou(forward_masks[index], backward_masks[index])
-                >= config.recovery_iou_threshold
-            )
-            recovery_run = recovery_run + 1 if recovered else 0
-            if recovery_run >= config.recovery_min_frames:
-                recovery_start = index - recovery_run + 1
-                break
-            index += 1
-        end = len(flagged) - 1 if recovery_start is None else recovery_start - 1
-        intervals.append((start, end))
-        if recovery_start is not None:
-            index += 1
-    return intervals
-
-
-def trusted_anchor(
-    start: int,
-    step: int,
-    limit: int,
-    forward_masks: Sequence[np.ndarray],
-    backward_masks: Sequence[np.ndarray],
-    forward_scores: Sequence[float],
-    backward_scores: Sequence[float],
-    config: FusionConfig,
-) -> Optional[int]:
-    for offset in range(config.anchor_search_frames + 1):
-        index = start + step * offset
-        if not 0 <= index < limit:
-            break
-        if (
-            mask_iou(forward_masks[index], backward_masks[index])
-            >= config.anchor_iou_threshold
-            and min(forward_scores[index], backward_scores[index])
-            >= config.anchor_score_threshold
-            and forward_masks[index].any()
-            and backward_masks[index].any()
-        ):
-            return index
-    return None
-
-
-def selected_masks(
-    path: Sequence[str], masks_by_source: Mapping[str, Sequence[np.ndarray]]
-) -> List[np.ndarray]:
-    return [masks_by_source[source][index].copy() for index, source in enumerate(path)]
-
-
-def greedy_sources(
-    masks_by_source: Mapping[str, Sequence[np.ndarray]],
-    scores_by_source: Mapping[str, Sequence[float]],
-) -> List[str]:
-    frame_count = len(next(iter(masks_by_source.values())))
-    result = []
-    for frame_index in range(frame_count):
-        candidates = [
-            source
-            for source in masks_by_source
-            if source != "O" and masks_by_source[source][frame_index].any()
-        ]
-        result.append(
-            max(candidates, key=lambda source: scores_by_source[source][frame_index])
-            if candidates
-            else "O"
-        )
-    return result
-
-
-def switch_count(sources: Sequence[str]) -> int:
-    return sum(first != second for first, second in zip(sources, sources[1:]))
-
-
-def interior_point(mask: np.ndarray) -> Tuple[float, float]:
-    """Return a normalized point far from the mask boundary."""
-    if not mask.any():
-        raise ValueError("cannot sample a point from an empty mask")
-    distance = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
-    y, x = np.unravel_index(int(np.argmax(distance)), distance.shape)
-    height, width = mask.shape
-    return (x + 0.5) / width, (y + 0.5) / height
-
-
-def run_anchor_propagation(
-    predictor: Any,
-    frame_dir: Path,
-    frame_count: int,
-    prompt: str,
-    anchor_index: int,
-    anchor_mask: np.ndarray,
-    interval: Tuple[int, int],
-    direction: str,
-    name: str,
-) -> Optional[Tuple[List[np.ndarray], List[float]]]:
-    """Start a clean session at one trusted anchor and propagate into an interval."""
-    session_id: Optional[str] = None
-    shape = anchor_mask.shape
-    masks = [np.zeros(shape, dtype=bool) for _ in range(frame_count)]
-    scores = [0.0] * frame_count
-    try:
-        session = predictor.handle_request(
-            {
-                "type": "start_session",
-                "resource_path": str(frame_dir),
-                "offload_video_to_cpu": True,
-                "offload_state_to_cpu": False,
-            }
-        )
-        session_id = session["session_id"]
-        response = predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": anchor_index,
-                "text": prompt,
-            }
-        )
-        anchor_candidates, detector, tracker = output_frame(response.get("outputs"))
-        if not anchor_candidates:
-            return None
-        obj_id = max(
-            anchor_candidates,
-            key=lambda candidate_id: (
-                mask_iou(anchor_candidates[candidate_id], anchor_mask),
-                tracker.get(candidate_id, detector.get(candidate_id, 0.0)),
-            ),
-        )
-        if mask_iou(anchor_candidates[obj_id], anchor_mask) < 0.5:
-            return None
-        x, y = interior_point(anchor_mask)
-        predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": anchor_index,
-                "points": [[x, y]],
-                "point_labels": [1],
-                "clear_old_points": True,
-                "obj_id": obj_id,
-                "rel_coordinates": True,
-            }
-        )
-        start, end = interval
-        max_frames = (
-            end - anchor_index if direction == "forward" else anchor_index - start
-        )
-        request = {
-            "type": "propagate_in_video",
-            "session_id": session_id,
-            "propagation_direction": direction,
-            "start_frame_index": anchor_index,
-            "max_frame_num_to_track": max_frames,
-        }
-        for propagated in predictor.handle_stream_request(request):
-            frame_index = int(propagated["frame_index"])
-            if not start <= frame_index <= end:
-                continue
-            frame_masks, frame_detector, frame_tracker = output_frame(
-                propagated.get("outputs")
-            )
-            if obj_id in frame_masks:
-                masks[frame_index] = frame_masks[obj_id]
-                scores[frame_index] = frame_tracker.get(
-                    obj_id, frame_detector.get(obj_id, 0.0)
-                )
-        return masks, scores
-    finally:
-        if session_id is not None:
-            predictor.handle_request(
-                {"type": "close_session", "session_id": session_id}
-            )
-
-
-def try_repair_interval(
-    predictor: Any,
-    frame_dir: Path,
-    frame_count: int,
-    prompt: str,
-    interval: Tuple[int, int],
-    left_anchor: Optional[int],
-    right_anchor: Optional[int],
-    base_masks: List[np.ndarray],
-    base_sources: List[str],
-    masks_by_source: Dict[str, Sequence[np.ndarray]],
-    scores_by_source: Dict[str, Sequence[float]],
-    config: FusionConfig,
-) -> Dict[str, Any]:
-    start, end = interval
-    attempt: Dict[str, Any] = {
-        "start": start,
-        "end": end,
-        "left_anchor": left_anchor,
-        "right_anchor": right_anchor,
-        "status": "rejected",
-    }
-    if left_anchor is None or right_anchor is None:
-        attempt["reason"] = "missing_trusted_anchor"
-        return attempt
-    left_seed = np.logical_and(
-        masks_by_source["F"][left_anchor], masks_by_source["B"][left_anchor]
-    )
-    right_seed = np.logical_and(
-        masks_by_source["F"][right_anchor], masks_by_source["B"][right_anchor]
-    )
-    left = run_anchor_propagation(
-        predictor,
-        frame_dir,
-        frame_count,
-        prompt,
-        left_anchor,
-        left_seed,
-        interval,
-        "forward",
-        "L",
-    )
-    right = run_anchor_propagation(
-        predictor,
-        frame_dir,
-        frame_count,
-        prompt,
-        right_anchor,
-        right_seed,
-        interval,
-        "backward",
-        "R",
-    )
-    if left is None or right is None:
-        attempt["reason"] = "anchor_prompt_did_not_match"
-        return attempt
-    local_slice = slice(start, end + 1)
-    local_masks = {
-        source: list(masks[local_slice]) for source, masks in masks_by_source.items()
-    }
-    local_scores = {
-        source: list(scores[local_slice]) for source, scores in scores_by_source.items()
-    }
-    local_masks["L"] = list(left[0][local_slice])
-    local_masks["R"] = list(right[0][local_slice])
-    local_scores["L"] = list(left[1][local_slice])
-    local_scores["R"] = list(right[1][local_slice])
-    base = viterbi_select(
-        {source: masks for source, masks in local_masks.items() if source in SOURCES},
-        {
-            source: scores
-            for source, scores in local_scores.items()
-            if source in SOURCES
-        },
-        config,
-    )
-    repaired = viterbi_select(local_masks, local_scores, config)
-    gain = (repaired.score - base.score) / max(end - start + 1, 1)
-    repaired_masks = selected_masks(repaired.sources, local_masks)
-    endpoint_iou = min(
-        mask_iou(repaired_masks[0], base_masks[start]),
-        mask_iou(repaired_masks[-1], base_masks[end]),
-    )
-    attempt.update(
-        {
-            "score_gain_per_frame": gain,
-            "endpoint_iou": endpoint_iou,
-            "candidate_source_counts": {
-                source: repaired.sources.count(source) for source in local_masks
-            },
-        }
-    )
-    if gain < config.repair_min_gain:
-        attempt["reason"] = "insufficient_score_gain"
-        return attempt
-    if endpoint_iou < config.recovery_iou_threshold:
-        attempt["reason"] = "interval_endpoints_worsened"
-        return attempt
-    for local_index, frame_index in enumerate(range(start, end + 1)):
-        base_masks[frame_index] = repaired_masks[local_index]
-        base_sources[frame_index] = repaired.sources[local_index]
-    masks_by_source["L"] = left[0]
-    masks_by_source["R"] = right[0]
-    scores_by_source["L"] = left[1]
-    scores_by_source["R"] = right[1]
-    attempt["status"] = "accepted"
-    return attempt
-
-
 def write_label_video(path: Path, masks: Sequence[np.ndarray], fps: float) -> None:
     if not masks:
         raise ValueError("cannot write empty mask video")
@@ -913,38 +364,6 @@ def write_label_video(path: Path, masks: Sequence[np.ndarray], fps: float) -> No
             writer.write(mask.astype(np.uint8))
     finally:
         writer.release()
-
-
-def write_all_instance_video(
-    path: Path,
-    frames: Sequence[Dict[int, np.ndarray]],
-    fps: float,
-    shape: Optional[Tuple[int, int]] = None,
-) -> Dict[int, int]:
-    first_mask = next((mask for frame in frames for mask in frame.values()), None)
-    if first_mask is None and shape is None:
-        raise RuntimeError("mask shape is required when a direction produced no masks")
-    height, width = first_mask.shape if first_mask is not None else shape
-    mapping = {
-        obj_id: index + 1
-        for index, obj_id in enumerate(sorted({i for f in frames for i in f}))
-    }
-    if len(mapping) > 255:
-        raise RuntimeError("more than 255 instances cannot be stored in gray8")
-    writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"FFV1"), fps, (width, height), isColor=False
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"cannot create lossless mask video: {path}")
-    try:
-        for frame in frames:
-            labels = np.zeros((height, width), dtype=np.uint8)
-            for obj_id, mask in sorted(frame.items()):
-                labels[mask] = mapping[obj_id]
-            writer.write(labels)
-    finally:
-        writer.release()
-    return mapping
 
 
 def overlay(
@@ -983,9 +402,7 @@ def write_result_video(
     forward_masks: Sequence[np.ndarray],
     backward_masks: Sequence[np.ndarray],
     fused_masks: Sequence[np.ndarray],
-    path_sources: Sequence[str],
-    uncertainty: Sequence[float],
-    repaired_frames: Sequence[bool],
+    statuses: Sequence[str],
     fps: float,
 ) -> None:
     height, width = forward_masks[0].shape
@@ -1008,7 +425,7 @@ def write_result_video(
             header(backward_panel, "Backward")
             header(
                 fused_panel,
-                f"Fused  source={path_sources[index]}  uncertainty={uncertainty[index]:.2f}",
+                f"Memory fusion  {statuses[index]}",
             )
 
             diagnostic = (frame.astype(np.float32) * 0.35).astype(np.uint8)
@@ -1022,10 +439,9 @@ def write_result_video(
                 fused.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
             )
             cv2.drawContours(diagnostic, contours, -1, (0, 255, 255), 2, cv2.LINE_AA)
-            repair = " repaired" if repaired_frames[index] else ""
             header(
                 diagnostic,
-                f"Difference  IoU={mask_iou(forward, backward):.2f}{repair}",
+                f"Difference  IoU={mask_iou(forward, backward):.2f}",
             )
             writer.write(
                 np.concatenate(
@@ -1190,608 +606,662 @@ def resolve_ground_truth(
     return candidate if candidate.is_file() else None
 
 
-def persist_direction(
-    output_dir: Path,
-    result: DirectionResult,
-    fps: float,
-    shape: Tuple[int, int],
-) -> Dict[int, int]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    mapping = write_all_instance_video(
-        output_dir / "masks.mkv", result.frames, fps, shape
-    )
-    write_jsonl(
-        output_dir / "frames.jsonl",
-        (
-            {
-                "frame_index": index,
-                "objects": [
-                    {
-                        "object_id": obj_id,
-                        "label": mapping[obj_id],
-                        "detector_score": detector.get(obj_id),
-                        "tracker_score": tracker.get(obj_id),
-                        "area": int(mask.sum()),
-                    }
-                    for obj_id, mask in sorted(frame.items())
-                ],
-            }
-            for index, (frame, detector, tracker) in enumerate(
-                zip(result.frames, result.detector_scores, result.tracker_scores)
+@dataclass(frozen=True)
+class MemoryConfig:
+    chunk_frames: int = 0
+    context_frames: int = 0
+    spatial_frames: int = 6
+    pointer_frames: int = 16
+    side: str = "both"
+    min_quality: float = 0.0
+    min_match_iou: float = 0.1
+
+    def __post_init__(self):
+        if self.chunk_frames < 0 or self.context_frames < 0:
+            raise ValueError("chunk/context frames must be non-negative")
+        if self.chunk_frames == 0 and self.context_frames:
+            raise ValueError("--context-frames requires --chunk-frames")
+        if self.spatial_frames < 1 or self.pointer_frames < 0:
+            raise ValueError(
+                "spatial frames must be positive; pointer frames non-negative"
             )
-        ),
+        if self.side not in {"both", "past", "future"}:
+            raise ValueError("memory side must be both, past or future")
+        if not 0 <= self.min_quality <= 1 or not 0 <= self.min_match_iou <= 1:
+            raise ValueError("quality and match thresholds must be in [0, 1]")
+
+
+def processing_windows(frame_count: int, config: MemoryConfig):
+    """Yield (core_start, core_end, window_start, window_end), half-open."""
+    if frame_count < 1:
+        raise ValueError("Video contains no frames")
+    step = config.chunk_frames or frame_count
+    for start in range(0, frame_count, step):
+        end = min(start + step, frame_count)
+        yield (
+            start,
+            end,
+            max(0, start - config.context_frames),
+            min(frame_count, end + config.context_frames),
+        )
+
+
+def window_frame_directory(source: Path, target: Path, start: int, end: int):
+    target.mkdir()
+    for local, original in enumerate(range(start, end)):
+        src, dst = source / f"{original:06d}.png", target / f"{local:06d}.png"
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
+
+def select_memories(entries, frame_idx, budget, config):
+    """Select disjoint source frames; split a fixed budget then refill spare slots.
+
+    Quality is predicted IoU, not presence: low visibility is not automatically
+    an error. Unknown quality is admitted only when no positive cutoff was set.
+    """
+    pools = {"F": [], "B": []}
+    seen = set()
+    for entry in entries:
+        direction = entry["direction"]
+        index = entry["frame_index"]
+        if direction not in pools or index == frame_idx:
+            continue
+        if (direction == "F" and index > frame_idx) or (
+            direction == "B" and index < frame_idx
+        ):
+            continue
+        if config.side == "past" and direction != "F":
+            continue
+        if config.side == "future" and direction != "B":
+            continue
+        quality = entry.get("quality")
+        if quality is None or not math.isfinite(quality):
+            if config.min_quality > 0:
+                continue
+        elif quality < config.min_quality:
+            continue
+        key = (index, direction, entry["object_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        pools[direction].append(entry)
+
+    def rank(entry):
+        quality = entry.get("quality")
+        quality = quality if quality is not None and math.isfinite(quality) else -1.0
+        return (
+            not entry["conditioning"],
+            abs(frame_idx - entry["frame_index"]),
+            -quality,
+        )
+
+    for pool in pools.values():
+        pool.sort(key=rank)
+    if budget == 0:
+        return []
+    past_slots = (budget + 1) // 2
+    chosen = pools["F"][:past_slots] + pools["B"][: budget // 2]
+    remainder = pools["F"][past_slots:] + pools["B"][budget // 2 :]
+    chosen.extend(sorted(remainder, key=rank)[: budget - len(chosen)])
+    return sorted(chosen, key=lambda item: (item["direction"], item["frame_index"]))
+
+
+def memory_diagnostics(entries, offset):
+    return [
+        {
+            key: (value + offset if key == "frame_index" else value)
+            for key, value in entry.items()
+            if key != "path"
+        }
+        for entry in entries
+    ]
+
+
+def run_memory_window(
+    predictor,
+    frame_dir,
+    work_dir,
+    count,
+    prompt,
+    shape,
+    config,
+    backward_mode,
+    equivalence_iou,
+    core_start,
+    core_end,
+):
+    """Build isolated banks, then decode the core against immutable snapshots."""
+    forward = run_direction(
+        predictor, frame_dir, count, prompt, "F", memory_dir=work_dir / "memory_forward"
     )
-    return mapping
+    physical = api = None
+    if backward_mode in {"physical", "verify"}:
+        reverse_dir = work_dir / "frames_reversed"
+        reverse_frame_directory(frame_dir, reverse_dir, count)
+        physical = run_direction(
+            predictor,
+            reverse_dir,
+            count,
+            prompt,
+            "B",
+            reverse_index=True,
+            memory_dir=work_dir / "memory_backward",
+        )
+    if backward_mode in {"api", "verify"}:
+        api = run_direction(
+            predictor,
+            frame_dir,
+            count,
+            prompt,
+            "B",
+            propagation_direction="backward",
+            memory_dir=work_dir / "memory_api",
+        )
+    equivalence = None
+    if backward_mode == "verify":
+        equivalence = compare_direction_results(physical, api, shape, equivalence_iou)
+        equivalence["scope"] = "public masks and scores only; not memory equivalence"
+        # Always retain physical source memories. Public-output equality does not
+        # prove internal pointer/position/memory equality.
+        if not equivalence["equivalent"]:
+            write_json(work_dir.parent / "backward_equivalence.json", equivalence)
+            raise RuntimeError(
+                "Backward implementations differ; inspect backward_equivalence.json "
+                "and explicitly choose --backward-mode physical or api"
+            )
+    backward = physical if physical is not None else api
+    forward_id, backward_id, matches = match_primary_tracks(forward, backward)
+    forward.primary_obj_id, backward.primary_obj_id = forward_id, backward_id
+    forward_masks, forward_scores = primary_track(forward, shape)
+    backward_masks, backward_scores = primary_track(backward, shape)
+    identity_conflict = bool(matches and matches[0]["mean_iou"] < config.min_match_iou)
+    entries = []
+    for direction in (forward, backward):
+        if direction.primary_obj_id is not None:
+            for records in direction.memories.values():
+                entry = records.get(direction.primary_obj_id)
+                if entry is not None:
+                    entries.append(entry)
+    source_count = len(entries)
+    if source_count == 0 and (forward_id is not None or backward_id is not None):
+        raise RuntimeError(
+            "Detected target has no exported memories; check the SAM3 capture path"
+        )
+
+    fused, diagnostics = [], []
+    session_id = None
+    try:
+        session_id = predictor.handle_request(
+            {
+                "type": "start_session",
+                "resource_path": str(frame_dir),
+                "offload_video_to_cpu": True,
+            }
+        )["session_id"]
+        for index in range(core_start, core_end):
+            spatial = select_memories(entries, index, config.spatial_frames, config)
+            pointers = select_memories(entries, index, config.pointer_frames, config)
+            if identity_conflict or not spatial:
+                # Empty output is an abstention, not a declaration of invisibility.
+                # Never rescue this case by copying a direction's final mask.
+                result = {
+                    "mask": np.zeros(shape, dtype=bool),
+                    "spatial_tokens": 0,
+                    "pointer_tokens": 0,
+                }
+                status = "identity_conflict" if identity_conflict else "no_memory"
+                spatial, pointers = [], []
+            else:
+                result = predictor.decode_memory_frame(
+                    session_id, index, spatial, pointers
+                )
+                status = "decoded"
+            mask = np.asarray(result.pop("mask"), dtype=bool)
+            if mask.shape != shape:
+                raise RuntimeError(f"Decoded mask dimensions {mask.shape} != {shape}")
+            fused.append(mask)
+            diagnostics.append(
+                {
+                    "frame_index": index,
+                    "status": status,
+                    "requires_review": status != "decoded",
+                    "forward_score": forward_scores[index],
+                    "backward_score": backward_scores[index],
+                    "forward_backward_iou": mask_iou(
+                        forward_masks[index], backward_masks[index]
+                    ),
+                    "spatial_memory": memory_diagnostics(spatial, 0),
+                    "pointer_memory": memory_diagnostics(pointers, 0),
+                    **result,
+                }
+            )
+            if (index - core_start + 1) % 50 == 0:
+                LOGGER.info(
+                    "Memory decoded %d/%d core frames",
+                    index - core_start + 1,
+                    core_end - core_start,
+                )
+    finally:
+        if session_id is not None:
+            predictor.handle_request(
+                {"type": "close_session", "session_id": session_id}
+            )
+    report = {
+        "primary_instances": {"forward": forward_id, "backward": backward_id},
+        "instance_matches": matches,
+        "identity_conflict": identity_conflict,
+        "source_memory_count": source_count,
+        "backward_equivalence": equivalence,
+        "source_memory_bytes": sum(
+            path.stat().st_size for path in work_dir.glob("memory_*/*.pt")
+        ),
+    }
+    return (
+        forward_masks[core_start:core_end],
+        backward_masks[core_start:core_end],
+        fused,
+        diagnostics,
+        report,
+    )
 
 
 def process_video(
-    predictor: Any,
-    video_path: Path,
-    input_root: Path,
-    output_dir: Path,
-    prompt: str,
-    model_version: str,
-    max_frames: Optional[int],
-    overwrite: bool,
-    fusion_config: FusionConfig,
-    repair_uncertain: bool,
-    ground_truth_path: Optional[Path],
-    ground_truth_label: int,
-    backward_mode: str,
-    backward_equivalence_iou: float,
-) -> str:
+    predictor,
+    video_path,
+    input_root,
+    output_dir,
+    prompt,
+    config,
+    *,
+    max_frames=None,
+    overwrite=False,
+    ground_truth_path=None,
+    ground_truth_label=1,
+    backward_mode="physical",
+    equivalence_iou=0.999,
+    checkpoint_identity=None,
+):
+    if not all(
+        callable(getattr(predictor, name, None))
+        for name in (
+            "begin_memory_capture",
+            "finish_memory_capture",
+            "decode_memory_frame",
+        )
+    ):
+        raise ValueError(
+            "Memory fusion requires the updated standard SAM3 single-GPU predictor"
+        )
     video_info = probe_video(video_path, fallback_fps=30.0)
-    fingerprint_payload = {
+    payload = {
         "schema_version": SCHEMA_VERSION,
+        "method": "bidirectional_memory",
         "input_video": str(video_path),
         "input_size": video_path.stat().st_size,
         "input_mtime_ns": video_path.stat().st_mtime_ns,
         "prompt": prompt,
-        "model_version": model_version,
+        "model_version": "sam3",
+        "checkpoint": checkpoint_identity,
         "max_frames": max_frames,
-        "fusion": asdict(fusion_config),
-        "repair_uncertain": repair_uncertain,
+        "memory": asdict(config),
         "ground_truth": str(ground_truth_path) if ground_truth_path else None,
+        "ground_truth_mtime_ns": (
+            ground_truth_path.stat().st_mtime_ns if ground_truth_path else None
+        ),
         "ground_truth_label": ground_truth_label,
         "backward_mode": backward_mode,
-        "backward_equivalence_iou": backward_equivalence_iou,
+        "backward_equivalence_iou": equivalence_iou,
     }
-    fingerprint = config_hash(fingerprint_payload)
+    fingerprint = config_hash(payload)
     metadata_path = output_dir / "metadata.json"
-    if not overwrite and metadata_path.is_file():
-        try:
-            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if (
-                existing.get("status") == "success"
-                and existing.get("config_hash") == fingerprint
-            ):
-                LOGGER.info("Skipping completed sequence: %s", video_path)
-                return "skipped"
-        except (OSError, json.JSONDecodeError):
-            pass
-
+    if metadata_path.exists() and not overwrite:
+        old = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if old.get("status") == "success" and old.get("config_hash") == fingerprint:
+            return "skipped"
+        raise FileExistsError(
+            "Output exists with incomplete/different configuration; use a new output root or --overwrite"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("forward", "backward", "backward_verification"):
-        shutil.rmtree(output_dir / name, ignore_errors=True)
-    for name in (
-        "masks.mkv",
-        "result.mp4",
-        "frames.jsonl",
-        "evaluation.json",
-        "audit.json",
-        "backward_equivalence.json",
-    ):
-        path = output_dir / name
-        if path.exists():
-            path.unlink()
+    if overwrite:
+        # These optional reports must not survive from a different run/config.
+        for name in (
+            "evaluation.json",
+            "backward_equivalence.json",
+            "forward/frames.jsonl",
+            "backward/frames.jsonl",
+        ):
+            (output_dir / name).unlink(missing_ok=True)
     metadata = {
-        **fingerprint_payload,
+        **payload,
         "config_hash": fingerprint,
         "status": "processing",
         "started_at": utc_now(),
-        "source": video_info,
     }
     write_json(metadata_path, metadata)
     started = time.monotonic()
     try:
-        with tempfile.TemporaryDirectory(prefix="sam3_bidirectional_") as temporary:
-            temporary_dir = Path(temporary)
-            frame_dir = temporary_dir / "frames"
-            reverse_dir = temporary_dir / "frames_reversed"
-            frame_dir.mkdir()
-            frame_count = extract_png_frames(video_path, frame_dir, max_frames)
-            reverse_frame_directory(frame_dir, reverse_dir, frame_count)
-            LOGGER.info("Running independent forward pass: %s", video_path)
-            forward = run_direction(predictor, frame_dir, frame_count, prompt, "F")
-            physical_backward = None
-            api_backward = None
-            if backward_mode in {"physical", "verify"}:
-                LOGGER.info(
-                    "Running independent physical backward pass: %s", video_path
-                )
-                physical_backward = run_direction(
-                    predictor,
-                    reverse_dir,
-                    frame_count,
-                    prompt,
-                    "B-physical",
-                    reverse_index=True,
-                )
-            if backward_mode in {"api", "verify"}:
-                LOGGER.info("Running independent API backward pass: %s", video_path)
-                api_backward = run_direction(
-                    predictor,
-                    frame_dir,
-                    frame_count,
-                    prompt,
-                    "B-api",
-                    propagation_direction="backward",
-                )
+        with tempfile.TemporaryDirectory(prefix="sam3_memory_") as temporary:
+            root = Path(temporary)
+            frames = root / "frames"
+            frames.mkdir()
+            count = extract_png_frames(video_path, frames, max_frames)
             shape = (int(video_info["height"]), int(video_info["width"]))
-            equivalence = None
-            if backward_mode == "verify":
-                assert physical_backward is not None and api_backward is not None
-                equivalence = compare_direction_results(
-                    physical_backward,
-                    api_backward,
-                    shape,
-                    backward_equivalence_iou,
+            forward_masks, backward_masks, fused_masks, diagnostics, reports = (
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
+            for block, (core_start, core_end, start, end) in enumerate(
+                processing_windows(count, config)
+            ):
+                LOGGER.info(
+                    "Window %d: context [%d,%d), output [%d,%d)",
+                    block,
+                    start,
+                    end,
+                    core_start,
+                    core_end,
                 )
-                write_json(output_dir / "backward_equivalence.json", equivalence)
-                if not equivalence["equivalent"]:
-                    persist_direction(
-                        output_dir / "backward_verification" / "physical",
-                        physical_backward,
-                        float(video_info["fps"]),
-                        shape,
+                with tempfile.TemporaryDirectory(
+                    prefix=f"block_{block}_", dir=root
+                ) as block_dir:
+                    work = Path(block_dir)
+                    local_frames = work / "frames"
+                    window_frame_directory(frames, local_frames, start, end)
+                    try:
+                        f, b, fused, records, report = run_memory_window(
+                            predictor,
+                            local_frames,
+                            work,
+                            end - start,
+                            prompt,
+                            shape,
+                            config,
+                            backward_mode,
+                            equivalence_iou,
+                            core_start - start,
+                            core_end - start,
+                        )
+                    except Exception:
+                        equivalence_path = root / "backward_equivalence.json"
+                        if equivalence_path.exists():
+                            shutil.copy2(
+                                equivalence_path,
+                                output_dir / "backward_equivalence.json",
+                            )
+                        raise
+                    forward_masks.extend(f)
+                    backward_masks.extend(b)
+                    fused_masks.extend(fused)
+                    for record in records:
+                        record["frame_index"] += start
+                        record["window_index"] = block
+                        for key in ("spatial_memory", "pointer_memory"):
+                            for entry in record[key]:
+                                entry["frame_index"] += start
+                        diagnostics.append(record)
+                    reports.append(
+                        {
+                            "window_index": block,
+                            "window": [start, end],
+                            "core": [core_start, core_end],
+                            **report,
+                        }
                     )
-                    persist_direction(
-                        output_dir / "backward_verification" / "api",
-                        api_backward,
-                        float(video_info["fps"]),
-                        shape,
-                    )
-                    raise RuntimeError(
-                        "physical reversal and API backward are not equivalent; "
-                        "inspect backward_equivalence.json and "
-                        "backward_verification/, then choose "
-                        "--backward-mode physical or api"
-                    )
-                backward = api_backward
-            else:
-                backward = (
-                    physical_backward if physical_backward is not None else api_backward
-                )
-                assert backward is not None
-            forward_id, backward_id, pair_report = match_primary_tracks(
-                forward, backward
-            )
-            forward.primary_obj_id = forward_id
-            backward.primary_obj_id = backward_id
-            forward_masks, forward_scores = primary_track(forward, shape)
-            backward_masks, backward_scores = primary_track(backward, shape)
-            empty_masks = [np.zeros(shape, dtype=bool) for _ in range(frame_count)]
-            path_result = viterbi_select(
-                {"F": forward_masks, "B": backward_masks, "O": empty_masks},
-                {"F": forward_scores, "B": backward_scores, "O": [0.0] * frame_count},
-                fusion_config,
-            )
-            masks_by_source: Dict[str, Sequence[np.ndarray]] = {
-                "F": forward_masks,
-                "B": backward_masks,
-                "O": empty_masks,
-            }
-            scores_by_source: Dict[str, Sequence[float]] = {
-                "F": forward_scores,
-                "B": backward_scores,
-                "O": [0.0] * frame_count,
-            }
-            greedy_path = greedy_sources(masks_by_source, scores_by_source)
-            uncertainty = uncertainty_values(
-                forward_masks, backward_masks, forward_scores, backward_scores
-            )
-            audit = bidirectional_audit(forward_masks, backward_masks)
-            write_json(output_dir / "audit.json", audit)
-            intervals = uncertain_intervals(
-                forward_masks,
-                backward_masks,
-                forward_scores,
-                backward_scores,
-                fusion_config,
-            )
-            repair_attempts = []
-            repaired_frames = [False] * frame_count
-            fused_masks = selected_masks(path_result.sources, masks_by_source)
-            fused_sources = list(path_result.sources)
-            for start, end in intervals:
-                left_anchor = trusted_anchor(
-                    start - 1,
-                    -1,
-                    frame_count,
-                    forward_masks,
-                    backward_masks,
-                    forward_scores,
-                    backward_scores,
-                    fusion_config,
-                )
-                right_anchor = trusted_anchor(
-                    end + 1,
-                    1,
-                    frame_count,
-                    forward_masks,
-                    backward_masks,
-                    forward_scores,
-                    backward_scores,
-                    fusion_config,
-                )
-                if repair_uncertain:
-                    attempt = try_repair_interval(
-                        predictor,
-                        frame_dir,
-                        frame_count,
-                        prompt,
-                        (start, end),
-                        left_anchor,
-                        right_anchor,
-                        fused_masks,
-                        fused_sources,
-                        masks_by_source,
-                        scores_by_source,
-                        fusion_config,
-                    )
-                    if attempt["status"] == "accepted":
-                        repaired_frames[start : end + 1] = [True] * (end - start + 1)
-                else:
-                    attempt = {
-                        "start": start,
-                        "end": end,
-                        "left_anchor": left_anchor,
-                        "right_anchor": right_anchor,
-                        "status": "disabled",
-                    }
-                repair_attempts.append(attempt)
-
-            forward_mapping = persist_direction(
-                output_dir / "forward", forward, float(video_info["fps"]), shape
-            )
-            backward_mapping = persist_direction(
-                output_dir / "backward", backward, float(video_info["fps"]), shape
-            )
-            write_label_video(
-                output_dir / "masks.mkv", fused_masks, float(video_info["fps"])
-            )
+            fps = float(video_info["fps"])
+            for name, masks in (
+                ("forward", forward_masks),
+                ("backward", backward_masks),
+            ):
+                (output_dir / name).mkdir(exist_ok=True)
+                write_label_video(output_dir / name / "masks.mkv", masks, fps)
+            write_label_video(output_dir / "masks.mkv", fused_masks, fps)
             write_result_video(
                 output_dir / "result.mp4",
-                frame_dir,
+                frames,
                 forward_masks,
                 backward_masks,
                 fused_masks,
-                fused_sources,
-                uncertainty,
-                repaired_frames,
-                float(video_info["fps"]),
+                [record["status"] for record in diagnostics],
+                fps,
             )
-            write_jsonl(
-                output_dir / "frames.jsonl",
-                (
-                    {
-                        "frame_index": index,
-                        "selected_source": fused_sources[index],
-                        "forward_score": forward_scores[index],
-                        "backward_score": backward_scores[index],
-                        "forward_backward_iou": mask_iou(
-                            forward_masks[index], backward_masks[index]
-                        ),
-                        "uncertainty": uncertainty[index],
-                        "emission_scores": path_result.frame_scores[index],
-                        "switch": index > 0
-                        and fused_sources[index] != fused_sources[index - 1],
-                        "switch_reason": (
-                            f"{fused_sources[index - 1]}_to_{fused_sources[index]}"
-                            if index > 0
-                            and fused_sources[index] != fused_sources[index - 1]
-                            else None
-                        ),
-                        "repair_accepted": repaired_frames[index],
-                    }
-                    for index in range(frame_count)
-                ),
-            )
-
+            write_jsonl(output_dir / "frames.jsonl", diagnostics)
+            audit = bidirectional_audit(forward_masks, backward_masks)
+            write_json(output_dir / "audit.json", audit)
             evaluation = None
             if ground_truth_path is not None:
-                ground_truth = read_label_video(
-                    ground_truth_path, frame_count, shape, ground_truth_label
+                gt = read_label_video(
+                    ground_truth_path, count, shape, ground_truth_label
                 )
-                evaluation = evaluate_masks(
-                    ground_truth,
-                    {
-                        "forward": forward_masks,
-                        "backward": backward_masks,
-                        "union": [
-                            np.logical_or(first, second)
-                            for first, second in zip(forward_masks, backward_masks)
-                        ],
-                        "intersection": [
-                            np.logical_and(first, second)
-                            for first, second in zip(forward_masks, backward_masks)
-                        ],
-                        "fused": fused_masks,
-                    },
+                methods = {
+                    "forward": forward_masks,
+                    "backward": backward_masks,
+                    "memory_fused": fused_masks,
+                }
+                evaluation = evaluate_masks(gt, methods)
+                for name, present in (("visible", True), ("invisible", False)):
+                    indices = [
+                        i for i, mask in enumerate(gt) if bool(mask.any()) == present
+                    ]
+                    evaluation[name] = (
+                        evaluate_masks(
+                            [gt[i] for i in indices],
+                            {
+                                method: [masks[i] for i in indices]
+                                for method, masks in methods.items()
+                            },
+                        )
+                        if indices
+                        else None
+                    )
+                evaluation["oracle_scope"] = (
+                    "selection among F/B only; not an upper bound for memory fusion"
                 )
                 write_json(output_dir / "evaluation.json", evaluation)
-
-        metadata.update(
-            {
-                "status": "success",
-                "completed_at": utc_now(),
-                "duration_seconds": round(time.monotonic() - started, 3),
-                "frames_processed": frame_count,
-                "primary_instances": {"forward": forward_id, "backward": backward_id},
-                "instance_matches": pair_report,
-                "object_id_to_label": {
-                    "forward": {str(k): v for k, v in forward_mapping.items()},
-                    "backward": {str(k): v for k, v in backward_mapping.items()},
-                },
-                "viterbi_score": path_result.score,
-                "switch_counts": {
-                    "greedy_framewise": switch_count(greedy_path),
-                    "viterbi": switch_count(fused_sources),
-                },
-                "source_counts": {
-                    source: fused_sources.count(source) for source in masks_by_source
-                },
-                "uncertain_intervals": [list(interval) for interval in intervals],
-                "repair_attempts": repair_attempts,
-                "backward_equivalence": equivalence,
-                "audit": audit,
-                "diagnostics": {
-                    "tracker_score": True,
-                    "predicted_iou": False,
-                    "presence_logit": False,
-                    "mask_stability": "geometry_proxy",
-                    "low_resolution_logits": False,
-                },
-                "evaluation": evaluation,
-                "outputs": {
-                    "forward_masks": "forward/masks.mkv",
-                    "backward_masks": "backward/masks.mkv",
-                    "fused_masks": "masks.mkv",
-                    "visualization": "result.mp4",
-                    "frame_diagnostics": "frames.jsonl",
-                    "unlabeled_audit": "audit.json",
-                },
-            }
-        )
+            metadata.update(
+                {
+                    "status": "success",
+                    "completed_at": utc_now(),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "frames_processed": count,
+                    "windows": reports,
+                    "requires_review_frames": sum(
+                        record["requires_review"] for record in diagnostics
+                    ),
+                    "source_banks_frozen": True,
+                    "training": False,
+                    "temporal_encoding": "existing unsigned distance codes; no learned direction embedding",
+                    "cross_window_memory": False,
+                    "identity_protocol": "text prompt and within-window mask association; cross-window identity not guaranteed",
+                    "frame_passes": sum(
+                        report["window"][1] - report["window"][0] for report in reports
+                    )
+                    * (3 if backward_mode == "verify" else 2)
+                    + count,
+                    "source_memory_storage": "temporary CPU tensor files, removed after each window",
+                    "audit": audit,
+                    "evaluation": evaluation,
+                    "mask_labels": "binary target mask, 1=foreground; inspect requires_review for abstentions",
+                }
+            )
         write_json(metadata_path, metadata)
         return "success"
     except Exception as exc:
         metadata.update(
             {
                 "status": "failed",
-                "failed_at": utc_now(),
-                "duration_seconds": round(time.monotonic() - started, 3),
                 "error": f"{type(exc).__name__}: {exc}",
+                "duration_seconds": round(time.monotonic() - started, 3),
             }
         )
         write_json(metadata_path, metadata)
         raise
 
 
-def build_parser() -> argparse.ArgumentParser:
+def nonnegative_int(value):
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return result
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
-        description="独立运行 SAM 正序/倒序分割，并用 Viterbi 汇总目标实例。",
+        description="不训练 SAM3：独立双向建库、联合 memory attention、单次最终解码。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--input-root", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--prompt", required=True)
     parser.add_argument(
-        "--input-root",
-        required=True,
-        help="输入目录；直接包含 color.mp4 时处理单段视频，否则递归查找",
-    )
-    parser.add_argument(
-        "--output-root", required=True, help="输出根目录，并保留输入相对目录结构"
-    )
-    parser.add_argument(
-        "--prompt", required=True, help='两个方向共用的文本提示，如 "left hand"'
-    )
-    parser.add_argument(
-        "--version",
-        default="sam3",
-        choices=["sam3", "sam3.1"],
-        help="使用的 SAM 模型版本",
+        "--version", choices=["sam3"], default="sam3", help="新融合路径仅支持基础 SAM3"
     )
     parser.add_argument(
         "--checkpoint",
         default="~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt",
-        help="模型 checkpoint 路径",
+    )
+    parser.add_argument("--device", type=parse_device, default=("cuda:0", 0))
+    parser.add_argument("--max-sequences", type=positive_int)
+    parser.add_argument("--max-frames", type=positive_int)
+    parser.add_argument(
+        "--chunk-frames",
+        type=nonnegative_int,
+        default=0,
+        help="每块输出核心帧数；0 表示全序列",
     )
     parser.add_argument(
-        "--device",
-        type=parse_device,
-        default=("cuda:0", 0),
-        metavar="cuda:N",
-        help="执行推理的 CUDA 设备",
-    )
-    parser.add_argument("--max-sequences", type=positive_int, help="最多处理多少段视频")
-    parser.add_argument(
-        "--max-frames", type=positive_int, help="每段视频最多处理多少帧"
+        "--context-frames",
+        type=nonnegative_int,
+        default=0,
+        help="每个核心前后附加上下文帧数；重叠区不融合结果",
     )
     parser.add_argument(
-        "--ground-truth-root",
-        help=(
-            "可选 GT masks.mkv 文件或根目录；目录模式按输入相对路径查找 " "masks.mkv"
-        ),
-    )
-    parser.add_argument(
-        "--ground-truth-label",
+        "--memory-frames",
         type=positive_int,
-        default=1,
-        help="GT masks.mkv 中作为目标前景的标签值",
+        default=6,
+        help="两侧空间记忆总帧数，含条件帧",
     )
     parser.add_argument(
-        "--repair-uncertain",
-        action="store_true",
-        help="开启默认关闭的 P0-C 高不确定区间双锚点重传播",
+        "--pointer-frames",
+        type=nonnegative_int,
+        default=16,
+        help="两侧 object pointer 总帧数",
     )
     parser.add_argument(
-        "--backward-mode",
-        choices=["verify", "physical", "api"],
-        default="verify",
-        help=(
-            "倒序实现：verify 同时运行 physical/api 并检查等价性；physical "
-            "强制使用反编号帧；api 强制使用 SAM backward API"
-        ),
+        "--memory-side",
+        choices=["both", "past", "future"],
+        default="both",
+        help="相同预算的方向消融",
     )
     parser.add_argument(
-        "--backward-equivalence-iou",
+        "--memory-min-quality",
         type=unit_interval,
-        default=0.999,
-        help="verify 模式判定两种倒序 mask 等价所需的最低逐帧 IoU",
+        default=0.0,
+        help="predicted IoU 筛选阈值；0 允许质量未知条目",
     )
     parser.add_argument(
-        "--overwrite", action="store_true", help="忽略配置 hash，覆盖已有完整结果"
-    )
-    parser.add_argument(
-        "--list-only", action="store_true", help="只列出待处理视频，不加载模型"
-    )
-    parser.add_argument(
-        "--disagreement-iou-threshold",
+        "--min-match-iou",
         type=unit_interval,
-        default=0.35,
-        help="F/B IoU 低于该值时视为严重分歧证据",
+        default=0.1,
+        help="两路实例关联最低 IoU；不满足则标记复核，不混合身份",
     )
     parser.add_argument(
-        "--disagreement-min-frames",
-        type=positive_int,
-        default=5,
-        help="严重分歧至少持续多少帧才形成不确定区间",
+        "--backward-mode", choices=["physical", "api", "verify"], default="physical"
     )
-    parser.add_argument(
-        "--empty-score-threshold",
-        type=unit_interval,
-        default=0.20,
-        help="允许选择目标不可见状态的最高候选质量分数",
-    )
-    parser.add_argument(
-        "--recovery-iou-threshold",
-        type=unit_interval,
-        default=0.60,
-        help="F/B 一致性恢复所需的最低 IoU",
-    )
-    parser.add_argument(
-        "--recovery-min-frames",
-        type=positive_int,
-        default=3,
-        help="一致性连续恢复多少帧后结束不确定区间",
-    )
-    parser.add_argument(
-        "--anchor-iou-threshold",
-        type=unit_interval,
-        default=0.80,
-        help="可信锚点要求的最低 F/B IoU",
-    )
-    parser.add_argument(
-        "--anchor-score-threshold",
-        type=unit_interval,
-        default=0.60,
-        help="可信锚点要求两个方向均达到的最低质量分数",
-    )
-    parser.add_argument(
-        "--anchor-search-frames",
-        type=positive_int,
-        default=90,
-        help="从不确定区间边缘向外搜索可信锚点的最大帧数",
-    )
-    parser.add_argument(
-        "--repair-min-gain",
-        type=nonnegative_float,
-        default=0.10,
-        help="接受双锚点修复所需的每帧最小 Viterbi 分数提升",
-    )
+    parser.add_argument("--backward-equivalence-iou", type=unit_interval, default=0.999)
+    parser.add_argument("--ground-truth-root")
+    parser.add_argument("--ground-truth-label", type=positive_int, default=1)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--list-only", action="store_true")
     return parser
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    input_root = expand_path(args.input_root)
-    output_root = expand_path(args.output_root)
-    ground_truth_root = (
-        expand_path(args.ground_truth_root) if args.ground_truth_root else None
+    try:
+        config = MemoryConfig(
+            args.chunk_frames,
+            args.context_frames,
+            args.memory_frames,
+            args.pointer_frames,
+            args.memory_side,
+            args.memory_min_quality,
+            args.min_match_iou,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    input_root, output_root = expand_path(args.input_root), expand_path(
+        args.output_root
     )
     if not input_root.is_dir():
-        LOGGER.error("Input root is not a directory: %s", input_root)
-        return 2
-    if ground_truth_root is not None and not ground_truth_root.exists():
-        LOGGER.error("Ground-truth path does not exist: %s", ground_truth_root)
-        return 2
+        parser.error(f"Input root is not a directory: {input_root}")
+    if input_root == output_root or input_root in output_root.parents:
+        parser.error("Output root must be outside the input tree")
     videos = discover_color_videos(input_root)
-    if args.max_sequences is not None:
+    if args.max_sequences:
         videos = videos[: args.max_sequences]
     if not videos:
-        LOGGER.error("No files named color.mp4 found below %s", input_root)
-        return 2
+        parser.error(f"No color.mp4 found below {input_root}")
     if args.list_only:
         for video in videos:
             print(video.relative_to(input_root))
         return 0
-
-    checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
-    if checkpoint is not None and not checkpoint.is_file():
-        LOGGER.error("Checkpoint does not exist: %s", checkpoint)
-        return 2
+    checkpoint = expand_path(args.checkpoint)
+    if not checkpoint.is_file():
+        parser.error(f"Checkpoint does not exist: {checkpoint}")
+    gt_root = expand_path(args.ground_truth_root) if args.ground_truth_root else None
+    if gt_root is not None and not gt_root.exists():
+        parser.error(f"Ground truth does not exist: {gt_root}")
     import torch
 
     device_name, device_index = args.device
     if not torch.cuda.is_available() or device_index >= torch.cuda.device_count():
-        LOGGER.error("Requested CUDA device is unavailable: %s", device_name)
-        return 2
+        parser.error(f"Requested CUDA device is unavailable: {device_name}")
     torch.cuda.set_device(device_index)
     from sam3 import build_sam3_predictor
 
-    kwargs = {"version": args.version, "compile": False, "async_loading_frames": True}
-    if checkpoint is not None:
-        kwargs["checkpoint_path"] = str(checkpoint)
-    predictor = build_sam3_predictor(**kwargs)
-    config = FusionConfig(
-        empty_score_threshold=args.empty_score_threshold,
-        disagreement_iou_threshold=args.disagreement_iou_threshold,
-        disagreement_min_frames=args.disagreement_min_frames,
-        recovery_iou_threshold=args.recovery_iou_threshold,
-        recovery_min_frames=args.recovery_min_frames,
-        anchor_iou_threshold=args.anchor_iou_threshold,
-        anchor_score_threshold=args.anchor_score_threshold,
-        anchor_search_frames=args.anchor_search_frames,
-        repair_min_gain=args.repair_min_gain,
+    predictor = build_sam3_predictor(
+        version="sam3",
+        checkpoint_path=str(checkpoint),
+        compile=False,
+        async_loading_frames=True,
     )
     counts = {"success": 0, "skipped": 0, "failed": 0}
     try:
         for video in videos:
-            relative_parent = video.parent.relative_to(input_root)
-            output_dir = output_dir_for(video, input_root, output_root)
             try:
-                ground_truth = resolve_ground_truth(
-                    ground_truth_root, relative_parent, len(videos) == 1
+                gt = resolve_ground_truth(
+                    gt_root, video.parent.relative_to(input_root), len(videos) == 1
                 )
-                if ground_truth_root is not None and ground_truth is None:
-                    LOGGER.warning("No matching GT masks.mkv for %s", video)
+                if gt_root is not None and gt is None:
+                    raise FileNotFoundError(f"No matching GT masks.mkv for {video}")
                 status = process_video(
                     predictor,
                     video,
                     input_root,
-                    output_dir,
+                    output_dir_for(video, input_root, output_root),
                     args.prompt,
-                    args.version,
-                    args.max_frames,
-                    args.overwrite,
                     config,
-                    args.repair_uncertain,
-                    ground_truth,
-                    args.ground_truth_label,
-                    args.backward_mode,
-                    args.backward_equivalence_iou,
+                    max_frames=args.max_frames,
+                    overwrite=args.overwrite,
+                    ground_truth_path=gt,
+                    ground_truth_label=args.ground_truth_label,
+                    backward_mode=args.backward_mode,
+                    equivalence_iou=args.backward_equivalence_iou,
+                    checkpoint_identity={
+                        "path": str(checkpoint),
+                        "size": checkpoint.stat().st_size,
+                        "mtime_ns": checkpoint.stat().st_mtime_ns,
+                    },
                 )
                 counts[status] += 1
             except Exception:
@@ -1800,7 +1270,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     finally:
         predictor.shutdown()
     LOGGER.info("Finished: %s", counts)
-    return 1 if counts["failed"] else 0
+    return int(counts["failed"] > 0)
 
 
 if __name__ == "__main__":

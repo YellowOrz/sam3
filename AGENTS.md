@@ -7,7 +7,7 @@
 ## 自定义视频脚本
 
 - `process_dataset_videos.py`：递归查找 `color.mp4`，用统一文本提示执行 SAM 3/3.1 分割并保留目录结构。先用 `--list-only` 核对输入；示例：`python scripts/process_dataset_videos.py --input-root DATA --output-root OUT --version sam3.1 --prompt hand --device cuda:0`。
-- `process_bidirectional_videos.py`：为每个 `color.mp4` 建立隔离的正序/倒序 session，匹配目标实例后用 Viterbi 汇总，并输出 Forward、Backward、Fused、Difference 四宫格视频。正式批处理推荐物理倒序；默认 `verify` 仅用于诊断物理倒序与 backward API 是否等价，二者不等价时会停止并要求显式选择。`--repair-uncertain` 可开启默认关闭的保守双锚点重传播。示例：`python scripts/process_bidirectional_videos.py --input-root DATA --output-root OUT --prompt "left hand" --device cuda:0 --backward-mode physical`。
+- `process_bidirectional_videos.py`：基础 SAM3 单 GPU、严格零训练的双向 memory 融合。隔离正反向建库，再联合读取记忆并单次解码；源库不写回，不再使用 Viterbi。默认物理倒序；`--chunk-frames 120 --context-frames 30` 启用重叠分块，核心帧唯一归属。例：`python scripts/process_bidirectional_videos.py --input-root DATA --output-root OUT --prompt "left hand" --device cuda:0 --checkpoint /path/to/sam3.pt`。详细限制和消融见 `docs/bidirectional_hand_segmentation_research.md`。
 - `process_hand_video_with_wilor_prompts.py`：处理单个目录中的 `color.mp4` 和 `MANO_wilor_occlusion/hand_joints_occlusion.jsonl`，用 WiLoR 关节迭代修正指定侧手的 SAM 分割。正点必须是落在上一轮目标掩码内的可见目标手关节；`--segmentation-passes` 默认为 2，设为 1 时仅运行文本分割。示例：`uv run scripts/process_hand_video_with_wilor_prompts.py --input-dir DATA --output-dir OUT --hand-side left --version sam3 --segmentation-passes 2 --device cuda:0`。
 - `compare_dataset_videos.py`：按共同的 `result.mp4` 相对路径，将多个提示词输出拼成带标签的对比视频。至少传入两个输出根目录，并用 `--output-dir` 指定目标；自动布局不合适时传 `--grid 2x2`。
 - `qualitative_test_interactive.py`：在桌面窗口中逐帧检查、修正并双向传播实例掩码，输出无损掩码、结果视频和元数据。运行：`python scripts/qualitative_test_interactive.py --video INPUT.mp4 --output-dir OUT --device cuda:0`；需图形环境与 CUDA。

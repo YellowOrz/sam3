@@ -92,6 +92,44 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         )
         return {"is_success": True}
 
+    def begin_memory_capture(self, session_id, directory):
+        """Opt in to CPU/disk snapshots of standard SAM3 source memories."""
+        from pathlib import Path
+
+        if getattr(self, "world_size", 1) != 1:
+            raise ValueError("Memory fusion currently requires a single GPU")
+        state = self._get_session(session_id)["state"]
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=False)
+        state["memory_export_directory"] = str(directory)
+        state["memory_export_records"] = {}
+
+    def finish_memory_capture(self, session_id):
+        state = self._get_session(session_id)["state"]
+        state.pop("memory_export_directory")
+        return state.pop("memory_export_records")
+
+    @torch.inference_mode()
+    def decode_memory_frame(self, session_id, frame_idx, spatial, pointers):
+        """Decode one target from fixed external memories without writing them back."""
+        from sam3.model.bidirectional_memory import read_memory
+
+        if getattr(self, "world_size", 1) != 1:
+            raise ValueError("Memory fusion currently requires a single GPU")
+        state = self._get_session(session_id)["state"]
+        self.model._prepare_backbone_feats(state, frame_idx, reverse=False)
+        tracker_state = self.model._init_new_tracker_state(state)
+        _, _, feats, positions, sizes = self.model.tracker._get_image_feature(
+            tracker_state, frame_idx, batch_size=1
+        )
+        result = read_memory(
+            self.model.tracker, frame_idx, feats, positions, sizes, spatial, pointers
+        )
+        logits = result.pop("logits")[0, 0]
+        mask = self.model._convert_low_res_mask_to_video_res(logits, state)[0]
+        result["mask"] = mask.cpu().numpy()
+        return result
+
     def _get_session_stats(self):
         """Get a statistics string for live sessions and their GPU usage."""
         live_session_strs = []

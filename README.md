@@ -162,6 +162,24 @@ output = response["outputs"]
 
 ## Examples
 
+### Zero-training bidirectional hand segmentation
+
+The research script uses independent forward/backward SAM3 memory banks and a
+single final decoder, without training or changing model weights:
+
+```bash
+python scripts/process_bidirectional_videos.py \
+  --input-root DATA --output-root OUT_MEMORY --prompt "left hand" \
+  --checkpoint /path/to/sam3.pt --device cuda:0 \
+  --chunk-frames 120 --context-frames 30
+```
+
+Omit the chunk/context options for full-sequence processing. This script supports
+standard SAM3 on one GPU; other predictors and scripts retain their existing
+behavior. Inspect `requires_review` in `frames.jsonl` for missing-memory or
+ambiguous-identity cases. Accuracy gains require validation on labeled videos.
+See the [research protocol and options](docs/bidirectional_hand_segmentation_research.md#13-当前零训练实现与使用).
+
 The `examples` directory contains notebooks demonstrating how to use SAM3 with
 various types of prompts:
 

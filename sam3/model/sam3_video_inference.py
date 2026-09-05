@@ -63,6 +63,7 @@ class Sam3VideoInference(Sam3VideoBase):
     每帧调用父类完成“文本/几何检测 + 已有 masklet 跟踪 + 关联与更新”，本类
     管理视频级状态、提示、流式输出和结果后处理。
     """
+
     TEXT_ID_FOR_TEXT = 0
     TEXT_ID_FOR_VISUAL = 1
 
@@ -481,6 +482,10 @@ class Sam3VideoInference(Sam3VideoBase):
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new
         inference_state["tracker_metadata"] = tracker_metadata_new
+        if "memory_export_directory" in inference_state:
+            from sam3.model.bidirectional_memory import export_memory_frame
+
+            export_memory_frame(inference_state, frame_idx)
         # 标记帧已计算，使后续的默认传播起点可以复用该信息。
         inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
 

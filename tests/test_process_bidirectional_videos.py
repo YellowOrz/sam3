@@ -4,7 +4,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-
 from scripts import process_bidirectional_videos as processor
 
 
@@ -23,59 +22,6 @@ def direction(
         [{obj_id: score} for score in scores],
         [{obj_id: score} for score in scores],
     )
-
-
-def test_viterbi_prefers_one_stable_switch_over_framewise_flicker() -> None:
-    forward = [square(1), square(2), square(3), square(4)]
-    backward = [square(8), square(7), square(6), square(5)]
-    result = processor.viterbi_select(
-        {
-            "F": forward,
-            "B": backward,
-            "O": [np.zeros((12, 16), dtype=bool) for _ in forward],
-        },
-        {
-            "F": [0.9, 0.4, 0.9, 0.4],
-            "B": [0.4, 0.9, 0.4, 0.9],
-            "O": [0.0] * 4,
-        },
-        processor.FusionConfig(switch_penalty=1.0),
-    )
-
-    assert sum(a != b for a, b in zip(result.sources, result.sources[1:])) <= 1
-    assert "O" not in result.sources
-
-
-def test_empty_state_is_fail_closed_when_one_direction_is_confident() -> None:
-    mask = square(2)
-    empty = np.zeros_like(mask)
-
-    result = processor.viterbi_select(
-        {"F": [mask], "B": [empty], "O": [empty]},
-        {"F": [0.8], "B": [0.0], "O": [0.0]},
-        processor.FusionConfig(),
-    )
-
-    assert result.sources == ("F",)
-
-
-def test_uncertainty_intervals_require_persistent_disagreement_and_failure() -> None:
-    forward = [square(1) for _ in range(8)]
-    backward = [square(1) for _ in range(8)]
-    for index in range(2, 7):
-        backward[index] = square(10)
-    scores_forward = [0.9] * 8
-    scores_backward = [0.9, 0.9] + [0.1] * 5 + [0.9]
-
-    intervals = processor.uncertain_intervals(
-        forward,
-        backward,
-        scores_forward,
-        scores_backward,
-        processor.FusionConfig(disagreement_min_frames=5),
-    )
-
-    assert intervals == [(2, 7)]
 
 
 def test_primary_instances_are_matched_by_masks_not_object_ids() -> None:
@@ -208,44 +154,6 @@ def test_backward_equivalence_detects_a_real_mask_difference() -> None:
     assert report["minimum_mask_iou"] < 0.999
 
 
-@pytest.mark.parametrize(("minimum_gain", "accepted"), [(0.1, True), (2.0, False)])
-def test_anchor_repair_is_only_applied_after_acceptance_gate(
-    monkeypatch: pytest.MonkeyPatch, minimum_gain: float, accepted: bool
-) -> None:
-    shape = (12, 16)
-    forward = [square(1), square(9), square(3)]
-    backward = [square(1), square(10), square(3)]
-    empty = [np.zeros(shape, dtype=bool) for _ in range(3)]
-    repaired_candidate = [empty[0], square(2), empty[2]]
-
-    monkeypatch.setattr(
-        processor,
-        "run_anchor_propagation",
-        lambda *args, **kwargs: (repaired_candidate, [0.0, 0.99, 0.0]),
-    )
-    fused = [mask.copy() for mask in forward]
-    sources = ["F"] * 3
-    attempt = processor.try_repair_interval(
-        object(),
-        Path("frames"),
-        3,
-        "left hand",
-        (1, 1),
-        0,
-        2,
-        fused,
-        sources,
-        {"F": forward, "B": backward, "O": empty},
-        {"F": [0.9, 0.1, 0.9], "B": [0.9, 0.1, 0.9], "O": [0.0] * 3},
-        processor.FusionConfig(
-            repair_min_gain=minimum_gain, recovery_iou_threshold=0.0
-        ),
-    )
-
-    assert (attempt["status"] == "accepted") is accepted
-    assert np.array_equal(fused[1], repaired_candidate[1] if accepted else forward[1])
-
-
 def test_evaluation_reports_oracle_and_fused_metrics() -> None:
     target = [square(1), square(2)]
     wrong = [square(9), square(9)]
@@ -281,7 +189,7 @@ def test_result_video_is_two_by_two(tmp_path: Path) -> None:
     mask = square(2)
 
     processor.write_result_video(
-        output, frame_dir, [mask], [mask], [mask], ["F"], [0.1], [False], 12.0
+        output, frame_dir, [mask], [mask], [mask], ["decoded"], 12.0
     )
 
     capture = cv2.VideoCapture(str(output))
@@ -293,106 +201,219 @@ def test_result_video_is_two_by_two(tmp_path: Path) -> None:
         capture.release()
 
 
-def test_process_video_writes_candidates_fusion_and_diagnostics(tmp_path: Path) -> None:
-    input_root = tmp_path / "input"
-    input_root.mkdir()
-    video_path = input_root / "color.mp4"
-    writer = cv2.VideoWriter(
-        str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 12.0, (16, 12)
-    )
-    assert writer.isOpened()
-    for value in (30, 60, 90):
-        writer.write(np.full((12, 16, 3), value, dtype=np.uint8))
-    writer.release()
+def entry(frame, direction, *, quality=0.9, conditioning=False, object_id=7):
+    return {
+        "frame_index": frame,
+        "direction": direction,
+        "quality": quality,
+        "conditioning": conditioning,
+        "object_id": object_id,
+        "path": f"{direction}_{frame}.pt",
+        "spatial_tokens": 4,
+        "pointer_values": 8,
+    }
 
-    class FakePredictor:
-        def __init__(self) -> None:
-            self.sessions = {}
-            self.next_session = 0
 
-        def handle_request(self, request):
-            if request["type"] == "start_session":
-                session_id = str(self.next_session)
-                self.next_session += 1
-                self.sessions[session_id] = "reversed" in request["resource_path"]
-                return {"session_id": session_id}
-            if request["type"] == "add_prompt":
-                reversed_frames = self.sessions[request["session_id"]]
-                index = request["frame_index"]
-                source_index = 2 - index if reversed_frames else index
-                return {
-                    "outputs": {
-                        "out_obj_ids": np.array([7]),
-                        "out_probs": np.array([0.8]),
-                        "out_tracker_probs": np.array([0.8]),
-                        "out_binary_masks": np.array([square(source_index + 1)]),
-                    }
-                }
-            return {"outputs": {}}
-
-        def handle_stream_request(self, request):
-            reversed_frames = self.sessions[request["session_id"]]
-            start = request["start_frame_index"]
-            count = request["max_frame_num_to_track"]
-            indices = (
-                range(start - 1, max(start - count, 0) - 1, -1)
-                if request["propagation_direction"] == "backward"
-                else range(start, min(start + count, 3))
-            )
-            for index in indices:
-                source_index = 2 - index if reversed_frames else index
-                yield {
-                    "frame_index": index,
-                    "outputs": {
-                        "out_obj_ids": np.array([7]),
-                        "out_probs": np.array([0.8]),
-                        "out_tracker_probs": np.array([0.8]),
-                        "out_binary_masks": np.array([square(source_index + 1)]),
-                    },
-                }
-
-    output_dir = tmp_path / "output"
-    status = processor.process_video(
-        FakePredictor(),
-        video_path,
-        input_root,
-        output_dir,
-        "left hand",
-        "sam3",
-        None,
-        False,
-        processor.FusionConfig(),
-        False,
-        None,
-        1,
-        "verify",
-        0.999,
-    )
-
-    assert status == "success"
+@pytest.mark.parametrize("side", ["both", "past", "future"])
+def test_memory_selection_enforces_direction_budget_and_no_self(side):
+    entries = [entry(i, d) for d in ("F", "B") for i in range(9)]
+    entries += [entry(3, "F")]
+    config = processor.MemoryConfig(side=side)
+    selected = processor.select_memories(entries, 4, 4, config)
+    assert len(selected) == 4
+    assert len({(e["direction"], e["frame_index"]) for e in selected}) == 4
     assert all(
-        (output_dir / name).is_file()
-        for name in (
-            "forward/masks.mkv",
-            "backward/masks.mkv",
-            "masks.mkv",
-            "result.mp4",
-            "frames.jsonl",
-            "audit.json",
-            "backward_equivalence.json",
+        e["frame_index"] < 4 if e["direction"] == "F" else e["frame_index"] > 4
+        for e in selected
+    )
+    if side == "both":
+        assert [e["direction"] for e in selected].count("F") == 2
+    else:
+        assert {e["direction"] for e in selected} == (
+            {"F"} if side == "past" else {"B"}
+        )
+
+
+def test_memory_selection_refills_missing_side_without_deleting_invisibility():
+    entries = [entry(0, "F", quality=None), entry(1, "F"), entry(2, "F", quality=0.1)]
+    entries[1]["presence_logit"] = -10.0
+    selected = processor.select_memories(
+        entries, 3, 3, processor.MemoryConfig(min_quality=0.5)
+    )
+    assert selected == [entries[1]]
+    assert len(processor.select_memories(entries, 3, 3, processor.MemoryConfig())) == 3
+    assert processor.select_memories(entries, 3, 0, processor.MemoryConfig()) == []
+
+
+def test_overlapping_windows_have_exactly_one_owner_per_frame():
+    windows = list(
+        processor.processing_windows(
+            5, processor.MemoryConfig(chunk_frames=2, context_frames=1)
         )
     )
-    metadata = json.loads((output_dir / "metadata.json").read_text())
-    assert metadata["backward_equivalence"]["equivalent"]
-    assert metadata["status"] == "success"
+    assert windows == [(0, 2, 0, 3), (2, 4, 1, 5), (4, 5, 3, 5)]
+    assert [t for a, b, _, _ in windows for t in range(a, b)] == list(range(5))
+    with pytest.raises(ValueError, match="requires"):
+        processor.MemoryConfig(context_frames=1)
 
 
-def test_parser_defaults_to_verification_and_conservative_repair() -> None:
-    args = processor.build_parser().parse_args(
-        ["--input-root", "input", "--output-root", "output", "--prompt", "left hand"]
+class MemoryPredictor:
+    """Exercise real disk/video orchestration without CUDA or model weights."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.next_session = 0
+        self.decoded = []
+        self.fail_decode = False
+
+    def begin_memory_capture(self, session_id, directory):
+        directory.mkdir()
+        self.sessions[session_id]["capture"] = directory
+
+    def finish_memory_capture(self, session_id):
+        return self.sessions[session_id]["records"]
+
+    def frame(self, session, index):
+        state = self.sessions[session]
+        image = cv2.imread(str(state["path"] / f"{index:06d}.png"))
+        original = round(float(image.mean()) / 30) - 1
+        obj = 9 if "reversed" in str(state["path"]) else 7
+        if "capture" in state:
+            state["records"][index] = {obj: entry(index, "F", object_id=obj)}
+        return {
+            "out_obj_ids": np.array([obj]),
+            "out_probs": np.array([0.9]),
+            "out_tracker_probs": np.array([0.9]),
+            "out_binary_masks": np.array([square(original + 1)]),
+        }
+
+    def handle_request(self, request):
+        kind = request["type"]
+        if kind == "start_session":
+            session = str(self.next_session)
+            self.next_session += 1
+            self.sessions[session] = {
+                "path": Path(request["resource_path"]),
+                "records": {},
+            }
+            return {"session_id": session}
+        session = request["session_id"]
+        if kind == "add_prompt":
+            return {"outputs": self.frame(session, request["frame_index"])}
+        if kind == "close_session":
+            del self.sessions[session]
+        return {}
+
+    def handle_stream_request(self, request):
+        start, count = request["start_frame_index"], request["max_frame_num_to_track"]
+        indices = (
+            range(start, start + count)
+            if request["propagation_direction"] == "forward"
+            else range(start - 1, start - count - 1, -1)
+        )
+        for i in indices:
+            yield {"frame_index": i, "outputs": self.frame(request["session_id"], i)}
+
+    def decode_memory_frame(self, session, index, spatial, pointers):
+        if self.fail_decode:
+            raise RuntimeError("decode failed")
+        assert all(
+            (
+                e["frame_index"] < index
+                if e["direction"] == "F"
+                else e["frame_index"] > index
+            )
+            for e in spatial + pointers
+        )
+        self.decoded.append((session, index, spatial, pointers))
+        return {
+            "mask": square(10),
+            "predicted_iou": 0.85,
+            "presence_logit": 3.0,
+            "spatial_tokens": 4 * len(spatial),
+            "pointer_tokens": len(pointers),
+        }
+
+
+def make_video(tmp_path, count=5):
+    root = tmp_path / "input"
+    root.mkdir()
+    video = root / "color.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 12, (16, 12))
+    assert writer.isOpened()
+    for i in range(count):
+        writer.write(np.full((12, 16, 3), (i + 1) * 30, dtype=np.uint8))
+    writer.release()
+    return root, video
+
+
+@pytest.mark.parametrize("chunk,context", [(0, 0), (2, 0), (2, 1)])
+def test_memory_pipeline_decodes_core_once_and_writes_provenance(
+    tmp_path, chunk, context
+):
+    root, video = make_video(tmp_path)
+    out = tmp_path / "output"
+    predictor = MemoryPredictor()
+    config = processor.MemoryConfig(chunk_frames=chunk, context_frames=context)
+    assert (
+        processor.process_video(predictor, video, root, out, "left hand", config)
+        == "success"
     )
+    assert not predictor.sessions
+    records = [
+        json.loads(line) for line in (out / "frames.jsonl").read_text().splitlines()
+    ]
+    assert [r["frame_index"] for r in records] == list(range(5))
+    # With no context the final singleton block has no legal self-free memory.
+    decoded_count = 4 if (chunk, context) == (2, 0) else 5
+    assert len(predictor.decoded) == decoded_count
+    for record in records:
+        assert "selected_source" not in record
+        for e in record["spatial_memory"] + record["pointer_memory"]:
+            assert "path" not in e
+            assert (
+                e["frame_index"] < record["frame_index"]
+                if e["direction"] == "F"
+                else e["frame_index"] > record["frame_index"]
+            )
+    masks = processor.read_label_video(out / "masks.mkv", 5, (12, 16), 1)
+    assert all(np.array_equal(m, square(10)) for m in masks[:decoded_count])
+    metadata = json.loads((out / "metadata.json").read_text())
+    assert metadata["source_banks_frozen"] and metadata["training"] is False
+    assert metadata["requires_review_frames"] == 5 - decoded_count
+    assert (
+        processor.process_video(predictor, video, root, out, "left hand", config)
+        == "skipped"
+    )
+    with pytest.raises(FileExistsError):
+        processor.process_video(predictor, video, root, out, "right hand", config)
 
-    assert args.backward_mode == "verify"
-    assert args.backward_equivalence_iou == pytest.approx(0.999)
-    assert not args.repair_uncertain
-    assert args.ground_truth_label == 1
+
+def test_decode_failure_closes_session_and_marks_output_failed(tmp_path):
+    root, video = make_video(tmp_path, 3)
+    predictor = MemoryPredictor()
+    predictor.fail_decode = True
+    out = tmp_path / "output"
+    with pytest.raises(RuntimeError, match="decode failed"):
+        processor.process_video(
+            predictor, video, root, out, "left hand", processor.MemoryConfig()
+        )
+    assert not predictor.sessions
+    assert json.loads((out / "metadata.json").read_text())["status"] == "failed"
+
+
+def test_parser_and_list_only_do_not_load_sam3(tmp_path):
+    root, _ = make_video(tmp_path, 1)
+    argv = [
+        "--input-root",
+        str(root),
+        "--output-root",
+        str(tmp_path / "out"),
+        "--prompt",
+        "left hand",
+    ]
+    args = processor.build_parser().parse_args(argv)
+    assert args.backward_mode == "physical" and args.chunk_frames == 0
+    assert processor.main(argv + ["--list-only"]) == 0
+    with pytest.raises(SystemExit):
+        processor.build_parser().parse_args(argv + ["--version", "sam3.1"])
