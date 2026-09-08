@@ -199,15 +199,14 @@ class Sam3VideoInference(Sam3VideoBase):
         for i in range(len(stages)):
             stages[i] = convert_my_tensors(stages[i])
 
-        # construct the final `BatchedDatapoint` and cast to GPU
+        # Keep decoded frames on their load device; only prompt tensors go to GPU.
         input_batch = BatchedDatapoint(
             img_batch=images,
             find_text_batch=find_text_batch,
-            find_inputs=stages,
+            find_inputs=copy_data_to_device(stages, device, non_blocking=True),
             find_targets=[None] * num_frames,
             find_metadatas=[None] * num_frames,
         )
-        input_batch = copy_data_to_device(input_batch, device, non_blocking=True)
         inference_state["input_batch"] = input_batch
 
         # 空几何提示使无框提示的帧也能走统一的检测器调用路径。

@@ -16,7 +16,7 @@ from sam3.train.data.collator import BatchedDatapoint
 
 from .act_ckpt_utils import activation_ckpt_wrapper
 from .box_ops import box_cxcywh_to_xyxy
-from .data_misc import FindStage
+from .data_misc import FindStage, gather_frames
 from .geometry_encoders import Prompt
 from .model_misc import inverse_sigmoid
 
@@ -145,7 +145,7 @@ class Sam3Image(torch.nn.Module):
         # note: we allow using a list (or other indexable types) of tensors as img_batch
         # (e.g. for async frame loading in demo). In this case we index img_batch.tensors directly
         if isinstance(img_batch, torch.Tensor):
-            image = img_batch[unique_ids]
+            image = gather_frames(img_batch, unique_ids)
         elif unique_ids.numel() == 1:
             image = img_batch[unique_ids.item()].unsqueeze(0)
         else:

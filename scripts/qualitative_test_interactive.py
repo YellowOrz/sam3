@@ -13,9 +13,16 @@
         --text_prompt "human hand" \
         --device cuda:0 \
         --checkpoint-interval 20 \
+        --chunk-frames 500 \
         --output-dir ./outputs/interactive/example
 
 如果输出目录中已经存在结果，请增加 ``--overwrite``。
+
+``--chunk-frames`` 默认为 0，表示不开启分块；启用时必须不少于 100 帧。程序会
+逐段创建独立 tracker session，完成交互后自动汇总。对象编号和 mask 标签按段独立。
+
+CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 ``float16``。
+主线程在启动时进入 autocast；传播工作线程会再进入一次（autocast 是线程局部的）。
 
 交互操作
 --------
@@ -25,9 +32,12 @@
 * 下方时间轴的蓝色部分是从第 0 帧开始连续处理完成的可播放范围，灰色尾部
   只表示视频总长度；拖动位置不会超过蓝色范围，拖动会暂停画面播放，但不会
   影响传播。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
-* 播放按钮依次为倒放、暂停、正放；传播按钮依次为暂停、反向、正向、先正向
-  再反向、先反向再正向。每组只有一个按钮高亮；点击倒放或正放会取消当前
-  mask 选择，但保留未提交点。
+  播放画面右上角会标记当前帧 mask 状态：CURRENT 表示本次传播已更新，
+  STALE 表示仍显示旧结果、等待重新传播，PREVIEW 表示当前帧正在预览未提交点。
+* 播放按钮依次为倒放、上一帧、暂停、下一帧、正放；传播按钮依次为暂停、反向、
+  正向、先正向再反向、先反向再正向。连续播放三个按钮只有一个高亮。上一帧和
+  下一帧仅在暂停时可点，每次移动一帧，范围与时间轴相同；按帧步进不取消
+  mask 选择，也不提交点。点击倒放或正放会取消当前 mask 选择，但保留未提交点。
 * 传播运行时只能点击传播暂停，其他传播方向按钮暂时禁用；自然完成后自动
   回到传播暂停。点击任一传播方向会确认未提交点，并从编辑帧（没有编辑时为
   当前帧）启动传播。
@@ -35,6 +45,8 @@
   ``Q`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
 * 鼠标中键点击 mask 可选择对象；重叠区域从小到大循环，循环末尾取消选择；
   点击空白处也会取消选择。选中 mask 使用高亮填充和细青色轮廓。
+* ``D`` 删除当前选中的对象：从 tracker 和所有已缓存帧中去掉该实例，其他对象
+  保留。需先暂停播放和传播；若有未提交编辑会先取消。未选中对象时无效。
 * 鼠标左键添加正点，右键添加负点。未选择 mask 时，第一个正点会创建新的
   对象；第一个负点不会创建对象。
 * 每个对象在每一帧最多使用 16 个点，窗口状态会显示当前数量；达到上限后
@@ -118,6 +130,24 @@ SELECTED_EDGE_THICKNESS = 2
 TIMELINE_HEIGHT = 72
 BUTTON_ROW_HEIGHT = 82
 CONTROL_HEIGHT = TIMELINE_HEIGHT + BUTTON_ROW_HEIGHT
+FRAME_STATUS_BORDER = 6
+FRAME_STATUS_STYLES = {
+    "current": {
+        "text": "CURRENT",
+        "fg": (80, 210, 90),
+        "bg": (24, 48, 28),
+    },
+    "stale": {
+        "text": "STALE",
+        "fg": (40, 185, 255),
+        "bg": (28, 44, 62),
+    },
+    "preview": {
+        "text": "PREVIEW",
+        "fg": (80, 230, 255),
+        "bg": (32, 48, 40),
+    },
+}
 PROPAGATION_MODES = (
     "backward",
     "forward",
@@ -165,10 +195,30 @@ def utc_now() -> str:
     return _utc_now("milliseconds")
 
 
+def cuda_amp_dtype() -> torch.dtype:
+    """Prefer bfloat16 AMP; fall back to float16 on GPUs without bf16."""
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def enter_cuda_amp() -> torch.dtype:
+    dtype = cuda_amp_dtype()
+    torch.autocast(device_type="cuda", dtype=dtype).__enter__()
+    return dtype
+
+
 def window_width_int(value: str) -> int:
     number = positive_int(value)
     if number < 640:
         raise argparse.ArgumentTypeError("window width must be at least 640")
+    return number
+
+
+def chunk_frames_int(value: str) -> int:
+    number = int(value)
+    if number != 0 and number < 100:
+        raise argparse.ArgumentTypeError("chunk frames must be 0 or at least 100")
     return number
 
 
@@ -215,6 +265,29 @@ def extract_frames(video_path: Path, output_dir: Path) -> int:
         raise RuntimeError(f"video contains no readable frames: {video_path}")
     print(f"Extracted {index} frames to {output_dir}")
     return index
+
+
+def frame_ranges(frame_count: int, chunk_frames: int) -> List[Tuple[int, int]]:
+    """Return half-open frame ranges, or one full-video range for zero."""
+    if frame_count < 1:
+        raise ValueError("frame count must be positive")
+    size = chunk_frames or frame_count
+    return [
+        (start, min(start + size, frame_count)) for start in range(0, frame_count, size)
+    ]
+
+
+def make_chunk_frame_dir(
+    source_dir: Path, target_dir: Path, start: int, end: int
+) -> None:
+    target_dir.mkdir(parents=True)
+    for local_index, source_index in enumerate(range(start, end)):
+        source = source_dir / f"{source_index:05d}.jpg"
+        target = target_dir / f"{local_index:05d}.jpg"
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copy2(source, target)
 
 
 def load_frame_bgr(frame_dir: Path, frame_index: int) -> np.ndarray:
@@ -265,6 +338,46 @@ def normalize_frame_outputs(
         int(obj_id): float(probability)
         for obj_id, probability in zip(obj_ids, probabilities)
     }
+
+
+def draw_frame_status_overlay(image: np.ndarray, status: str) -> np.ndarray:
+    style = FRAME_STATUS_STYLES[status]
+    height, width = image.shape[:2]
+    fg = style["fg"]
+    bg = style["bg"]
+    text = style["text"]
+    cv2.rectangle(
+        image,
+        (0, 0),
+        (width - 1, height - 1),
+        fg,
+        FRAME_STATUS_BORDER,
+        cv2.LINE_8,
+    )
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.7
+    thickness = 2
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    pad_x, pad_y = 10, 7
+    box_w = text_w + pad_x * 2
+    box_h = text_h + baseline + pad_y * 2
+    x2 = max(FRAME_STATUS_BORDER + 8, width - FRAME_STATUS_BORDER - 8)
+    y1 = FRAME_STATUS_BORDER + 8
+    x1 = max(FRAME_STATUS_BORDER + 8, x2 - box_w)
+    y2 = min(height - FRAME_STATUS_BORDER - 8, y1 + box_h)
+    cv2.rectangle(image, (x1, y1), (x2, y2), bg, cv2.FILLED, cv2.LINE_AA)
+    cv2.rectangle(image, (x1, y1), (x2, y2), fg, 2, cv2.LINE_AA)
+    cv2.putText(
+        image,
+        text,
+        (x1 + pad_x, y1 + pad_y + text_h),
+        font,
+        scale,
+        fg,
+        thickness,
+        cv2.LINE_AA,
+    )
+    return image
 
 
 def render_frame_bgr(
@@ -500,7 +613,7 @@ class PropagationRunner:
                         "propagation_direction": direction,
                         "start_frame_index": start_frame_index,
                     }
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
                         for response in self.predictor.handle_stream_request(request):
                             if self.stop_event.is_set():
                                 stopped = True
@@ -606,6 +719,7 @@ class InteractiveApp:
         output_dir: Path,
         window_width: int,
         checkpoint_interval: int = 20,
+        frame_offset: int = 0,
     ):
         self.predictor = predictor
         self.version = version
@@ -616,6 +730,7 @@ class InteractiveApp:
         self.frame_count = frame_count
         self.prompt = prompt
         self.output_dir = output_dir
+        self.frame_offset = frame_offset
         self.initial_propagation_mode = "forward"
         self.checkpoint_interval = checkpoint_interval
         self.event_queue: queue.Queue = queue.Queue()
@@ -837,6 +952,21 @@ class InteractiveApp:
         self.set_display_index(frame_index)
         self.status = f"frame {self.display_index}"
 
+    def step_playback(self, direction: int) -> None:
+        if self.playing:
+            self.status = "pause playback before stepping frames"
+            return
+        frontier = self.playable_frontier()
+        next_frame = self.display_index + direction
+        if next_frame < 0:
+            self.status = "at first frame"
+            return
+        if next_frame > frontier:
+            self.status = "at playable frontier"
+            return
+        self.set_display_index(next_frame)
+        self.status = f"frame {self.display_index}"
+
     def image_coordinates(self, x: int, y: int) -> Tuple[int, int]:
         return (
             min(self.video_info.width - 1, max(0, round(x / self.display_scale))),
@@ -852,6 +982,53 @@ class InteractiveApp:
         self.selection_offset = 0
         if update_status:
             self.status = "selection cleared"
+
+    def remove_selected_object(self) -> None:
+        if self.playing or self.runner.is_alive:
+            self.status = "pause playback and propagation before editing"
+            return
+        if self.active_obj is None:
+            self.status = "select an object before deleting"
+            return
+        obj_id = int(self.active_obj)
+        was_new_draft = obj_id in self.draft_new_obj_ids
+        if self.editing:
+            self.cancel_edit()
+            if was_new_draft:
+                self.status = f"discarded draft obj {obj_id}"
+                return
+        removed = {p.sequence for p in self.confirmed_points if p.obj_id == obj_id}
+        self.confirmed_points = [p for p in self.confirmed_points if p.obj_id != obj_id]
+        self.commits = [
+            CommitRecord(
+                commit.frame_index,
+                tuple(key for key in commit.affected_keys if key[1] != obj_id),
+                tuple(s for s in commit.point_sequences if s not in removed),
+            )
+            for commit in self.commits
+            if any(key[1] != obj_id for key in commit.affected_keys)
+        ]
+        self.predictor.handle_request(
+            {
+                "type": "remove_object",
+                "session_id": self.session_id,
+                "obj_id": obj_id,
+                "frame_index": self.display_index,
+            }
+        )
+        for masks in self.cache.values():
+            masks.pop(obj_id, None)
+        for probs in self.probability_cache.values():
+            probs.pop(obj_id, None)
+        self.clear_object_selection(update_status=False)
+        self.predictor.handle_request(
+            {"type": "clear_checkpoints", "session_id": self.session_id}
+        )
+        self.save_checkpoint(self.display_index)
+        self.record_event(
+            "remove_object", obj_id=obj_id, frame_index=self.display_index
+        )
+        self.status = f"removed obj {obj_id}"
 
     def select_object(self, x: int, y: int) -> None:
         masks = self.cache.get(self.display_index, {})
@@ -971,6 +1148,10 @@ class InteractiveApp:
             self.playing = True
             self.last_play_time = time.monotonic()
             self.status = "playing forward"
+        elif name == "play_step_backward":
+            self.step_playback(-1)
+        elif name == "play_step_forward":
+            self.step_playback(1)
         elif name == "prop_pause":
             self.stop_propagation()
             self.status = "propagation paused"
@@ -1245,7 +1426,7 @@ class InteractiveApp:
             }
             if max_frame_num_to_track is not None:
                 request["max_frame_num_to_track"] = max_frame_num_to_track
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
                 for response in self.predictor.handle_stream_request(request):
                     frame_index = int(response["frame_index"])
                     self.store_frame_outputs(frame_index, response.get("outputs", {}))
@@ -1386,6 +1567,37 @@ class InteractiveApp:
         )
         cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
 
+    def draw_step_icon(
+        self,
+        image: np.ndarray,
+        rect: Tuple[int, int, int, int],
+        direction: int,
+        color: Tuple[int, int, int],
+    ) -> None:
+        left, top, right, bottom = rect
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        half = max(5, min(9, (right - left) // 6))
+        bar_x = center_x - direction * (half + 4)
+        cv2.rectangle(
+            image,
+            (bar_x - 1, center_y - 7),
+            (bar_x + 1, center_y + 7),
+            color,
+            cv2.FILLED,
+        )
+        tip_x = center_x + direction * half
+        base_x = center_x - direction * (half - 1)
+        points = np.array(
+            [
+                (tip_x, center_y),
+                (base_x, center_y - 6),
+                (base_x, center_y + 6),
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
+
     def draw_button(
         self,
         image: np.ndarray,
@@ -1426,6 +1638,10 @@ class InteractiveApp:
         elif name.endswith("backward_forward"):
             self.draw_arrow_icon(image, rect, -1, color, -8)
             self.draw_arrow_icon(image, rect, 1, color, 8)
+        elif name.endswith("step_backward"):
+            self.draw_step_icon(image, rect, -1, color)
+        elif name.endswith("step_forward"):
+            self.draw_step_icon(image, rect, 1, color)
         elif name.endswith("backward"):
             self.draw_arrow_icon(image, rect, -1, color)
         else:
@@ -1510,7 +1726,7 @@ class InteractiveApp:
         row_top = TIMELINE_HEIGHT
         button_top = row_top + 17
         button_bottom = row_top + BUTTON_ROW_HEIGHT - 15
-        play_right = round(width * 0.38)
+        play_right = round(width * 0.46)
         cv2.line(
             panel, (play_right, row_top), (play_right, CONTROL_HEIGHT), (55, 55, 55), 1
         )
@@ -1524,10 +1740,16 @@ class InteractiveApp:
             1,
             cv2.LINE_AA,
         )
-        play_names = ("play_backward", "play_pause", "play_forward")
+        play_names = (
+            "play_backward",
+            "play_step_backward",
+            "play_pause",
+            "play_step_forward",
+            "play_forward",
+        )
         play_left = 78
-        play_gap = 7
-        play_width = max(34, (play_right - play_left - 20 - 2 * play_gap) // 3)
+        play_gap = 6
+        play_width = max(32, (play_right - play_left - 20 - 4 * play_gap) // 5)
         active_play = (
             "play_pause"
             if not self.playing
@@ -1535,12 +1757,18 @@ class InteractiveApp:
         )
         for index, name in enumerate(play_names):
             left = play_left + index * (play_width + play_gap)
+            if name == "play_step_backward":
+                enabled = not self.playing and self.display_index > 0
+            elif name == "play_step_forward":
+                enabled = not self.playing and self.display_index < max(0, frontier)
+            else:
+                enabled = True
             self.draw_button(
                 panel,
                 name,
                 (left, button_top, left + play_width, button_bottom),
                 name == active_play,
-                True,
+                enabled,
             )
 
         prop_left = play_right + 18
@@ -1584,6 +1812,17 @@ class InteractiveApp:
             )
         return panel
 
+    def display_frame_status(self) -> str:
+        if (
+            self.editing
+            and self.edit_frame == self.display_index
+            and self.preview_signature is not None
+        ):
+            return "preview"
+        if self.display_index in self.stale_frames:
+            return "stale"
+        return "current"
+
     def render(self) -> np.ndarray:
         rendered = render_frame_bgr(
             load_frame_bgr(self.frame_dir, self.display_index),
@@ -1591,7 +1830,6 @@ class InteractiveApp:
             probabilities_by_obj=self.probability_cache.get(self.display_index, {}),
             points=self.current_points_for_display(),
             active_obj=self.active_obj,
-            stale=self.display_index in self.stale_frames,
             status=None,
         )
         if self.display_scale != 1.0:
@@ -1600,6 +1838,7 @@ class InteractiveApp:
                 (self.display_width, self.display_height),
                 interpolation=cv2.INTER_AREA,
             )
+        draw_frame_status_overlay(rendered, self.display_frame_status())
         return np.vstack((rendered, self.render_controls()))
 
     def advance_playback(self) -> None:
@@ -1654,6 +1893,8 @@ class InteractiveApp:
             self.preview()
         elif key in (ord("c"), ord("C")):
             self.clear_all_interactions()
+        elif key in (ord("d"), ord("D")):
+            self.remove_selected_object()
         elif key in (10, 13, 32):
             self.status = "Enter and Space are disabled"
         return True
@@ -1782,7 +2023,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
                     masks_by_obj,
                     probabilities_by_obj=app.probability_cache.get(frame_index, {}),
                     object_to_label=object_to_label,
-                    frame_index=frame_index,
+                    frame_index=app.frame_offset + frame_index,
                     prompt=app.prompt,
                 )
             )
@@ -1802,6 +2043,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
         "height": app.video_info.height,
         "frame_count": app.frame_count,
         "fps": app.video_info.fps,
+        "frame_start": app.frame_offset,
     }
     outputs = {
         "instance_masks_video": "masks.mkv",
@@ -1866,6 +2108,163 @@ def validate_interactive_outputs(output_dir: Path, overwrite: bool) -> None:
         )
 
 
+def merge_chunk_outputs(
+    chunks: Sequence[Tuple[int, int, Path]],
+    output_dir: Path,
+    video_path: Path,
+    video_info: VideoInfo,
+    prompt: str,
+    version: str,
+    chunk_frames: int,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary_result = output_dir / ".result.tmp.mp4"
+    temporary_masks = output_dir / ".masks.tmp.mkv"
+    for path in (temporary_result, temporary_masks):
+        path.unlink(missing_ok=True)
+    result_writer = cv2.VideoWriter(
+        str(temporary_result),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        video_info.fps,
+        (video_info.width, video_info.height),
+    )
+    mask_writer = cv2.VideoWriter(
+        str(temporary_masks),
+        cv2.VideoWriter_fourcc(*"FFV1"),
+        video_info.fps,
+        (video_info.width, video_info.height),
+        isColor=False,
+    )
+    if not result_writer.isOpened() or not mask_writer.isOpened():
+        result_writer.release()
+        mask_writer.release()
+        for path in (temporary_result, temporary_masks):
+            path.unlink(missing_ok=True)
+        raise RuntimeError("cannot create merged output videos")
+
+    chunk_metadata = []
+    confirmed_points = []
+    events = []
+    sequence_offset = 0
+    try:
+        for chunk_index, (start, end, chunk_dir) in enumerate(chunks, 1):
+            result_capture = cv2.VideoCapture(str(chunk_dir / "result.mp4"))
+            mask_capture = cv2.VideoCapture(str(chunk_dir / "masks.mkv"))
+            try:
+                if not result_capture.isOpened() or not mask_capture.isOpened():
+                    raise RuntimeError(f"cannot open outputs for chunk {chunk_index}")
+                for _ in range(end - start):
+                    result_ok, result_frame = result_capture.read()
+                    mask_ok, mask_frame = mask_capture.read()
+                    if not result_ok or not mask_ok:
+                        raise RuntimeError(f"chunk {chunk_index} output is incomplete")
+                    if result_frame.shape[:2] != (video_info.height, video_info.width):
+                        raise RuntimeError(f"chunk {chunk_index} dimensions differ")
+                    result_writer.write(result_frame)
+                    mask_writer.write(cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY))
+            finally:
+                result_capture.release()
+                mask_capture.release()
+
+            metadata = json.loads(
+                (chunk_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+            interactions = json.loads(
+                (chunk_dir / "interactions.json").read_text(encoding="utf-8")
+            )
+            chunk_metadata.append(
+                {
+                    "index": chunk_index,
+                    "start_frame": start,
+                    "end_frame_exclusive": end,
+                    "frame_count": end - start,
+                    "object_id_to_label": metadata["object_id_to_label"],
+                }
+            )
+            local_sequences = [
+                int(item.get("sequence", 0))
+                for item in [
+                    *interactions.get("confirmed_points", []),
+                    *interactions.get("events", []),
+                ]
+            ]
+            for item in interactions.get("confirmed_points", []):
+                item["sequence"] += sequence_offset
+                item["frame_index"] += start
+                item["chunk_index"] = chunk_index
+                confirmed_points.append(item)
+            for item in interactions.get("events", []):
+                item["sequence"] += sequence_offset
+                for key in ("frame_index", "target_frame", "checkpoint_frame"):
+                    if key in item:
+                        item[key] += start
+                if "point_sequence" in item:
+                    item["point_sequence"] += sequence_offset
+                if "point_sequences" in item:
+                    item["point_sequences"] = [
+                        value + sequence_offset for value in item["point_sequences"]
+                    ]
+                item["chunk_index"] = chunk_index
+                events.append(item)
+            sequence_offset += max(local_sequences, default=0)
+    except BaseException:
+        for path in (temporary_result, temporary_masks):
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        result_writer.release()
+        mask_writer.release()
+
+    temporary_result.replace(output_dir / "result.mp4")
+    temporary_masks.replace(output_dir / "masks.mkv")
+    source = {
+        "width": video_info.width,
+        "height": video_info.height,
+        "frame_count": video_info.frame_count,
+        "fps": video_info.fps,
+    }
+    outputs = {
+        "instance_masks_video": "masks.mkv",
+        "instance_masks_codec": "FFV1",
+        "instance_masks_pixel_format": "gray8",
+        "visualization_video": "result.mp4",
+        "label_dtype": "uint8",
+        "background_label": 0,
+        "label_scope": "chunk",
+    }
+    common = {
+        "status": "success",
+        "input_video": str(video_path),
+        "model_version": version,
+        "source": source,
+        "chunk_frames": chunk_frames,
+        "chunks": chunk_metadata,
+        "outputs": outputs,
+    }
+    atomic_write_json(
+        output_dir / "metadata.json",
+        {
+            **common,
+            "completed_at": utc_now(),
+            "prompt": prompt,
+            "frames_processed": video_info.frame_count,
+            "object_identity_scope": "chunk",
+        },
+    )
+    atomic_write_json(
+        output_dir / "interactions.json",
+        {
+            **common,
+            "created_at": utc_now(),
+            "text_prompt": prompt,
+            "propagation_direction": "forward",
+            "confirmed_points": confirmed_points,
+            "events": events,
+        },
+    )
+    print(f"Merged {len(chunks)} chunks into {output_dir}")
+
+
 def run_interactive(
     predictor: Any,
     version: str,
@@ -1877,9 +2276,15 @@ def run_interactive(
     output_dir: Path,
     window_width: int,
     checkpoint_interval: int,
+    frame_offset: int = 0,
 ) -> None:
     response = predictor.handle_request(
-        {"type": "start_session", "resource_path": str(frame_dir)}
+        {
+            "type": "start_session",
+            "resource_path": str(frame_dir),
+            "offload_video_to_cpu": True,
+            "offload_state_to_cpu": False,
+        }
     )
     session_id = response["session_id"]
     app: Optional[InteractiveApp] = None
@@ -1904,6 +2309,7 @@ def run_interactive(
             output_dir,
             window_width,
             checkpoint_interval,
+            frame_offset,
         )
         app.start(response.get("outputs", {}))
         app.run()
@@ -1951,6 +2357,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FRAMES",
         help="Save a CPU tracker checkpoint every FRAMES frames (default: 20)",
     )
+    parser.add_argument(
+        "--chunk-frames",
+        type=chunk_frames_int,
+        default=0,
+        metavar="FRAMES",
+        help="Frames per independent chunk; 0 disables chunking (default: 0, min: 100)",
+    )
     return parser
 
 
@@ -1980,9 +2393,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     username = getpass.getuser()
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/torchinductor_cache_{username}"
     os.environ["USE_PERFLIB"] = "1"
+    amp_dtype = enter_cuda_amp()
     from sam3 import build_sam3_predictor
 
-    print(f"Building {args.version} model on {device_name}...")
+    print(
+        f"Building {args.version} model on {device_name} "
+        f"with CUDA AMP dtype {amp_dtype}..."
+    )
     build_kwargs = dict(version=args.version, compile=False, async_loading_frames=False)
     if checkpoint is not None:
         build_kwargs["checkpoint_path"] = str(checkpoint)
@@ -1990,20 +2407,65 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         video_info = probe_video(video_path)
         with tempfile.TemporaryDirectory(prefix="sam3_interactive_frames_") as temp:
-            frame_dir = Path(temp)
+            workspace = Path(temp)
+            frame_dir = workspace / "frames"
             frame_count = extract_frames(video_path, frame_dir)
-            run_interactive(
-                predictor,
-                args.version,
-                video_path,
-                video_info,
-                frame_dir,
-                frame_count,
-                args.text_prompt,
-                output_dir,
-                args.window_width,
-                args.checkpoint_interval,
+            video_info = VideoInfo(
+                video_info.width, video_info.height, frame_count, video_info.fps
             )
+            if args.chunk_frames == 0:
+                run_interactive(
+                    predictor,
+                    args.version,
+                    video_path,
+                    video_info,
+                    frame_dir,
+                    frame_count,
+                    args.text_prompt,
+                    output_dir,
+                    args.window_width,
+                    args.checkpoint_interval,
+                )
+            else:
+                chunks = []
+                ranges = frame_ranges(frame_count, args.chunk_frames)
+                for chunk_index, (start, end) in enumerate(ranges, 1):
+                    chunk_root = workspace / f"chunk_{chunk_index:04d}"
+                    chunk_frame_dir = chunk_root / "frames"
+                    chunk_output_dir = chunk_root / "output"
+                    make_chunk_frame_dir(frame_dir, chunk_frame_dir, start, end)
+                    print(
+                        f"Processing chunk {chunk_index}/{len(ranges)} "
+                        f"(frames {start}-{end - 1})"
+                    )
+                    run_interactive(
+                        predictor,
+                        args.version,
+                        video_path,
+                        VideoInfo(
+                            video_info.width,
+                            video_info.height,
+                            end - start,
+                            video_info.fps,
+                        ),
+                        chunk_frame_dir,
+                        end - start,
+                        args.text_prompt,
+                        chunk_output_dir,
+                        args.window_width,
+                        args.checkpoint_interval,
+                        frame_offset=start,
+                    )
+                    chunks.append((start, end, chunk_output_dir))
+                merge_chunk_outputs(
+                    chunks,
+                    output_dir,
+                    video_path,
+                    video_info,
+                    args.text_prompt,
+                    args.version,
+                    args.chunk_frames,
+                )
     finally:
         predictor.shutdown()
     return 0

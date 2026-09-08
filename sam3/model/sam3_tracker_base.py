@@ -6,6 +6,7 @@ import logging
 
 import torch
 import torch.nn.functional as F
+from sam3.model.data_misc import gather_frames
 from sam3.model.memory import SimpleMaskEncoder
 from sam3.model.sam3_tracker_utils import get_1d_sine_pe, select_closest_cond_frames
 from sam3.sam.mask_decoder import MaskDecoder, MLP
@@ -488,7 +489,7 @@ class Sam3TrackerBase(torch.nn.Module):
             unique_img_ids, inv_ids = img_ids, None
 
         # Compute the image features on those unique image ids
-        image = img_batch[unique_img_ids]
+        image = gather_frames(img_batch, unique_img_ids)
         backbone_out = self.forward_image(image)
         (
             _,
@@ -877,7 +878,7 @@ class Sam3TrackerBase(torch.nn.Module):
             img_ids = input.find_inputs[stage_id].img_ids
             if img_feats_already_computed:
                 # Retrieve image features according to img_ids (if they are already computed).
-                current_image = input.img_batch[img_ids]
+                current_image = gather_frames(input.img_batch, img_ids)
                 current_vision_feats = [x[:, img_ids] for x in vision_feats]
                 current_vision_pos_embeds = [x[:, img_ids] for x in vision_pos_embeds]
             else:

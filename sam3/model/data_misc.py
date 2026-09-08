@@ -32,6 +32,8 @@ class NestedTensor:
         return NestedTensor(new_tensors, new_mask)
 
     def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.to(device=self.tensors.device)
         return self.tensors[idx]
 
     def __len__(self):
@@ -45,11 +47,15 @@ class NestedTensor:
     def shape(self):
         return self.tensors.shape
 
-    # custom memory pinning method on custom type
     def pin_memory(self, device=None):
         self.tensors = self.tensors.pin_memory(device)
         if self.mask is not None:
             self.mask = self.mask.pin_memory(device)
+
+
+def gather_frames(frames, ids):
+    """Index frames that may be on CPU while ``ids`` are on GPU."""
+    return frames[ids.to(device=frames.device)]
 
 
 # Register NestedTensor as a pytree node so tree_map_only can traverse into it

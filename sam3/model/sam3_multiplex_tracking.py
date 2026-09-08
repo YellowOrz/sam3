@@ -144,7 +144,9 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             for i in range(len(stages)):
                 stages[i] = convert_my_tensors(stages[i])
 
-        # construct the final `BatchedDatapoint` and cast to GPU
+        # Keep decoded frames on their load device; only prompt tensors go to GPU.
+        with torch.profiler.record_function("Sam3MultiplexTracking.recursive_to"):
+            stages = recursive_to(stages, device, non_blocking=True)
         input_batch = BatchedDatapoint(
             img_batch=img_batch,
             find_text_batch=find_text_batch,
@@ -153,8 +155,6 @@ class Sam3MultiplexTracking(Sam3MultiplexBase):
             get_queries=None,
             find_metadatas=[None] * num_frames,
         )
-        with torch.profiler.record_function("Sam3MultiplexTracking.recursive_to"):
-            input_batch = recursive_to(input_batch, device, non_blocking=True)
         inference_state["input_batch"] = input_batch
 
         # construct the placeholder interactive prompts and tracking queries

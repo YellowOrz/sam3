@@ -40,6 +40,11 @@ class FakePredictor:
         if request["type"] == "clear_checkpoints":
             self.checkpoint_frames.clear()
             return {"is_success": True}
+        if request["type"] == "remove_object":
+            return {
+                "is_success": True,
+                "frame_index": request.get("frame_index", 0),
+            }
         obj_id = request.get("obj_id", 1)
         mask = np.zeros((8, 10), dtype=bool)
         mask[2:6, 3:8] = True
@@ -85,6 +90,18 @@ def test_reverse_progress_counts_down_absolute_frame_numbers() -> None:
     assert "0/10" in output.getvalue()
 
 
+def test_cuda_amp_prefers_bfloat16_when_supported(monkeypatch) -> None:
+    monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(qualitative.torch.cuda, "is_bf16_supported", lambda: True)
+    assert qualitative.cuda_amp_dtype() is torch.bfloat16
+
+
+def test_cuda_amp_falls_back_to_float16_without_bf16(monkeypatch) -> None:
+    monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(qualitative.torch.cuda, "is_bf16_supported", lambda: False)
+    assert qualitative.cuda_amp_dtype() is torch.float16
+
+
 def test_parser_has_no_interactive_switch() -> None:
     args = qualitative.build_parser().parse_args(
         ["--video", "input.mp4", "--output-dir", "output"]
@@ -93,7 +110,38 @@ def test_parser_has_no_interactive_switch() -> None:
     assert not hasattr(args, "interactive")
     assert not hasattr(args, "propagation_direction")
     assert args.checkpoint_interval == 20
+    assert args.chunk_frames == 0
     assert qualitative.WINDOW_FLAGS & cv2.WINDOW_GUI_NORMAL
+
+
+def test_chunk_frames_parser_and_ranges() -> None:
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            "input.mp4",
+            "--output-dir",
+            "output",
+            "--chunk-frames",
+            "500",
+        ]
+    )
+
+    assert args.chunk_frames == 500
+    assert qualitative.frame_ranges(2000, args.chunk_frames) == [
+        (0, 500),
+        (500, 1000),
+        (1000, 1500),
+        (1500, 2000),
+    ]
+    assert qualitative.frame_ranges(1001, 500)[-1] == (1000, 1001)
+    assert qualitative.chunk_frames_int("0") == 0
+    assert qualitative.chunk_frames_int("100") == 100
+    try:
+        qualitative.chunk_frames_int("99")
+    except qualitative.argparse.ArgumentTypeError:
+        pass
+    else:
+        raise AssertionError("chunk sizes below 100 should be rejected")
 
 
 def test_propagation_thread_binds_callers_cuda_device(monkeypatch) -> None:
@@ -235,7 +283,9 @@ def test_control_panel_draws_dynamic_timeline_and_all_buttons(tmp_path: Path) ->
     assert app.timeline_bounds[0] < app.timeline_bounds[1] < app.display_width - 20
     assert set(app.hitboxes) == {
         "play_backward",
+        "play_step_backward",
         "play_pause",
+        "play_step_forward",
         "play_forward",
         "prop_pause",
         "prop_backward",
@@ -285,6 +335,47 @@ def test_play_direction_clears_selection_but_keeps_draft_points(
     app.handle_control_click("play_forward")
     assert app.active_obj is None
     assert app.draft_points == [draft]
+
+
+def test_step_buttons_move_one_playable_frame_while_paused(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}}
+    app.display_index = 0
+    app.playing = False
+    app.active_obj = 7
+    draft = qualitative.PointEdit(1, 0, 7, 4, 3, 1)
+    app.draft_points = [draft]
+
+    app.handle_control_click("play_step_forward")
+    assert app.display_index == 1
+    assert not app.playing
+    assert app.active_obj == 7
+    assert app.draft_points == [draft]
+
+    app.handle_control_click("play_step_forward")
+    assert app.display_index == 1
+    assert app.status == "at playable frontier"
+
+    app.handle_control_click("play_step_backward")
+    assert app.display_index == 0
+    app.handle_control_click("play_step_backward")
+    assert app.display_index == 0
+    assert app.status == "at first frame"
+
+
+def test_step_buttons_are_ignored_while_playing(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}, 2: {}}
+    app.display_index = 1
+    app.playing = True
+    app.playback_direction = 1
+
+    app.handle_control_click("play_step_forward")
+    app.handle_control_click("play_step_backward")
+
+    assert app.display_index == 1
+    assert app.playing
+    assert app.status == "pause playback before stepping frames"
 
 
 def test_mouse_hitbox_uses_canvas_coordinates_below_video(tmp_path: Path) -> None:
@@ -590,6 +681,58 @@ def test_playback_can_show_processed_frames_marked_stale(tmp_path: Path) -> None
     app.advance_playback()
 
     assert app.display_index == 1
+
+
+def test_frame_status_overlay_draws_badge_and_border() -> None:
+    image = np.zeros((90, 220, 3), dtype=np.uint8)
+    qualitative.draw_frame_status_overlay(image, "stale")
+    fg = qualitative.FRAME_STATUS_STYLES["stale"]["fg"]
+
+    assert tuple(int(value) for value in image[0, 0]) == fg
+    assert tuple(int(value) for value in image[0, -1]) == fg
+
+
+def test_display_frame_status_current_stale_and_preview(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}}
+    app.stale_frames = {1}
+    app.display_index = 0
+    assert app.display_frame_status() == "current"
+
+    app.display_index = 1
+    assert app.display_frame_status() == "stale"
+
+    app.editing = True
+    app.edit_frame = 1
+    app.preview_signature = ((1, 1, 1, 2, 3, 1),)
+    assert app.display_frame_status() == "preview"
+
+
+def test_render_marks_stale_and_current_frames(tmp_path: Path, monkeypatch) -> None:
+    texts: list[str] = []
+    original_put_text = cv2.putText
+
+    def capture_text(image, text, *args):
+        texts.append(text)
+        return original_put_text(image, text, *args)
+
+    monkeypatch.setattr(cv2, "putText", capture_text)
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}}
+    app.stale_frames = {1}
+
+    app.display_index = 1
+    rendered = app.render()
+    assert "STALE" in texts
+    fg = qualitative.FRAME_STATUS_STYLES["stale"]["fg"]
+    assert tuple(int(value) for value in rendered[0, 0]) == fg
+
+    texts.clear()
+    app.display_index = 0
+    rendered = app.render()
+    assert "CURRENT" in texts
+    fg = qualitative.FRAME_STATUS_STYLES["current"]["fg"]
+    assert tuple(int(value) for value in rendered[0, 0]) == fg
 
 
 def test_forward_playback_stops_at_end(tmp_path: Path) -> None:
@@ -934,6 +1077,87 @@ def test_c_clears_all_interactions_and_restarts_text_propagation(
     assert "close_session" not in request_types
 
 
+def test_d_removes_selected_object_from_all_cached_frames(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    keep = np.ones((8, 10), dtype=bool)
+    drop = np.zeros((8, 10), dtype=bool)
+    drop[1:3, 1:3] = True
+    app.cache = {
+        0: {1: keep.copy(), 2: drop.copy()},
+        1: {1: keep.copy(), 2: drop.copy()},
+    }
+    app.probability_cache = {0: {1: 0.9, 2: 0.4}, 1: {1: 0.8, 2: 0.3}}
+    app.confirmed_points = [
+        qualitative.PointEdit(1, 0, 1, 4, 2, 1),
+        qualitative.PointEdit(2, 0, 2, 5, 3, 0),
+    ]
+    app.commits = [
+        qualitative.CommitRecord(0, ((0, 1),), (1,)),
+        qualitative.CommitRecord(0, ((0, 2),), (2,)),
+    ]
+    app.active_obj = 2
+    app.display_index = 1
+
+    assert app.handle_key(ord("d"))
+
+    assert 2 not in app.cache[0]
+    assert 2 not in app.cache[1]
+    assert 1 in app.cache[0] and 1 in app.cache[1]
+    assert app.probability_cache[0] == {1: 0.9}
+    assert [point.obj_id for point in app.confirmed_points] == [1]
+    assert app.commits == [qualitative.CommitRecord(0, ((0, 1),), (1,))]
+    assert app.active_obj is None
+    assert app.status == "removed obj 2"
+    request_types = [request["type"] for request in app.predictor.requests]
+    assert request_types.count("remove_object") == 1
+    assert "clear_checkpoints" in request_types
+    assert "save_checkpoint" in request_types
+    assert any(
+        event["type"] == "remove_object" and event["obj_id"] == 2
+        for event in app.events
+    )
+
+
+def test_d_discards_uncommitted_new_object_without_model_remove(
+    tmp_path: Path,
+) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {1: np.ones((8, 10), dtype=bool)}}
+    app.next_obj_id = 2
+    app.active_obj = None
+    app.add_point(4, 3, 1)
+    new_id = app.active_obj
+    assert new_id == 2
+    assert 2 in app.draft_new_obj_ids
+    app.predictor.requests.clear()
+
+    assert app.handle_key(ord("d"))
+
+    assert not app.editing
+    assert app.draft_points == []
+    assert app.status == f"discarded draft obj {new_id}"
+    assert not any(
+        request.get("type") == "remove_object" for request in app.predictor.requests
+    )
+    assert 1 in app.cache[0]
+
+
+def test_d_requires_selection_and_paused_playback(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {1: np.ones((8, 10), dtype=bool)}}
+    app.playing = True
+    app.active_obj = 1
+
+    assert app.handle_key(ord("d"))
+    assert 1 in app.cache[0]
+    assert app.status == "pause playback and propagation before editing"
+
+    app.playing = False
+    app.active_obj = None
+    assert app.handle_key(ord("d"))
+    assert app.status == "select an object before deleting"
+
+
 def test_mouse_clicks_and_keyboard_keys_are_logged(tmp_path: Path, capsys) -> None:
     app = make_app(tmp_path)
     app.select_object = lambda x, y: None
@@ -1040,6 +1264,74 @@ def test_interactive_outputs_write_mask_video_and_metadata(tmp_path: Path) -> No
     interactions = json.loads(interactions_path.read_text(encoding="utf-8"))
     assert interactions["propagation_direction"] == "forward"
     assert interactions["confirmed_points"][0]["frame_index"] == 1
+
+
+def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
+    tmp_path: Path,
+) -> None:
+    chunks = []
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[2:6, 3:8] = True
+    for chunk_index, (start, frame_count) in enumerate(((0, 2), (2, 1)), 1):
+        chunk_root = tmp_path / f"chunk-{chunk_index}"
+        chunk_root.mkdir()
+        app = make_app(chunk_root)
+        app.frame_count = frame_count
+        app.video_info = qualitative.VideoInfo(10, 8, frame_count, 12.0)
+        app.frame_offset = start
+        app.cache = {index: {1: mask} for index in range(frame_count)}
+        app.probability_cache = {index: {1: 0.75} for index in range(frame_count)}
+        app.confirmed_points = [qualitative.PointEdit(1, 0, 1, 4, 3, 1)]
+        app.events = [
+            {
+                "sequence": 1,
+                "type": "confirm",
+                "frame_index": 0,
+                "point_sequences": [1],
+            }
+        ]
+        qualitative.write_interactive_outputs(app)
+        chunks.append((start, start + frame_count, app.output_dir))
+
+    output_dir = tmp_path / "merged"
+    qualitative.merge_chunk_outputs(
+        chunks,
+        output_dir,
+        tmp_path / "input.mp4",
+        qualitative.VideoInfo(10, 8, 3, 12.0),
+        "hand",
+        "sam3.1",
+        2,
+    )
+
+    capture = cv2.VideoCapture(str(output_dir / "result.mp4"))
+    try:
+        assert capture.isOpened()
+        assert int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) == 3
+    finally:
+        capture.release()
+    metadata = json.loads((output_dir / "metadata.json").read_text())
+    assert metadata["frames_processed"] == 3
+    assert [
+        (chunk["start_frame"], chunk["end_frame_exclusive"])
+        for chunk in metadata["chunks"]
+    ] == [
+        (0, 2),
+        (2, 3),
+    ]
+    interactions = json.loads((output_dir / "interactions.json").read_text())
+    assert [point["frame_index"] for point in interactions["confirmed_points"]] == [
+        0,
+        2,
+    ]
+    assert [point["sequence"] for point in interactions["confirmed_points"]] == [
+        1,
+        2,
+    ]
+    assert [event["point_sequences"] for event in interactions["events"]] == [
+        [1],
+        [2],
+    ]
 
 
 def test_existing_output_requires_overwrite(tmp_path: Path) -> None:
