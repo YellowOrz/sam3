@@ -30,108 +30,105 @@ class Sam3TrackerBase(torch.nn.Module):
         backbone,
         transformer,
         maskmem_backbone,
-        num_maskmem=7,  # default 1 input frame + 6 previous frames as in CAE
+        num_maskmem=7,  # 默认 1 个输入帧 + 6 个历史帧，与 CAE 一致
         image_size=1008,
-        backbone_stride=14,  # stride of the image backbone output
-        # The maximum number of conditioning frames to participate in the memory attention (-1 means no limit; if there are more conditioning frames than this limit,
-        # we only cross-attend to the temporally closest `max_cond_frames_in_attn` conditioning frames in the encoder when tracking each frame). This gives the model
-        # a temporal locality when handling a large number of annotated frames (since closer frames should be more important) and also avoids GPU OOM.
+        backbone_stride=14,  # 图像 backbone 输出的步长
+        # 参与 memory attention 的最大条件帧数量（-1 表示不限制；若条件帧超过该上限，
+        # 跟踪每一帧时编码器仅与时间上最近的 `max_cond_frames_in_attn` 个条件帧做交叉注意力）。这使模型
+        # 在处理大量标注帧时具有时间局部性（更近的帧应更重要），同时也能避免 GPU OOM。
         max_cond_frames_in_attn=-1,
-        # Whether to always keep the first conditioning frame in case we exceed the maximum number of conditioning frames allowed
+        # 当条件帧数量超过上限时，是否始终保留第一帧条件帧
         keep_first_cond_frame=False,
-        # whether to output multiple (3) masks for the first click on initial conditioning frames
+        # 是否对初始条件帧上的首次点击输出多个（3 个）掩码
         multimask_output_in_sam=False,
-        # the minimum and maximum number of clicks to use multimask_output_in_sam (only relevant when `multimask_output_in_sam=True`;
-        # default is 1 for both, meaning that only the first click gives multimask output; also note that a box counts as two points)
+        # 启用 multimask_output_in_sam 的最小与最大点击数（仅在 `multimask_output_in_sam=True` 时有效；
+        # 默认均为 1，表示仅首次点击产生多掩码输出；另请注意一个框计为两个点）
         multimask_min_pt_num=1,
         multimask_max_pt_num=1,
-        # whether to also use multimask output for tracking (not just for the first click on initial conditioning frames; only relevant when `multimask_output_in_sam=True`)
+        # 是否在跟踪时也使用多掩码输出（不仅限于初始条件帧上的首次点击；仅在 `multimask_output_in_sam=True` 时有效）
         multimask_output_for_tracking=False,
-        # whether to forward image features per frame (as it's being tracked) during evaluation, instead of forwarding image features
-        # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
+        # 评估时是否按帧（边跟踪边）前向计算图像特征，而不是一次性前向所有帧的图像特征。
+        # 这可避免评估超长视频时 backbone OOM，但可能稍慢。
         forward_backbone_per_frame_for_eval=False,
-        # The memory bank's temporal stride during evaluation (i.e. the `r` parameter in XMem and Cutie; XMem and Cutie use r=5).
-        # For r>1, the (self.num_maskmem - 1) non-conditioning memory frames consist of
-        # (self.num_maskmem - 2) nearest frames from every r-th frames, plus the last frame.
+        # 评估时 memory bank 的时间步长（即 XMem 与 Cutie 中的 `r` 参数；XMem 与 Cutie 使用 r=5）。
+        # 当 r>1 时，(self.num_maskmem - 1) 个非条件 memory 帧由
+        # 每隔 r 帧取最近的 (self.num_maskmem - 2) 帧，再加上最后一帧组成。
         memory_temporal_stride_for_eval=1,
-        # whether to offload outputs to CPU memory during evaluation, to avoid GPU OOM on very long videos or very large resolutions or too many objects
-        # (it's recommended to use `forward_backbone_per_frame_for_eval=True` first before setting this option to True)
+        # 评估时是否将输出卸载到 CPU 内存，以避免超长视频、超大分辨率或对象过多时 GPU OOM
+        # （建议先启用 `forward_backbone_per_frame_for_eval=True`，再将此选项设为 True）
         offload_output_to_cpu_for_eval=False,
-        # whether to trim the output of past non-conditioning frames (num_maskmem frames before the current frame) during evaluation
-        # (this helps save GPU or CPU memory on very long videos for semi-supervised VOS eval, where only the first frame receives prompts)
+        # 评估时是否裁剪过去非条件帧的输出（当前帧之前的 num_maskmem 帧）
+        # （有助于在半监督 VOS 评估的超长视频上节省 GPU 或 CPU 内存，此类评估仅第一帧接收提示）
         trim_past_non_cond_mem_for_eval=False,
-        # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
+        # 评估时是否在 memory encoder 中对对象掩码施加非重叠约束（以避免/缓解掩码叠加）
         non_overlap_masks_for_mem_enc=False,
-        # the maximum number of object pointers from other frames in encoder cross attention
+        # 编码器交叉注意力中来自其他帧的对象指针的最大数量
         max_obj_ptrs_in_encoder=16,
-        # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
+        # 用于构造 SAM mask decoder 的额外参数；若不为 None，应为传入 `MaskDecoder` 类的 kwargs 字典
         sam_mask_decoder_extra_args=None,
-        # whether to compile all the model compoents
+        # 是否编译所有模型组件
         compile_all_components=False,
-        # select the frame with object existence
+        # 选择存在对象的帧
         use_memory_selection=False,
-        # when using memory selection, the threshold to determine if the frame is good
+        # 使用 memory selection 时，判断帧是否良好的阈值
         mf_threshold=0.01,
     ):
         super().__init__()
 
-        # Part 1: the image backbone
+        # 第 1 部分：图像 backbone
         self.backbone = backbone
         self.num_feature_levels = 3
         self.max_obj_ptrs_in_encoder = max_obj_ptrs_in_encoder
-        # A conv layer to downsample the GT mask prompt to stride 4 (the same stride as
-        # low-res SAM mask logits) and to change its scales from 0~1 to SAM logit scale,
-        # so that it can be fed into the SAM mask decoder to generate a pointer.
+        # 一个卷积层，将 GT 掩码提示下采样到步长 4（与低分辨率 SAM 掩码 logits 相同），
+        # 并将其尺度从 0~1 转换为 SAM logit 尺度，以便送入 SAM mask decoder 生成指针。
         self.mask_downsample = torch.nn.Conv2d(1, 1, kernel_size=4, stride=4)
 
-        # Part 2: encoder-only transformer to fuse current frame's visual features
-        # with memories from past frames
+        # 第 2 部分：仅含编码器的 transformer，用于融合当前帧视觉特征与过去帧的记忆
         assert transformer.decoder is None, "transformer should be encoder-only"
         self.transformer = transformer
         self.hidden_dim = transformer.d_model
 
-        # Part 3: memory encoder for the previous frame's outputs
+        # 第 3 部分：用于编码上一帧输出的 memory encoder
         self.maskmem_backbone = maskmem_backbone
         self.mem_dim = self.hidden_dim
         if hasattr(self.maskmem_backbone, "out_proj") and hasattr(
             self.maskmem_backbone.out_proj, "weight"
         ):
-            # if there is compression of memories along channel dim
+            # 若记忆在通道维度上有压缩
             self.mem_dim = self.maskmem_backbone.out_proj.weight.shape[0]
-        self.num_maskmem = num_maskmem  # Number of memories accessible
+        self.num_maskmem = num_maskmem  # 可访问的记忆数量
 
-        # Temporal encoding of the memories
+        # 记忆的时间编码
         self.maskmem_tpos_enc = torch.nn.Parameter(
             torch.zeros(num_maskmem, 1, 1, self.mem_dim)
         )
         trunc_normal_(self.maskmem_tpos_enc, std=0.02)
 
-        # a single token to indicate no memory embedding from previous frames
+        # 用于表示没有来自过去帧的记忆嵌入的单个 token
         self.no_mem_embed = torch.nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
         self.no_mem_pos_enc = torch.nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
         trunc_normal_(self.no_mem_embed, std=0.02)
         trunc_normal_(self.no_mem_pos_enc, std=0.02)
-        # Apply sigmoid to the output raw mask logits (to turn them from
-        # range (-inf, +inf) to range (0, 1)) before feeding them into the memory encoder
+        # 在送入 memory encoder 之前，对输出的原始掩码 logits 施加 sigmoid
+        # （将其从 (-inf, +inf) 映射到 (0, 1)）
         self.sigmoid_scale_for_mem_enc = 20.0
         self.sigmoid_bias_for_mem_enc = -10.0
         self.non_overlap_masks_for_mem_enc = non_overlap_masks_for_mem_enc
         self.memory_temporal_stride_for_eval = memory_temporal_stride_for_eval
-        # On frames with mask input, whether to directly output the input mask without
-        # using a SAM prompt encoder + mask decoder
+        # 在有掩码输入的帧上，是否直接输出输入掩码，而不使用 SAM prompt encoder + mask decoder
         self.multimask_output_in_sam = multimask_output_in_sam
         self.multimask_min_pt_num = multimask_min_pt_num
         self.multimask_max_pt_num = multimask_max_pt_num
         self.multimask_output_for_tracking = multimask_output_for_tracking
 
-        # Part 4: SAM-style prompt encoder (for both mask and point inputs)
-        # and SAM-style mask decoder for the final mask output
+        # 第 4 部分：SAM 风格的 prompt encoder（同时支持掩码与点输入）
+        # 以及用于最终掩码输出的 SAM 风格 mask decoder
         self.image_size = image_size
         self.backbone_stride = backbone_stride
         self.low_res_mask_size = self.image_size // self.backbone_stride * 4
-        # we resize the mask if it doesn't match `self.input_mask_size` (which is always 4x
-        # the low-res mask size, regardless of the actual input image size); this is because
-        # `_use_mask_as_output` always downsamples the input masks by 4x
+        # 若掩码尺寸与 `self.input_mask_size` 不匹配则进行缩放（该尺寸始终为低分辨率掩码
+        # 尺寸的 4 倍，与实际输入图像尺寸无关）；这是因为 `_use_mask_as_output` 始终会将
+        # 输入掩码下采样 4 倍
         self.input_mask_size = self.low_res_mask_size * 4
         self.forward_backbone_per_frame_for_eval = forward_backbone_per_frame_for_eval
         self.offload_output_to_cpu_for_eval = offload_output_to_cpu_for_eval
@@ -146,11 +143,11 @@ class Sam3TrackerBase(torch.nn.Module):
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
         self.keep_first_cond_frame = keep_first_cond_frame
 
-        # Use frame filtering according to SAM2Long
+        # 按 SAM2Long 方式使用帧筛选
         self.use_memory_selection = use_memory_selection
         self.mf_threshold = mf_threshold
 
-        # Compile all components of the model
+        # 编译模型的所有组件
         self.compile_all_components = compile_all_components
         if self.compile_all_components:
             self._compile_all_components()

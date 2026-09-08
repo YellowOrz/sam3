@@ -426,10 +426,9 @@ class Sam3VideoBase(nn.Module):
         """
 
         # 第一步的结果只包含“当前可检测到什么”，尚未决定它是否为已有对象。
-        # a MultiGPU model (assigned to `self.detector`) that shards frames in a round-robin manner.
-        # It returns a "det_out" dict for `frame_idx` and fills SAM2 backbone features for `frame_idx`
-        # into `feature_cache`. Despite its distributed inference under the hood, the results would be
-        # the same as if it is running backbone and detector for every frame on a single GPU.
+        # 由分配给 `self.detector` 的多 GPU 模型以轮询方式分片处理帧。
+        # 它返回 `frame_idx` 的 "det_out" 字典，并将该帧的 SAM2 backbone 特征填入 `feature_cache`。
+        # 尽管底层是分布式推理，结果与在单 GPU 上对每一帧运行 backbone 和检测器相同。
         det_out = self.run_backbone_and_detection(
             frame_idx=frame_idx,
             num_frames=num_frames,
@@ -441,12 +440,11 @@ class Sam3VideoBase(nn.Module):
         )
 
         # 第二步只读取已有 memory 进行传播；memory 更新必须等关联和抑制规则完成后再做。
-        # the returned `tracker_low_res_masks_global` contains the concatenated masklet predictions
-        # gathered from all GPUs (as if they are propagated on a single GPU). Note that this step only
-        # runs the SAM2 propagation step, but doesn't encode new memory for the predicted masks;
-        # we defer memory encoding to `run_tracker_update_execution_phase` after resolving all heuristics.
+        # 返回的 `tracker_low_res_masks_global` 包含从所有 GPU 收集并拼接的 masklet 预测
+        # （效果等同于在单 GPU 上传播）。注意本步只运行 SAM2 传播，不会为预测掩码编码新 memory；
+        # 我们在解析完所有启发式规则后，将 memory 编码推迟到 `run_tracker_update_execution_phase`。
         if tracker_metadata_prev == {}:
-            # initialize masklet metadata if it's uninitialized (empty dict)
+            # 若 masklet 元数据尚未初始化（空字典），则进行初始化
             tracker_metadata_prev.update(self._initialize_metadata())
         tracker_low_res_masks_global, tracker_obj_scores_global = (
             self.run_tracker_propagation(
@@ -459,12 +457,11 @@ class Sam3VideoBase(nn.Module):
         )
 
         # 第三步由 rank 0 将检测和跟踪结果关联，统一决定新增、删除、重条件化和负载分配。
-        # for SAM2 masklet updates (i.e. which objects to add and remove, how to load-balance them, etc).
-        # We also run SAM2 memory encoder globally in this step to resolve non-overlapping constraints.
-        # **This step should involve all the heuristics needed for any updates.** Most of the update
-        # planning will be done on the master rank (GPU 0) and the resulting plan `tracker_update_plan` is
-        # broadcasted to other GPUs (to be executed in a distributed manner). This step also generates the
-        # new masklet metadata `tracker_metadata_new` (based on its previous version `tracker_metadata_prev`).
+        # 用于 SAM2 masklet 更新（即新增/删除哪些对象、如何负载均衡等）。
+        # 本步还会全局运行 SAM2 memory encoder，以处理非重叠约束。
+        # **本步应包含更新所需的全部启发式规则。** 大部分更新规划在主 rank（GPU 0）完成，
+        # 得到的计划 `tracker_update_plan` 会广播到其他 GPU（以分布式方式执行）。
+        # 本步还会基于上一版 `tracker_metadata_prev` 生成新的 masklet 元数据 `tracker_metadata_new`。
         tracker_update_plan, tracker_metadata_new = (
             self.run_tracker_update_planning_phase(
                 frame_idx=frame_idx,
@@ -479,7 +476,7 @@ class Sam3VideoBase(nn.Module):
             )
         )
 
-        # Get reconditioning info from the update plan
+        # 从更新计划中获取重条件化信息
         reconditioned_obj_ids = tracker_update_plan.get("reconditioned_obj_ids", set())
         det_to_matched_trk_obj_ids = tracker_update_plan.get(
             "det_to_matched_trk_obj_ids", {}
@@ -500,7 +497,7 @@ class Sam3VideoBase(nn.Module):
         )
 
         # 第五步只在 rank 0 组装客户端输出；其他 rank 的占位结果不会离开进程组。
-        # only GPU 0 will send outputs to the server).
+        # 只有 GPU 0 会将输出发送到服务器。
         if self.rank == 0:
             obj_id_to_mask = self.build_outputs(
                 frame_idx=frame_idx,
@@ -521,27 +518,27 @@ class Sam3VideoBase(nn.Module):
             )
             obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
         else:
-            obj_id_to_mask, obj_id_to_score = {}, {}  # dummy outputs on other GPUs
-        # a few statistics for the current frame as a part of the output
+            obj_id_to_mask, obj_id_to_score = {}, {}  # 其他 GPU 上的占位输出
+        # 当前帧的若干统计信息，作为输出的一部分
         frame_stats = {
             "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),
             "num_obj_dropped": tracker_update_plan["num_obj_dropped_due_to_limit"],
         }
-        # add tracker scores to metadata, it should be fired for frames except the first frame
+        # 将 tracker 分数写入元数据；除第一帧外都应执行
         if tracker_obj_scores_global.shape[0] > 0:
-            # Convert tracker_obj_scores_global to sigmoid scores before updating
+            # 更新前将 tracker_obj_scores_global 转换为 sigmoid 分数
             tracker_obj_scores_global = tracker_obj_scores_global.sigmoid().tolist()
             tracker_obj_ids = tracker_metadata_prev["obj_ids_all_gpu"]
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][
                 frame_idx
             ].update(dict(zip(tracker_obj_ids, tracker_obj_scores_global)))
         return (
-            obj_id_to_mask,  # a dict: obj_id --> output mask
-            obj_id_to_score,  # a dict: obj_id --> output score (prob)
+            obj_id_to_mask,  # 字典：obj_id --> 输出掩码
+            obj_id_to_score,  # 字典：obj_id --> 输出分数（概率）
             tracker_states_local_new,
             tracker_metadata_new,
             frame_stats,
-            tracker_obj_scores_global,  # a dict: obj_id --> tracker frame-level scores
+            tracker_obj_scores_global,  # 字典：obj_id --> tracker 帧级分数
         )
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):
