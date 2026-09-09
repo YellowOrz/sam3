@@ -73,7 +73,19 @@ class LearnedPromptContractTests(unittest.TestCase):
                 module.parse_args(arguments)
             self.assertEqual(output.read_bytes(), b"existing")
 
-    def test_selected_category_excludes_other_gt_and_retains_negatives(self):
+    def test_cuda_ids_parse_multi_gpu_device_string(self):
+        tree = ast.parse((ROOT / "sam3/train/learned_prompt.py").read_text())
+        node = next(
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "_cuda_ids"
+        )
+        namespace = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "cuda_ids", "exec"), namespace)
+        parse = namespace["_cuda_ids"]
+        self.assertEqual(parse("cuda:1,2,3"), [1, 2, 3])
+        self.assertEqual(parse("cuda:1"), [1])
+        self.assertEqual(parse("cpu"), None)
         # Execute the real native loader and TargetCOCO class with only tensor/RLE
         # helpers substituted; this check exercises their actual query generation.
         import collections

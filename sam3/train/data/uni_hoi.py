@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import shutil
 import subprocess
 from pathlib import Path
@@ -12,6 +13,11 @@ import numpy as np
 from pycocotools import mask as mask_util
 
 from sam3.train.data.coco_json_loaders import COCO_FROM_JSON
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 HAND_KINDS = frozenset({"hand_left", "hand_right"})
 MaskDecoder = Callable[[Path, int, int], Iterable[np.ndarray]]
@@ -127,15 +133,95 @@ def _encode_instance(mask: np.ndarray, instance_id: int) -> Optional[dict]:
     }
 
 
+def _index_cache_path(root: Path, split_name: str, kind: str, category_id: int) -> Path:
+    return root / "metadata" / f"uni_hoi_index-{split_name}-{kind}-{category_id}.pkl"
+
+
+def _index_fingerprint(root: Path) -> list:
+    paths = [root / "metadata" / "split.json"]
+    paths.extend(sorted(root.glob("sequences/*/*/sequence.json")))
+    paths.extend(sorted(root.glob("sequences/*/*/*/mask.mkv")))
+    paths.extend(sorted(root.glob("sequences/*/*/*/instances.json")))
+    return [
+        (str(path.relative_to(root)), path.stat().st_mtime_ns)
+        for path in paths
+        if path.is_file()
+    ]
+
+
+def _read_index_cache(path: Path, fingerprint: list) -> Optional[List[Dict]]:
+    if not path.is_file():
+        return None
+    try:
+        payload = pickle.loads(path.read_bytes())
+    except (OSError, pickle.UnpicklingError, AttributeError, EOFError):
+        return None
+    if not isinstance(payload, dict) or payload.get("fingerprint") != fingerprint:
+        return None
+    raw_data = payload.get("raw_data")
+    return raw_data if isinstance(raw_data, list) and raw_data else None
+
+
+def _write_index_cache(path: Path, fingerprint: list, raw_data: List[Dict]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(
+        pickle.dumps({"fingerprint": fingerprint, "raw_data": raw_data}, protocol=4)
+    )
+    temporary.replace(path)
+
+
 def build_uni_hoi_raw_data(
     root: Path,
     split_name: str,
     kind: str,
     category_id: int,
     decode_mask: MaskDecoder = iter_mask_frames,
+    cache: Optional[bool] = None,
 ) -> List[Dict]:
     if kind not in HAND_KINDS:
         raise ValueError(f"kind must be hand_left or hand_right, got {kind}")
+    if cache is None:
+        cache = decode_mask is iter_mask_frames
+    if cache:
+        cache_path = _index_cache_path(root, split_name, kind, category_id)
+        fingerprint = _index_fingerprint(root)
+        lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = lock_path.open("a+")
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            pass
+        else:
+            try:
+                cached = _read_index_cache(cache_path, fingerprint)
+                if cached is not None:
+                    print(
+                        f"Loaded cached {split_name} index ({len(cached)} frames)",
+                        flush=True,
+                    )
+                    return cached
+                raw_data = _scan_uni_hoi_raw_data(
+                    root, split_name, kind, category_id, decode_mask
+                )
+                try:
+                    _write_index_cache(cache_path, fingerprint, raw_data)
+                except OSError:
+                    pass
+                return raw_data
+            finally:
+                lock.close()
+    return _scan_uni_hoi_raw_data(root, split_name, kind, category_id, decode_mask)
+
+
+def _scan_uni_hoi_raw_data(
+    root: Path,
+    split_name: str,
+    kind: str,
+    category_id: int,
+    decode_mask: MaskDecoder,
+) -> List[Dict]:
     split_path = root / "metadata" / "split.json"
     split_index = json.loads(split_path.read_text(encoding="utf-8"))
     raw_data: List[Dict] = []

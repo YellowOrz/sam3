@@ -8,7 +8,14 @@ addmm_act_op = torch.ops.aten._addmm_activation
 
 
 def addmm_act(activation, linear, mat1):
-    if torch.is_grad_enabled():
+    # Fused kernel is not in autograd. Global grad can still be on when every
+    # input is a constant (frozen ViT during learned-prompt training).
+    needs_grad = torch.is_grad_enabled() and (
+        mat1.requires_grad
+        or linear.weight.requires_grad
+        or (linear.bias is not None and linear.bias.requires_grad)
+    )
+    if needs_grad:
         raise ValueError("Expected grad to be disabled.")
     self = linear.bias.detach()
     mat2 = linear.weight.detach()

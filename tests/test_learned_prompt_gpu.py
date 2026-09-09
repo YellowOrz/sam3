@@ -69,6 +69,7 @@ def test_real_sam3_positive_negative_training_and_resume(tmp_path, monkeypatch):
         )
     )
     config = OmegaConf.load(ROOT / "sam3/train/configs/learned_prompt.yaml")
+    config.device = "cuda:0"
     config.checkpoint = checkpoint
     config.initial_feature = str(feature_file)
     config.target_id = "target"

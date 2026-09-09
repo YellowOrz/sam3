@@ -1,19 +1,21 @@
 # python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.yaml
-checkpoint: /path/to/sam3.pt
-initial_feature: /path/to/right_hand_initial.pt
+checkpoint: /data0/xuzhefeng/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt
+initial_feature: /data0/xuzhefeng/Datasets/uni-hoi-dataset/right_hand_initial.pt
 target_id: right_hand
 kind: hand_right
 category_id: 1
 output_dir: outputs/learned_right_hand
-dataset_root: ~/Datasets/uni-hoi-dataset
-device: cuda:0
+dataset_root: /data0/xuzhefeng/Datasets/uni-hoi-dataset
+# Physical GPU ids. One id is single-process; several ids spawn DDP.
+device: cuda:1,2,3
 epochs: 20
-batch_size: 1
-num_workers: 0
-lr: 0.001
+batch_size: 8
+num_workers: 16
+lr: 0.0003
 max_grad_norm: 1.0
 amp: true
 seed: 0
+tensorboard_interval: 100
 train:
   split: train
 # Set val: null only if no held-out annotations are available.

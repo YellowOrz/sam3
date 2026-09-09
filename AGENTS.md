@@ -7,6 +7,7 @@
 ## 自定义视频脚本
 
 - `process_dataset_videos.py`：递归查找 `color.mp4`，用统一文本提示执行 SAM 3/3.1 分割并保留目录结构。先用 `--list-only` 核对输入；示例：`python scripts/process_dataset_videos.py --input-root DATA --output-root OUT --version sam3.1 --prompt hand --device cuda:0`。
+- `process_learned_prompt_videos.py`：同一目录约定，用训练好的目标特征文件做无文本 SAM 3 分割（不支持 3.1）。示例：`python scripts/process_learned_prompt_videos.py --input-root DATA --output-root OUT --learned-prompt outputs/learned_left_hand/best.pt --checkpoint /path/to/sam3.pt --device cuda:0`。
 - `process_bidirectional_videos.py`：基础 SAM3 单 GPU、严格零训练的双向 memory 融合。隔离正反向建库，再联合读取记忆并单次解码；源库不写回，不再使用 Viterbi。默认物理倒序；`--chunk-frames 120 --context-frames 30` 启用重叠分块，核心帧唯一归属。例：`python scripts/process_bidirectional_videos.py --input-root DATA --output-root OUT --prompt "left hand" --device cuda:0 --checkpoint /path/to/sam3.pt`。详细限制和消融见 `docs/bidirectional_hand_segmentation_research.md`。
 - `process_hand_video_with_wilor_prompts.py`：处理单个目录中的 `color.mp4` 和 `MANO_wilor_occlusion/hand_joints_occlusion.jsonl`，用 WiLoR 关节迭代修正指定侧手的 SAM 分割。正点必须是落在上一轮目标掩码内的可见目标手关节；`--segmentation-passes` 默认为 2，设为 1 时仅运行文本分割。示例：`uv run scripts/process_hand_video_with_wilor_prompts.py --input-dir DATA --output-dir OUT --hand-side left --version sam3 --segmentation-passes 2 --device cuda:0`。
 - `compare_dataset_videos.py`：按共同的 `result.mp4` 相对路径，将多个提示词输出拼成带标签的对比视频。至少传入两个输出根目录，并用 `--output-dir` 指定目标；自动布局不合适时传 `--grid 2x2`。

@@ -53,6 +53,26 @@ def test_direction_choices_and_expansion() -> None:
         parser.parse_args(["--prompt", "hand", "--direction", "sideways"])
 
 
+def test_add_prompt_request_switches_text_and_learned() -> None:
+    text = processor.add_prompt_request("s", 3, "hand", "text")
+    learned = processor.add_prompt_request("s", 3, "left_hand", "learned")
+
+    assert text == {
+        "type": "add_prompt",
+        "session_id": "s",
+        "frame_index": 3,
+        "text": "hand",
+    }
+    assert learned == {
+        "type": "add_learned_prompt",
+        "session_id": "s",
+        "frame_index": 3,
+        "target_id": "left_hand",
+    }
+    with pytest.raises(ValueError, match="unsupported prompt request type"):
+        processor.add_prompt_request("s", 0, "hand", "box")
+
+
 def test_backward_propagation_writes_result_in_forward_playback_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

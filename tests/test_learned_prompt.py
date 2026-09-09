@@ -102,6 +102,21 @@ def test_feature_and_optimizer_resume(tmp_path):
         learned.LearnedPrompt.load(path, base)
 
 
+def test_fused_mlp_allows_global_grad_when_tensors_are_frozen():
+    from sam3.perflib.fused import addmm_act
+
+    linear = torch.nn.Linear(8, 8)
+    linear.requires_grad_(False)
+    inputs = torch.randn(2, 8)
+    with torch.enable_grad():
+        output = addmm_act(torch.nn.GELU, linear, inputs)
+    assert output.shape == (2, 8)
+    assert not output.requires_grad
+    linear.weight.requires_grad_(True)
+    with torch.enable_grad(), pytest.raises(ValueError, match="grad"):
+        addmm_act(torch.nn.GELU, linear, inputs)
+
+
 @pytest.mark.parametrize("bad", ["shape", "mask", "all_masked", "nan", "target"])
 def test_invalid_features_rejected(bad):
     features, mask, target = (

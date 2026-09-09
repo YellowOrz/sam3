@@ -431,6 +431,29 @@ def propagate_and_write(
     return object_to_label
 
 
+def add_prompt_request(
+    session_id: str,
+    frame_index: int,
+    prompt: str,
+    prompt_request_type: str,
+) -> Dict[str, Any]:
+    if prompt_request_type == "learned":
+        return {
+            "type": "add_learned_prompt",
+            "session_id": session_id,
+            "frame_index": frame_index,
+            "target_id": prompt,
+        }
+    if prompt_request_type == "text":
+        return {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": frame_index,
+            "text": prompt,
+        }
+    raise ValueError(f"unsupported prompt request type: {prompt_request_type}")
+
+
 def process_video(
     predictor: Any,
     video_path: Path,
@@ -441,6 +464,8 @@ def process_video(
     max_frames: Optional[int],
     overwrite: bool,
     direction: str,
+    prompt_request_type: str = "text",
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
@@ -469,6 +494,8 @@ def process_video(
         "frames_processed": 0,
         "object_id_to_label": {},
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
     write_json(metadata_path, metadata)
 
     started = time.monotonic()
@@ -488,12 +515,12 @@ def process_video(
             )
             session_id = session_response["session_id"]
             predictor.handle_request(
-                {
-                    "type": "add_prompt",
-                    "session_id": session_id,
-                    "frame_index": 0 if direction == "forward" else frame_count - 1,
-                    "text": prompt,
-                }
+                add_prompt_request(
+                    session_id,
+                    0 if direction == "forward" else frame_count - 1,
+                    prompt,
+                    prompt_request_type,
+                )
             )
             object_to_label = propagate_and_write(
                 predictor=predictor,
@@ -551,6 +578,66 @@ def process_video(
                 )
             except Exception:
                 LOGGER.exception("Failed to close session %s", session_id)
+
+
+def require_cuda(device_name: str, device_index: int) -> bool:
+    import torch
+
+    if not torch.cuda.is_available():
+        LOGGER.error("CUDA is required by the SAM 3 video predictor")
+        return False
+    if device_index >= torch.cuda.device_count():
+        LOGGER.error(
+            "Requested %s, but only %d CUDA device(s) are visible",
+            device_name,
+            torch.cuda.device_count(),
+        )
+        return False
+    torch.cuda.set_device(device_index)
+    return True
+
+
+def run_sequences(
+    predictor: Any,
+    videos: List[Path],
+    input_root: Path,
+    output_root: Path,
+    prompt: str,
+    model_version: str,
+    max_frames: Optional[int],
+    overwrite: bool,
+    requested_direction: str,
+    prompt_request_type: str = "text",
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, int]:
+    counts = {"success": 0, "skipped": 0, "failed": 0}
+    directions = processing_directions(requested_direction)
+    for index, video_path in enumerate(videos, start=1):
+        base_output_dir = output_dir_for(video_path, input_root, output_root)
+        LOGGER.info("[%d/%d] Processing %s", index, len(videos), video_path)
+        for direction in directions:
+            output_dir = directional_output_dir(
+                base_output_dir, requested_direction, direction
+            )
+            try:
+                status = process_video(
+                    predictor=predictor,
+                    video_path=video_path,
+                    output_dir=output_dir,
+                    input_root=input_root,
+                    prompt=prompt,
+                    model_version=model_version,
+                    max_frames=max_frames,
+                    overwrite=overwrite,
+                    direction=direction,
+                    prompt_request_type=prompt_request_type,
+                    extra_metadata=extra_metadata,
+                )
+                counts[status] += 1
+            except Exception:
+                counts["failed"] += 1
+                LOGGER.exception("Sequence failed (%s): %s", direction, video_path)
+    return counts
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -628,19 +715,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.error("Checkpoint does not exist: %s", checkpoint)
         return 2
 
-    import torch
-
-    if not torch.cuda.is_available():
-        LOGGER.error("CUDA is required by the SAM 3 video predictor")
+    if not require_cuda(device_name, device_index):
         return 2
-    if device_index >= torch.cuda.device_count():
-        LOGGER.error(
-            "Requested %s, but only %d CUDA device(s) are visible",
-            device_name,
-            torch.cuda.device_count(),
-        )
-        return 2
-    torch.cuda.set_device(device_index)
     checkpoint_description = str(checkpoint) if checkpoint else "HuggingFace"
     LOGGER.info(
         "Loading %s on %s from %s",
@@ -655,32 +731,18 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if checkpoint is not None:
         build_kwargs["checkpoint_path"] = str(checkpoint)
     predictor = build_sam3_predictor(**build_kwargs)
-    counts = {"success": 0, "skipped": 0, "failed": 0}
     try:
-        directions = processing_directions(args.direction)
-        for index, video_path in enumerate(videos, start=1):
-            base_output_dir = output_dir_for(video_path, input_root, output_root)
-            LOGGER.info("[%d/%d] Processing %s", index, len(videos), video_path)
-            for direction in directions:
-                output_dir = directional_output_dir(
-                    base_output_dir, args.direction, direction
-                )
-                try:
-                    status = process_video(
-                        predictor=predictor,
-                        video_path=video_path,
-                        output_dir=output_dir,
-                        input_root=input_root,
-                        prompt=args.prompt,
-                        model_version=args.version,
-                        max_frames=args.max_frames,
-                        overwrite=args.overwrite,
-                        direction=direction,
-                    )
-                    counts[status] += 1
-                except Exception:
-                    counts["failed"] += 1
-                    LOGGER.exception("Sequence failed (%s): %s", direction, video_path)
+        counts = run_sequences(
+            predictor=predictor,
+            videos=videos,
+            input_root=input_root,
+            output_root=output_root,
+            prompt=args.prompt,
+            model_version=args.version,
+            max_frames=args.max_frames,
+            overwrite=args.overwrite,
+            requested_direction=args.direction,
+        )
     finally:
         predictor.shutdown()
 

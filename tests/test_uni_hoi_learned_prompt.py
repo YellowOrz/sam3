@@ -101,6 +101,26 @@ def test_frame_map_and_subject_split():
     )
 
 
+def test_index_cache_scans_once(tmp_path):
+    write_mini_dataset(tmp_path)
+    calls = {"n": 0}
+
+    def counting_decode(path, width, height):
+        calls["n"] += 1
+        return decode_mini(path, width, height)
+
+    first = build_uni_hoi_raw_data(
+        tmp_path, "train", "hand_right", 1, decode_mask=counting_decode, cache=True
+    )
+    second = build_uni_hoi_raw_data(
+        tmp_path, "train", "hand_right", 1, decode_mask=counting_decode, cache=True
+    )
+    assert calls["n"] == 1
+    assert [item["image"]["file_name"] for item in first] == [
+        item["image"]["file_name"] for item in second
+    ]
+
+
 def test_selected_kind_keeps_negatives_and_drops_other_instances(tmp_path):
     write_mini_dataset(tmp_path)
     raw = build_uni_hoi_raw_data(
