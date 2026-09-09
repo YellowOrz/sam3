@@ -614,8 +614,10 @@ def test_forward_propagation_only_invalidates_later_frames(tmp_path: Path) -> No
     app = make_app(tmp_path)
     app.cache = {0: {}, 1: {}, 2: {}}
     starts = []
-    app.runner.start = lambda session_id, frame_index, generation, mode: starts.append(
-        (session_id, frame_index, generation, mode)
+    app.runner.start = (
+        lambda session_id, frame_index, generation, mode, **kwargs: starts.append(
+            (session_id, frame_index, generation, mode)
+        )
     )
 
     app.start_propagation(1, "forward")
@@ -1357,3 +1359,114 @@ def test_existing_output_requires_overwrite(tmp_path: Path) -> None:
         raise AssertionError("existing output should have been rejected")
 
     qualitative.validate_interactive_outputs(output_dir, overwrite=True)
+
+
+def test_prompt_markers_merge_frames_and_jump_when_playable(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}}
+    app.confirmed_points = [qualitative.PointEdit(1, 1, 3, 4, 2, 1)]
+    app.draft_points = [qualitative.PointEdit(2, 1, 3, 5, 2, 1)]
+    app.display_index = 0
+    app.render_controls()
+
+    assert [frame for frame, _rect in app.prompt_marker_hitboxes] == [1]
+    _, rect = app.prompt_marker_hitboxes[0]
+    app.on_mouse(
+        cv2.EVENT_LBUTTONDOWN,
+        (rect[0] + rect[2]) // 2,
+        app.display_height + (rect[1] + rect[3]) // 2,
+        0,
+        None,
+    )
+
+    assert app.display_index == 1
+    assert not app.playing
+
+
+def test_prompt_marker_skips_unplayable_frames(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}}
+    app.display_index = 0
+    app.seek_prompt_marker(2)
+
+    assert app.display_index == 0
+    assert "not playable" in app.status
+
+
+def test_propagation_stops_at_range_bounds(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}, 2: {}}
+    app.prop_range_left = 0
+    app.prop_range_right = 1
+    captured: dict = {}
+
+    def fake_start(
+        session_id,
+        frame_index,
+        generation,
+        mode,
+        max_forward_track=None,
+        max_backward_track=None,
+    ):
+        del session_id, generation
+        captured.update(
+            {
+                "frame_index": frame_index,
+                "mode": mode,
+                "max_forward_track": max_forward_track,
+                "max_backward_track": max_backward_track,
+            }
+        )
+
+    app.runner.start = fake_start
+    app.start_propagation(0, "forward")
+
+    assert captured["max_forward_track"] == 1
+    assert captured["max_backward_track"] == 0
+    assert app.stale_frames == {1}
+    assert app.propagation_track_limit(2, "forward") == 0
+    assert app.propagation_track_limit(2, "backward") == 0
+
+
+def test_range_brackets_align_bar_to_bound_frames(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.prop_range_left = 0
+    app.prop_range_right = 2
+    app.render_controls()
+
+    left_x = app.track_x_for_frame(0)
+    right_x = app.track_x_for_frame(2)
+    left_box = app.range_hitboxes["left"]
+    right_box = app.range_hitboxes["right"]
+
+    assert left_box[0] < left_x <= left_box[2]
+    assert left_x - left_box[0] > left_box[2] - left_x
+    assert right_box[0] <= right_x < right_box[2]
+    assert right_box[2] - right_x > right_x - right_box[0]
+
+
+def test_bracket_keys_set_propagation_range(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.display_index = 1
+    app.handle_key(ord("]"))
+    assert (app.prop_range_left, app.prop_range_right) == (0, 1)
+
+    app.display_index = 2
+    app.handle_key(ord("["))
+    assert (app.prop_range_left, app.prop_range_right) == (2, 2)
+
+
+def test_clear_all_keeps_propagation_range(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    app.prop_range_left = 1
+    app.prop_range_right = 2
+    starts = []
+    app.start_propagation = lambda frame_index, mode: starts.append((frame_index, mode))
+    app.restore_confirmed_state = lambda: None
+    app.save_checkpoint = lambda frame_index: None
+    app.stop_propagation = lambda: None
+
+    app.clear_all_interactions()
+
+    assert (app.prop_range_left, app.prop_range_right) == (1, 2)
+    assert starts == [(0, "forward")]

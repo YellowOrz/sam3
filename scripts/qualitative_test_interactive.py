@@ -49,7 +49,13 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
   状态，后续传播方向由 UI 按钮控制。
 * 下方时间轴的蓝色部分是从第 0 帧开始连续处理完成的可播放范围，灰色尾部
   只表示视频总长度；拖动位置不会超过蓝色范围，拖动会暂停画面播放，但不会
-  影响传播。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
+  影响传播。进度条上方 ``>|`` 与 ``|<`` 标出传播窗口（默认整段视频），竖线对准
+  边界帧；正向停在右界、反向停在左界，端点帧仍会写出。拖动手柄可改范围且不能
+  交叉；暂停时
+  ``[`` / ``]`` 把当前帧设为左/右界，若交叉则另一侧跟着移到当前帧。起始帧
+  在窗口外时该方向只更新起始帧。``C`` 清点不会重置窗口。播放不受窗口限制。
+  进度条下方每个 ▴ 对应一帧上的已确认或未提交提示点，点击可跳到该帧（仅限
+  可播放范围）。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
   播放画面右上角会标记当前帧 mask 状态：CURRENT 表示本次传播已更新，
   STALE 表示仍显示旧结果、等待重新传播，PREVIEW 表示当前帧正在预览未提交点。
 * 播放按钮依次为倒放、上一帧、暂停、下一帧、正放；传播按钮依次为暂停、反向、
@@ -594,6 +600,8 @@ class PropagationRunner:
         start_frame_index: int,
         generation: int,
         mode: str,
+        max_forward_track: Optional[int] = None,
+        max_backward_track: Optional[int] = None,
     ) -> None:
         if self.is_alive:
             raise RuntimeError("propagation is already running")
@@ -637,6 +645,13 @@ class PropagationRunner:
                         "propagation_direction": direction,
                         "start_frame_index": start_frame_index,
                     }
+                    track_limit = (
+                        max_forward_track
+                        if direction == "forward"
+                        else max_backward_track
+                    )
+                    if track_limit is not None:
+                        request["max_frame_num_to_track"] = track_limit
                     with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
                         for response in self.predictor.handle_stream_request(request):
                             if self.stop_event.is_set():
@@ -792,12 +807,18 @@ class InteractiveApp:
         self.selection_offset = 0
         self.next_obj_id = 1
         self.hitboxes: Dict[str, Tuple[int, int, int, int]] = {}
+        self.range_hitboxes: Dict[str, Tuple[int, int, int, int]] = {}
+        self.prompt_marker_hitboxes: List[Tuple[int, Tuple[int, int, int, int]]] = []
         self.timeline_dragging = False
+        self.range_dragging: Optional[str] = None
         self.window_open = False
         self.display_width = min(window_width, max(video_info.width, 640))
         self.display_scale = self.display_width / video_info.width
         self.display_height = max(1, round(video_info.height * self.display_scale))
-        self.timeline_bounds = (20, max(20, self.display_width - 20))
+        self.track_span = (20, max(20, self.display_width - 20))
+        self.timeline_bounds = self.track_span
+        self.prop_range_left = 0
+        self.prop_range_right = max(0, frame_count - 1)
 
     def record_event(self, event_type: str, **payload: Any) -> None:
         self.sequence += 1
@@ -873,19 +894,34 @@ class InteractiveApp:
         self.propagation_mode = mode
         self.last_propagation_mode = mode
         directions = set(propagation_legs(mode))
-        if directions == {"forward"}:
+        inside = self.prop_range_left <= frame_index <= self.prop_range_right
+        if inside and directions == {"forward"}:
             self.stale_frames.update(
-                index for index in self.cache if index > frame_index
+                index
+                for index in self.cache
+                if frame_index < index <= self.prop_range_right
             )
-        elif directions == {"backward"}:
+        elif inside and directions == {"backward"}:
             self.stale_frames.update(
-                index for index in self.cache if index < frame_index
+                index
+                for index in self.cache
+                if self.prop_range_left <= index < frame_index
             )
-        else:
+        elif inside:
             self.stale_frames.update(
-                index for index in self.cache if index != frame_index
+                index
+                for index in self.cache
+                if index != frame_index
+                and self.prop_range_left <= index <= self.prop_range_right
             )
-        self.runner.start(self.session_id, frame_index, self.generation, mode)
+        self.runner.start(
+            self.session_id,
+            frame_index,
+            self.generation,
+            mode,
+            max_forward_track=self.propagation_track_limit(frame_index, "forward"),
+            max_backward_track=self.propagation_track_limit(frame_index, "backward"),
+        )
         self.status = f"propagating {mode.replace('_', '-')}"
         self.record_event(
             "propagation_start",
@@ -940,6 +976,85 @@ class InteractiveApp:
             elif event_type == "error":
                 self.fatal_error = value
                 self.status = "error"
+
+    def prompt_point_frames(self) -> List[int]:
+        return sorted(
+            {
+                point.frame_index
+                for point in (*self.confirmed_points, *self.draft_points)
+            }
+        )
+
+    def track_x_for_frame(self, frame_index: int) -> int:
+        track_left, track_right = self.track_span
+        if self.frame_count <= 1:
+            return track_left
+        span = max(1, track_right - track_left)
+        return track_left + round(span * frame_index / max(1, self.frame_count - 1))
+
+    def frame_for_track_x(self, x: int) -> int:
+        track_left, track_right = self.track_span
+        if self.frame_count <= 1:
+            return 0
+        span = max(1, track_right - track_left)
+        fraction = (min(track_right, max(track_left, x)) - track_left) / span
+        return int(round(fraction * (self.frame_count - 1)))
+
+    def propagation_track_limit(self, start_frame_index: int, direction: str) -> int:
+        if (
+            start_frame_index < self.prop_range_left
+            or start_frame_index > self.prop_range_right
+        ):
+            return 0
+        if direction == "forward":
+            return self.prop_range_right - start_frame_index
+        return start_frame_index - self.prop_range_left
+
+    def set_prop_bound(
+        self, side: str, frame_index: int, expand: bool, record: bool = True
+    ) -> None:
+        frame_index = max(0, min(frame_index, max(0, self.frame_count - 1)))
+        if side == "left":
+            if expand and frame_index > self.prop_range_right:
+                self.prop_range_right = frame_index
+            self.prop_range_left = (
+                frame_index if expand else min(frame_index, self.prop_range_right)
+            )
+        else:
+            if expand and frame_index < self.prop_range_left:
+                self.prop_range_left = frame_index
+            self.prop_range_right = (
+                frame_index if expand else max(frame_index, self.prop_range_left)
+            )
+        self.status = (
+            f"propagation range {self.prop_range_left}-{self.prop_range_right}"
+        )
+        if record:
+            self.record_event(
+                "set_prop_range",
+                left=self.prop_range_left,
+                right=self.prop_range_right,
+                side=side,
+            )
+
+    def seek_prompt_marker(self, frame_index: int) -> None:
+        frontier = self.playable_frontier()
+        if frontier < 0 or frame_index > frontier:
+            self.status = f"prompt frame {frame_index} is not playable yet"
+            return
+        self.playing = False
+        self.set_display_index(frame_index)
+        self.status = f"frame {self.display_index}"
+
+    def marker_frame_at(self, x: int, y: int) -> Optional[int]:
+        hits = [
+            (frame_index, rect)
+            for frame_index, rect in self.prompt_marker_hitboxes
+            if self.point_in_rect(x, y, rect)
+        ]
+        if not hits:
+            return None
+        return min(hits, key=lambda item: abs(((item[1][0] + item[1][2]) // 2) - x))[0]
 
     def playable_frontier(self) -> int:
         frontier = -1
@@ -1188,7 +1303,21 @@ class InteractiveApp:
     def on_mouse(self, event: int, x: int, y: int, flags: int, param: Any) -> None:
         del param
         if event == cv2.EVENT_LBUTTONUP:
+            if self.range_dragging is not None:
+                self.record_event(
+                    "set_prop_range",
+                    left=self.prop_range_left,
+                    right=self.prop_range_right,
+                    side=self.range_dragging,
+                )
             self.timeline_dragging = False
+            self.range_dragging = None
+            return
+        if event == cv2.EVENT_MOUSEMOVE and self.range_dragging is not None:
+            if flags & cv2.EVENT_FLAG_LBUTTON:
+                self.set_prop_bound(
+                    self.range_dragging, self.frame_for_track_x(x), False, record=False
+                )
             return
         if event == cv2.EVENT_MOUSEMOVE and self.timeline_dragging:
             if flags & cv2.EVENT_FLAG_LBUTTON:
@@ -1197,6 +1326,20 @@ class InteractiveApp:
         if event == cv2.EVENT_LBUTTONDOWN and self.display_height <= y < (
             self.display_height + TIMELINE_HEIGHT
         ):
+            panel_y = y - self.display_height
+            marker_frame = self.marker_frame_at(x, panel_y)
+            if marker_frame is not None:
+                self.log_input("prompt_marker", frame_index=marker_frame, display_x=x)
+                self.seek_prompt_marker(marker_frame)
+                return
+            for name, rect in self.range_hitboxes.items():
+                if self.point_in_rect(x, panel_y, rect):
+                    self.log_input("prop_range", control=name, display_x=x)
+                    self.range_dragging = name
+                    self.set_prop_bound(
+                        name, self.frame_for_track_x(x), False, record=False
+                    )
+                    return
             self.log_input("timeline", display_x=x)
             self.timeline_dragging = True
             self.seek_timeline(x)
@@ -1622,6 +1765,58 @@ class InteractiveApp:
         )
         cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
 
+    def draw_bound_bracket(
+        self,
+        image: np.ndarray,
+        bar_x: int,
+        track_y: int,
+        side: str,
+        color: Tuple[int, int, int],
+    ) -> None:
+        top, bottom = track_y - 18, track_y - 2
+        cv2.line(image, (bar_x, top), (bar_x, bottom), color, 2, cv2.LINE_AA)
+        mid_y = (top + bottom) // 2
+        if side == "left":
+            tip_x = bar_x - 3
+            base_x = bar_x - 11
+            self.range_hitboxes["left"] = (bar_x - 14, 24, bar_x + 4, track_y + 2)
+        else:
+            tip_x = bar_x + 3
+            base_x = bar_x + 11
+            self.range_hitboxes["right"] = (bar_x - 4, 24, bar_x + 14, track_y + 2)
+        points = np.array(
+            [(tip_x, mid_y), (base_x, top + 1), (base_x, bottom - 1)],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
+
+    def draw_range_markers(self, image: np.ndarray, track_y: int) -> None:
+        color = (80, 210, 255)
+        self.draw_bound_bracket(
+            image, self.track_x_for_frame(self.prop_range_left), track_y, "left", color
+        )
+        self.draw_bound_bracket(
+            image,
+            self.track_x_for_frame(self.prop_range_right),
+            track_y,
+            "right",
+            color,
+        )
+
+    def draw_prompt_markers(self, image: np.ndarray, track_y: int) -> None:
+        color = (90, 90, 255)
+        self.prompt_marker_hitboxes = []
+        for frame_index in self.prompt_point_frames():
+            x = self.track_x_for_frame(frame_index)
+            points = np.array(
+                [(x, track_y + 8), (x - 6, track_y + 20), (x + 6, track_y + 20)],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(image, points, color, cv2.LINE_AA)
+            self.prompt_marker_hitboxes.append(
+                (frame_index, (x - 10, track_y + 6, x + 10, TIMELINE_HEIGHT - 1))
+            )
+
     def draw_button(
         self,
         image: np.ndarray,
@@ -1675,6 +1870,8 @@ class InteractiveApp:
         width = self.display_width
         panel = np.full((CONTROL_HEIGHT, width, 3), (27, 29, 32), dtype=np.uint8)
         self.hitboxes = {}
+        self.range_hitboxes = {}
+        self.prompt_marker_hitboxes = []
         frontier = self.playable_frontier()
         current = min(self.display_index, max(0, frontier))
         progress_text = f"frame {current} | processed to {max(0, frontier)} | total {self.frame_count}"
@@ -1728,6 +1925,7 @@ class InteractiveApp:
             thumb_x = track_left + round(
                 (track_right - track_left) * current / (self.frame_count - 1)
             )
+        self.track_span = (track_left, track_right)
         self.timeline_bounds = (track_left, max(track_left, available_right))
         if frontier >= 0:
             cv2.line(
@@ -1739,6 +1937,8 @@ class InteractiveApp:
                 cv2.LINE_AA,
             )
             cv2.circle(panel, (thumb_x, track_y), 9, (255, 200, 80), cv2.FILLED)
+        self.draw_range_markers(panel, track_y)
+        self.draw_prompt_markers(panel, track_y)
         cv2.line(
             panel,
             (0, TIMELINE_HEIGHT),
@@ -1919,6 +2119,10 @@ class InteractiveApp:
             self.clear_all_interactions()
         elif key in (ord("d"), ord("D")):
             self.remove_selected_object()
+        elif key == ord("["):
+            self.set_prop_bound("left", self.display_index, expand=True)
+        elif key == ord("]"):
+            self.set_prop_bound("right", self.display_index, expand=True)
         elif key in (10, 13, 32):
             self.status = "Enter and Space are disabled"
         return True
