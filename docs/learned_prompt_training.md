@@ -24,21 +24,25 @@ python scripts/prepare_learned_prompt.py --checkpoint /models/sam3.pt --target-i
 
 特征文件记录目标 ID、初始化信息和基础 checkpoint 的 SHA-256；加载时检查基础权重一致性。初始化工具不会覆盖已经存在的文件。不同目标使用不同输出路径。
 
-## 2. 用原生数据格式训练
+## 2. 用 uni-hoi 统一集训练
 
-复制并编辑 [配置](../sam3/train/configs/learned_prompt.yaml)。数据使用 SAM3 自带 COCO 加载器支持的 `images / annotations / categories` JSON 和图像目录，mask 支持 polygon、压缩 RLE 和未压缩 RLE。
+复制并编辑 [配置](../sam3/train/configs/learned_prompt.yaml)。默认读取 `~/Datasets/uni-hoi-dataset`（目录布局见 uni-hoi-dataset 仓库的 `docs/hand-object-seg-spec.md`）：按 `metadata/split.json` 的 subject 划分取 `rgb.mkv` / `mask.mkv` / `instances.json`，不抽帧落盘。索引阶段用 ffmpeg 流式解码 16-bit `mask.mkv`（首次按视角扫描，大约数分钟）；训练时按帧读 H.264 `rgb.mkv`。需要本机 `ffmpeg`。
 
-- `category_id`：数据集中的目标类别 ID，训练集和验证集应保持相同映射。
+当前仓库中的统一集首期主要是 dex-ycb，手别全部为 `hand_right`。默认配置训练右手：初始化时用 `--target-id right_hand --reference-text "right hand"`。
+
+- `kind`：`instances.json` 中的 `hand_left` 或 `hand_right`。只把该 kind 的实例 mask 当作正样本，其他物体留在图像里但不进损失。
 - `target_id`：初始化特征文件中的 ID，仅用于选择和校验，不送入文本编码器。
 - `initial_feature`：上一步导出的特征文件。
-- `train`、`val`：对应图像目录和标注 JSON。按原始视频划分数据，避免相邻帧跨训练和验证集。
+- `dataset_root`、`train.split`、`val.split`：统一集根目录和 `split.json` 中的划分名。同一 subject 的序列不会跨训练和验证集。
 - `checkpoint`、`device`、`output_dir`：基础模型、训练设备和输出位置。
 
-选中类别的标注必须有实例 mask；如果没有 `bbox` 字段，会从 mask 计算。保留空目标图片，使用原生 crowd 过滤逻辑。数据在内部只生成选中类别的 query，不会把其他类别 GT 混入目标训练。
+无该侧手的帧保留为负样本（含 dex-ycb 序列开头无手帧）。掩码语义是 modal 可见像素：`frame_map` 覆盖但像素全空的实例会丢掉，该帧若没有其它正样本则按负样本处理。仍使用原生 crowd 过滤。数据在内部只生成选中 kind 的 query。
 
 ```bash
 python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.yaml
 ```
+
+若要改回 COCO JSON，在 `train` / `val` 里写 `images` 和 `annotations`（mask 支持 polygon、压缩 RLE 和未压缩 RLE），加载器会走原来的单类别 COCO 路径。
 
 这是独立的单设备训练入口，复用原有数据、变换、collator、实例匹配及 loss，不改变原 Trainer 和优化器的默认规则。图像缩放到基础 SAM3 的 1008 分辨率。损失包括 mask focal、Dice、框、分类和 presence；具体权重在 YAML 中可调。负样本通过原生 presence 损失监督目标不存在。
 
@@ -54,10 +58,10 @@ python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.y
 恢复训练时，`epochs` 是希望达到的总轮数。恢复会沿用保存的优化器状态和学习率；如需新的学习率重新微调，可将 `initial_feature` 设为训练后的特征，使用新的输出目录，不传 `--resume`。
 
 ```bash
-python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.yaml --resume outputs/learned_left_hand/last.pt
+python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.yaml --resume outputs/learned_right_hand/last.pt
 ```
 
-训练右手时，重新初始化一个目标文件，修改 `target_id`、`category_id`、`initial_feature` 和 `output_dir` 后独立运行。
+训练左手时，重新初始化一个目标文件，把 `kind` 改为 `hand_left`，并修改 `target_id`、`initial_feature` 和 `output_dir` 后独立运行。当前 dex-ycb 没有左手正样本，那些帧会全部作为负样本。
 
 ## 3. 无文本图片推理
 
@@ -116,7 +120,7 @@ finally:
 无需权重的接口、梯度和恢复测试：
 
 ```bash
-pytest tests/test_learned_prompt.py tests/test_learned_prompt_contract.py -q
+pytest tests/test_learned_prompt.py tests/test_learned_prompt_contract.py tests/test_uni_hoi_learned_prompt.py -q
 ```
 
 服务器可运行真实 SAM3 的正样本、负样本、反向传播和恢复训练 smoke test（Linux shell）：

@@ -26,6 +26,25 @@ from torchvision.datasets.vision import VisionDataset
 from .coco_json_loaders import COCO_FROM_JSON
 
 
+def _read_video_frame(video_path: str, frame_index: int) -> PILImage.Image:
+    import cv2
+
+    capture = cv2.VideoCapture(video_path)
+    try:
+        if not capture.isOpened():
+            raise FileNotFoundError(video_path)
+        if frame_index:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise FileNotFoundError(
+                f"cannot read frame {frame_index} from {video_path}"
+            )
+        return PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+
+
 @dataclass
 class InferenceMetadata:
     """Metadata required for postprocessing"""
@@ -201,7 +220,15 @@ class CustomCocoDetectionAPI(VisionDataset):
             all_img_metadata.append(current_meta)
             path = os.path.join(self.root, path)
             try:
-                if ".mp4" in path and path[-4:] == ".mp4":
+                if "@" in path:
+                    video_path, frame_token = path.rsplit("@", 1)
+                else:
+                    video_path, frame_token = "", ""
+                if frame_token.isdigit() and os.path.isfile(video_path):
+                    all_images.append(
+                        (img_id, _read_video_frame(video_path, int(frame_token)))
+                    )
+                elif ".mp4" in path and path[-4:] == ".mp4":
                     # Going to load a video frame
                     from decord import cpu, VideoReader
 
@@ -235,9 +262,9 @@ class CustomCocoDetectionAPI(VisionDataset):
         if self.coco is not None:
             return
 
-        assert g_pathmgr.isfile(self.annFile), (
-            f"please provide valid annotation file. Missing: {self.annFile}"
-        )
+        assert g_pathmgr.isfile(
+            self.annFile
+        ), f"please provide valid annotation file. Missing: {self.annFile}"
         annFile = g_pathmgr.get_local_path(self.annFile)
 
         if self.coco is not None:
@@ -329,9 +356,9 @@ class CustomCocoDetectionAPI(VisionDataset):
         else:
             num_queries_per_stage = stage2num_queries.most_common(1)[0][1]
         for stage, num_queries in stage2num_queries.items():
-            assert num_queries == num_queries_per_stage, (
-                f"Number of queries in stage {stage} is {num_queries}, expected {num_queries_per_stage}"
-            )
+            assert (
+                num_queries == num_queries_per_stage
+            ), f"Number of queries in stage {stage} is {num_queries}, expected {num_queries_per_stage}"
 
         for query in queries:
             h, w = id2imsize[query["image_id"]]

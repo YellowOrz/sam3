@@ -17,6 +17,7 @@ from sam3.model_builder import build_sam3_image_model
 from sam3.train.data.coco_json_loaders import ann_to_rle, COCO_FROM_JSON
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Sam3ImageDataset
+from sam3.train.data.uni_hoi import UniHoiTargetCOCO
 from sam3.train.loss.loss_fns import Boxes, CORE_LOSS_KEY, IABCEMdetr, Masks
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryOneToManyMatcher
@@ -58,12 +59,30 @@ class TargetCOCO(COCO_FROM_JSON):
 
 
 def make_loader(config: DictConfig, split: str, target_id: str) -> DataLoader:
+    spec = config[split]
+    category_id = int(config.category_id)
+    if spec.get("annotations"):
+        img_folder = spec["images"]
+        ann_file = spec["annotations"]
+        coco_json_loader = partial(
+            TargetCOCO, category_id=category_id, target_id=target_id
+        )
+    else:
+        root = str(Path(str(config.dataset_root)).expanduser())
+        img_folder = root
+        ann_file = str(Path(root) / "metadata" / "split.json")
+        coco_json_loader = partial(
+            UniHoiTargetCOCO,
+            category_id=category_id,
+            target_id=target_id,
+            dataset_root=root,
+            split_name=str(spec["split"]),
+            kind=str(config.kind),
+        )
     dataset = Sam3ImageDataset(
-        img_folder=config[split]["images"],
-        ann_file=config[split]["annotations"],
-        coco_json_loader=partial(
-            TargetCOCO, category_id=int(config.category_id), target_id=target_id
-        ),
+        img_folder=img_folder,
+        ann_file=ann_file,
+        coco_json_loader=coco_json_loader,
         transforms=[
             FlexibleFilterFindGetQueries(query_filter=FilterCrowds()),
             DecodeRle(),
@@ -189,6 +208,11 @@ def train(config: DictConfig, resume: str | None = None) -> None:
     if previous_category is not None and previous_category != int(config.category_id):
         raise ValueError("Feature was trained for a different dataset category_id")
     prompt.metadata["category_id"] = int(config.category_id)
+    if config.get("kind"):
+        previous_kind = prompt.metadata.get("kind")
+        if previous_kind is not None and previous_kind != str(config.kind):
+            raise ValueError("Feature was trained for a different uni-hoi kind")
+        prompt.metadata["kind"] = str(config.kind)
     trainable = [param for param in model.parameters() if param.requires_grad]
     if len(trainable) != 1 or trainable[0] is not prompt.features:
         raise RuntimeError("Only the selected target feature may be trainable")
