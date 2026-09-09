@@ -8,12 +8,101 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class LearnedPromptContractTests(unittest.TestCase):
+    def test_epoch_snapshots_and_resume(self):
+        import random
+        import shutil
+
+        tree = ast.parse((ROOT / "sam3/train/learned_prompt.py").read_text())
+        train = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "train"
+        )
+        model = Mock()
+        prompt = model.backbone.learned_prompt
+        prompt.metadata = {}
+        prompt.features.requires_grad = True
+        model.parameters.return_value = [prompt.features]
+        model.to.return_value = model
+        torch = Mock()
+        torch.optim.AdamW.return_value.state_dict.return_value = {}
+        torch.get_rng_state.return_value = []
+        torch.device.return_value.type = "cpu"
+        namespace = dict(
+            DictConfig=object, Path=Path, random=random, shutil=shutil,
+            json=json, np=Mock(), torch=torch, OmegaConf=Mock(),
+            build_sam3_image_model=Mock(return_value=model),
+            make_loader=Mock(return_value=types.SimpleNamespace(sampler=None)),
+            make_loss=Mock(),
+            run_epoch=Mock(return_value=({"core_loss": 1.0}, 10)),
+            os=types.SimpleNamespace(environ={}),
+            dist=types.SimpleNamespace(is_available=lambda: False),
+            _unwrap=lambda value: value,
+            _rank0=lambda: True,
+            DistributedSampler=type("DistributedSampler", (), {}),
+            make_tensorboard_logger=Mock(),
+            _tb_payload=lambda *args: {},
+            tqdm=Mock(),
+            CORE_LOSS_KEY="core_loss",
+        )
+        exec(
+            compile(ast.Module(body=[train], type_ignores=[]), "train", "exec"),
+            namespace,
+        )
+
+        def save(path, training_state=None):
+            path.write_text(json.dumps({"training_state": training_state}))
+
+        prompt.save.side_effect = save
+        with tempfile.TemporaryDirectory() as directory:
+            config = types.SimpleNamespace(
+                epochs=5, batch_size=1, num_workers=0, lr=0.001,
+                max_grad_norm=1.0, seed=0, output_dir=directory,
+                checkpoint="base.pt", initial_feature="initial.pt",
+                target_id="left", category_id=1, device="cpu", loss={},
+                save_every_n_epochs=2,
+            )
+            config.get = lambda key, default=None: getattr(config, key, default)
+            with patch("builtins.print"):
+                namespace["train"](config)
+            output = Path(directory)
+            self.assertEqual(
+                sorted(p.name for p in output.glob("epoch_*.pt")),
+                ["epoch_0002.pt", "epoch_0004.pt"],
+            )
+            state = json.loads((output / "last.pt").read_text())["training_state"]
+            self.assertEqual(state["epoch"], 5)
+            snapshot = json.loads((output / "epoch_0004.pt").read_text())
+            self.assertEqual(snapshot["training_state"]["epoch"], 4)
+            state["python_rng"] = random.getstate()
+            torch.load.return_value = {"training_state": state}
+            config.epochs = 6
+            with patch("builtins.print"):
+                namespace["train"](config, resume=str(output / "last.pt"))
+            self.assertEqual(
+                (output / "epoch_0006.pt").read_bytes(),
+                (output / "last.pt").read_bytes(),
+            )
+            config.save_every_n_epochs = 0
+            config.epochs = 7
+            with patch("builtins.print"):
+                namespace["train"](config, resume=str(output / "last.pt"))
+            self.assertFalse((output / "epoch_0007.pt").exists())
+            namespace["_rank0"] = lambda: False
+            config.output_dir = str(output / "non_primary")
+            config.save_every_n_epochs = 2
+            namespace["train"](config)
+            self.assertFalse(Path(config.output_dir).exists())
+            for invalid in (-1, 1.5, True, "2"):
+                config.save_every_n_epochs = invalid
+                with self.assertRaisesRegex(ValueError, "save_every_n_epochs"):
+                    namespace["train"](config)
+
     def test_existing_builder_positional_signatures_are_preserved(self):
         tree = ast.parse((ROOT / "sam3/model_builder.py").read_text(encoding="utf-8"))
         expected = {

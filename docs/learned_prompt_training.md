@@ -131,6 +131,8 @@ python scripts/process_learned_prompt_videos.py \
 
 ## 5. 验证与实验边界
 
+训练 YAML 支持 `save_every_n_epochs: 5`：每完成 5 个 epoch，额外保留 `epoch_0005.pt`、`epoch_0010.pt` 等快照，包含提示特征和优化器、epoch、随机状态，可传给 `--resume`。设为 `0` 或省略此项时不保留编号快照。`last.pt` 和 `learned_prompt.pt` 仍每个 epoch 更新，`best.pt` 仍在验证总 loss 改善时更新；最后不足一个间隔的训练结果保存在 `last.pt` 中。
+
 无需权重的接口、梯度和恢复测试：
 
 ```bash

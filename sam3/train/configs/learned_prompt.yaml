@@ -9,6 +9,9 @@ dataset_root: /data0/xuzhefeng/Datasets/uni-hoi-dataset
 # Physical GPU ids. One id is single-process; several ids spawn DDP.
 device: cuda:1,2,3
 epochs: 20
+# Keep numbered resumable snapshots every N epochs; 0 disables snapshots.
+# last.pt / learned_prompt.pt still update every epoch; best.pt tracks validation.
+save_every_n_epochs: 5
 batch_size: 8
 num_workers: 16
 lr: 0.0003

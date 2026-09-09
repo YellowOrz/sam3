@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 import socket
 import sys
 from functools import partial
@@ -282,6 +283,9 @@ def run_epoch(
 
 
 def train(config: DictConfig, resume: str | None = None) -> None:
+    save_every = config.get("save_every_n_epochs", 0)
+    if type(save_every) is not int or save_every < 0:
+        raise ValueError("save_every_n_epochs must be a nonnegative integer")
     if config.epochs < 1 or config.batch_size < 1 or config.num_workers < 0:
         raise ValueError(
             "epochs/batch_size must be positive and num_workers nonnegative"
@@ -419,6 +423,10 @@ def train(config: DictConfig, resume: str | None = None) -> None:
                         ),
                     },
                 )
+                if save_every and epoch_id % save_every == 0:
+                    shutil.copyfile(
+                        output / "last.pt", output / f"epoch_{epoch_id:04d}.pt"
+                    )
                 metrics = {"epoch": epoch_id, "train": train_metrics, "val": val_metrics}
                 with (output / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(metrics) + "\n")
