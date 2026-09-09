@@ -60,6 +60,16 @@
 - 3 项自动视频可视化测试全部通过。
 - 一帧 `1280×720` 临时视频端到端流程通过：两个 session 完成 start、add prompt、propagate、close，并生成非空 MP4。
 
+## 9. DexYCB right-hand 训练链路
+
+- 新增 `scripts/unified_to_sam3.py`，将统一集单视角的 `rgb.mkv`、`mask.mkv`、`instances.json` 导出为 JPEG 与 COCO-RLE。
+- 新增 `scripts/export_unified_manifest.py`，按 train/val/test manifest 合并导出右手正样本。
+- 统一集类别名自动映射：`hand_left/right` → `left_hand/right_hand`。
+- 当前 DexYCB 统计：train 20275、val 2879、test 2402 个右手可见帧；没有左手正样本。
+- K=1、1000 步试训：前 50 步平均 loss 0.4582，后 50 步 0.2395。
+- 200 张验证图近似 Dice 0.8105；200 张测试图近似 Dice 0.7779。
+- 修复 ViT MLP：训练时使用可反向传播的普通 Linear/activation 路径；推理 fused 路径在进入第二个 Linear 前恢复权重 dtype。
+
 ## 下一步
 
 1. 转换视频 RGB、left mask、right mask、valid 标志和 frame/instance ID。
