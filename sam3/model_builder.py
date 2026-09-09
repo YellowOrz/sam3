@@ -21,6 +21,7 @@ from sam3.model.decoder import (
 )
 from sam3.model.encoder import TransformerEncoderFusion, TransformerEncoderLayer
 from sam3.model.geometry_encoders import SequenceGeometryEncoder
+from sam3.model.learnable_text_encoder import LearnableClassTextEncoder
 from sam3.model.maskformer_segmentation import PixelDecoder, UniversalSegmentationHead
 from sam3.model.memory import (
     CXBlock,
@@ -497,8 +498,19 @@ def build_tracker(
     return model
 
 
-def _create_text_encoder(bpe_path: str) -> VETextEncoder:
-    """Create SAM3 text encoder."""
+def _create_text_encoder(
+    bpe_path: str,
+    text_encoder_type: str = "ve",
+    tokens_per_class: int = 1,
+) -> nn.Module:
+    """Create either the original text encoder or learned class tokens."""
+    if text_encoder_type == "learnable_class":
+        return LearnableClassTextEncoder(tokens_per_class=tokens_per_class)
+    if text_encoder_type != "ve":
+        raise ValueError(
+            "text_encoder_type must be either 've' or 'learnable_class'"
+        )
+
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
     return VETextEncoder(
         tokenizer=tokenizer,
@@ -579,6 +591,8 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    text_encoder_type="ve",
+    tokens_per_class=1,
 ):
     """
     Build SAM3 image model
@@ -590,12 +604,14 @@ def build_sam3_image_model(
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
+        compile: Whether to compile supported model components
+        text_encoder_type: "ve" for natural language or "learnable_class"
+        tokens_per_class: Number of learned 256D tokens for each class
 
     Returns:
         A SAM3 image model
     """
-    if bpe_path is None:
+    if bpe_path is None and text_encoder_type == "ve":
         bpe_path = pkg_resources.resource_filename(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
         )
@@ -607,7 +623,11 @@ def build_sam3_image_model(
     )
 
     # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = _create_text_encoder(
+        bpe_path,
+        text_encoder_type=text_encoder_type,
+        tokens_per_class=tokens_per_class,
+    )
 
     # Create visual-language backbone
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
@@ -683,6 +703,8 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    text_encoder_type="ve",
+    tokens_per_class=1,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """
     Build SAM3 dense tracking model.
@@ -690,11 +712,13 @@ def build_sam3_video_model(
     Args:
         checkpoint_path: Optional path to checkpoint file
         bpe_path: Path to the BPE tokenizer file
+        text_encoder_type: "ve" for natural language or "learnable_class"
+        tokens_per_class: Number of learned 256D tokens for each class
 
     Returns:
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
-    if bpe_path is None:
+    if bpe_path is None and text_encoder_type == "ve":
         bpe_path = pkg_resources.resource_filename(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
         )
@@ -704,7 +728,11 @@ def build_sam3_video_model(
 
     # Build Detector components
     visual_neck = _create_vision_backbone()
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = _create_text_encoder(
+        bpe_path,
+        text_encoder_type=text_encoder_type,
+        tokens_per_class=tokens_per_class,
+    )
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()
@@ -802,8 +830,18 @@ def build_sam3_video_model(
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 
+        if text_encoder_type == "learnable_class":
+            ckpt = {
+                key: value
+                for key, value in ckpt.items()
+                if "language_backbone." not in key
+            }
+
+        use_strict_loading = (
+            strict_state_dict_loading and text_encoder_type == "ve"
+        )
         missing_keys, unexpected_keys = model.load_state_dict(
-            ckpt, strict=strict_state_dict_loading
+            ckpt, strict=use_strict_loading
         )
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
