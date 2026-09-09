@@ -1,0 +1,28 @@
+# python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.yaml
+checkpoint: /path/to/sam3.pt
+initial_feature: /path/to/left_hand_initial.pt
+target_id: left_hand
+category_id: 1
+output_dir: outputs/learned_left_hand
+device: cuda:0
+epochs: 20
+batch_size: 1
+num_workers: 0
+lr: 0.001
+max_grad_norm: 1.0
+amp: true
+seed: 0
+train:
+  images: /path/to/train/images
+  annotations: /path/to/train/instances.json
+# Set val: null only if no held-out annotations are available.
+val:
+  images: /path/to/val/images
+  annotations: /path/to/val/instances.json
+loss:
+  mask: 20.0
+  dice: 1.0
+  box: 5.0
+  giou: 2.0
+  classification: 20.0
+  presence: 20.0

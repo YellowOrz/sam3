@@ -188,3 +188,7 @@ python sam3/train/train.py -c configs/roboflow_v100/roboflow_v100_eval.yaml
 # Example: Evaluate on ODinW13 dataset
 python sam3/train/train.py -c configs/odinw13/odinw_text_only.yaml
 ```
+
+## 可选：仅训练目标特征
+
+基础 SAM3 支持冻结全部原有参数、只训练替代 text encoder 输出的目标特征。不同目标分别训练，支持文本特征初始化和随机初始化；新模式训练及图片／视频推理不加载 text encoder。使用方法见 [可学习目标特征模式](docs/learned_prompt_training.md)，配置见 [learned_prompt.yaml](sam3/train/configs/learned_prompt.yaml)。原有训练方式不变。

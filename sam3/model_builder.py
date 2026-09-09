@@ -540,7 +540,7 @@ def _create_sam3_transformer(
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
 
-def _load_checkpoint(model, checkpoint_path):
+def _load_checkpoint(model, checkpoint_path, skip_text_encoder=False):
     """Load model checkpoint from file."""
     with g_pathmgr.open(checkpoint_path, "rb") as f:
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
@@ -557,7 +557,15 @@ def _load_checkpoint(model, checkpoint_path):
                 if "tracker" in k
             }
         )
+    if skip_text_encoder:
+        sam3_image_ckpt = {
+            k: v
+            for k, v in sam3_image_ckpt.items()
+            if not k.startswith("backbone.language_backbone.")
+        }
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
+    if skip_text_encoder and missing_keys:
+        raise RuntimeError(f"Incomplete base SAM3 checkpoint: {missing_keys}")
     if len(missing_keys) > 0:
         print(
             f"loaded {checkpoint_path} and found "
@@ -583,6 +591,7 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    learned_prompt_path=None,
 ):
     """
     Build SAM3 image model
@@ -595,6 +604,8 @@ def build_sam3_image_model(
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
         compile_mode: To enable compilation, set to "default"
+        learned_prompt_path: Optional target feature file; skips the text encoder
+            and freezes original parameters. eval_mode=False trains only the feature.
 
     Returns:
         A SAM3 image model
@@ -609,7 +620,9 @@ def build_sam3_image_model(
     )
 
     # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = (
+        _create_text_encoder(bpe_path) if learned_prompt_path is None else None
+    )
 
     # Create visual-language backbone
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
@@ -648,7 +661,21 @@ def build_sam3_image_model(
         checkpoint_path = download_ckpt_from_hf(version="sam3")
     # Load checkpoint if provided
     if checkpoint_path is not None:
-        _load_checkpoint(model, checkpoint_path)
+        _load_checkpoint(
+            model, checkpoint_path, skip_text_encoder=learned_prompt_path is not None
+        )
+
+    if learned_prompt_path is not None:
+        from sam3.model.learned_prompt import attach_learned_prompt, LearnedPrompt
+
+        if checkpoint_path is None:
+            raise ValueError("Learned prompts require a pretrained base checkpoint")
+        attach_learned_prompt(
+            model,
+            LearnedPrompt.load(learned_prompt_path, checkpoint_path),
+            training=not eval_mode,
+        )
+        model.to(device=device)
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
@@ -685,6 +712,7 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
+    learned_prompt_path=None,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
     """! @brief 构建 SAM 3 视频分割的“检测器 + 时序跟踪器”模型。
 
@@ -693,6 +721,7 @@ def build_sam3_video_model(
     @param apply_temporal_disambiguation 是否启用跨帧消歧、重检测等时序启发式策略。
     @param device 模型所在设备。
     @param compile 是否在首次传播时用 ``torch.compile`` 编译主要推理模块。
+    @param learned_prompt_path 可选目标特征文件；启用后不加载文本编码器，冻结原模型。
     @return 已加载权重、但尚未绑定视频会话的 ``Sam3VideoInference`` 实例。
 
     检测器在每帧根据文本/几何提示产生候选掩码；跟踪器则把已确认对象的
@@ -706,7 +735,9 @@ def build_sam3_video_model(
 
     # 检测器负责从图像特征、文本特征和几何提示中提出当前帧的新对象候选。
     visual_neck = _create_vision_backbone()
-    text_encoder = _create_text_encoder(bpe_path)
+    text_encoder = (
+        _create_text_encoder(bpe_path) if learned_prompt_path is None else None
+    )
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()
@@ -804,6 +835,12 @@ def build_sam3_video_model(
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 
+        if learned_prompt_path is not None:
+            ckpt = {
+                k: v
+                for k, v in ckpt.items()
+                if not k.startswith("detector.backbone.language_backbone.")
+            }
         missing_keys, unexpected_keys = model.load_state_dict(
             ckpt, strict=strict_state_dict_loading
         )
@@ -811,6 +848,15 @@ def build_sam3_video_model(
             print(f"Missing keys: {missing_keys}")
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
+
+    if learned_prompt_path is not None:
+        from sam3.model.learned_prompt import attach_learned_prompt, LearnedPrompt
+
+        if checkpoint_path is None:
+            raise ValueError("Learned prompts require a pretrained base checkpoint")
+        attach_learned_prompt(
+            model, LearnedPrompt.load(learned_prompt_path, checkpoint_path)
+        )
 
     model.to(device=device)
     return model

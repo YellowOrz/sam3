@@ -81,9 +81,9 @@ class Sam3Processor:
         if not isinstance(images, list):
             raise ValueError("Images must be a list of PIL images or tensors")
         assert len(images) > 0, "Images list must not be empty"
-        assert isinstance(images[0], PIL.Image.Image), (
-            "Images must be a list of PIL images"
-        )
+        assert isinstance(
+            images[0], PIL.Image.Image
+        ), "Images must be a list of PIL images"
 
         state["original_heights"] = [image.height for image in images]
         state["original_widths"] = [image.width for image in images]
@@ -111,9 +111,25 @@ class Sam3Processor:
         return state
 
     @torch.inference_mode()
+    def set_learned_prompt(self, target_id: str, state: Dict):
+        """Run segmentation using the target loaded by learned_prompt_path."""
+        prompt = getattr(self.model.backbone, "learned_prompt", None)
+        if prompt is None:
+            raise ValueError("Build the model with learned_prompt_path first")
+        prompt.require_target(target_id)
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_learned_prompt")
+        state["backbone_out"].update(prompt(1, device=self.device))
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = self.model._get_dummy_prompt()
+        return self._forward_grounding(state)
+
+    @torch.inference_mode()
     def set_text_prompt(self, prompt: str, state: Dict):
         """Sets the text prompt and run the inference"""
 
+        if hasattr(self.model.backbone, "learned_prompt"):
+            raise ValueError("Use set_learned_prompt in learned-feature mode")
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 

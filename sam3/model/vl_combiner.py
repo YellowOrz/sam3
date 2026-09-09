@@ -40,7 +40,9 @@ class SAM3VLBackbone(nn.Module):
         super().__init__()
         self.vision_backbone: Sam3DualViTDetNeck = (
             # pyrefly: ignore [bad-assignment]
-            torch.compile(visual) if compile_visual else visual
+            torch.compile(visual)
+            if compile_visual
+            else visual
         )
         self.language_backbone = text
         self.scalp = scalp
@@ -124,6 +126,13 @@ class SAM3VLBackbone(nn.Module):
     def forward_text(
         self, captions, input_boxes=None, additional_text=None, device="cuda"
     ):
+        if hasattr(self, "learned_prompt"):
+            if input_boxes is not None or additional_text is not None:
+                raise ValueError(
+                    "Learned prompts do not encode additional text or boxes"
+                )
+            # Captions are internal query slots only; no tokenizer/encoder is called.
+            return self.learned_prompt(len(captions), device=device)
         return activation_ckpt_wrapper(self._forward_text_no_ack_ckpt)(
             captions=captions,
             input_boxes=input_boxes,
@@ -186,9 +195,9 @@ class SAM3VLBackboneTri(SAM3VLBackbone):
         super().__init__(
             visual=visual, text=text, compile_visual=compile_visual, scalp=scalp
         )
-        assert isinstance(self.vision_backbone, Sam3TriViTDetNeck), (
-            f"Expected vision backbone to be of type Sam3TriViTDetNeck, got {type(self.vision_backbone)}"
-        )
+        assert isinstance(
+            self.vision_backbone, Sam3TriViTDetNeck
+        ), f"Expected vision backbone to be of type Sam3TriViTDetNeck, got {type(self.vision_backbone)}"
 
     def forward_image(
         self,
@@ -359,9 +368,9 @@ class TriHeadVisionOnly(VisionOnly):
             compile_mode=compile_mode,
             compile_extra_args=compile_extra_args,
         )
-        assert isinstance(self.vision_backbone, Sam3TriViTDetNeck), (
-            f"Expected vision backbone to be of type Sam3TriViTDetNeck, got {type(self.vision_backbone)}"
-        )
+        assert isinstance(
+            self.vision_backbone, Sam3TriViTDetNeck
+        ), f"Expected vision backbone to be of type Sam3TriViTDetNeck, got {type(self.vision_backbone)}"
 
     def forward_image(
         self,

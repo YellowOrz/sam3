@@ -40,6 +40,7 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         video_loader_type="cv2",
         apply_temporal_disambiguation: bool = True,
         compile: bool = False,
+        learned_prompt_path=None,
     ):
         """! @brief 加载 SAM 3 视频模型并配置帧加载方式。
 
@@ -64,10 +65,29 @@ class Sam3VideoPredictor(Sam3BasePredictor):
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
                 compile=compile,
+                learned_prompt_path=learned_prompt_path,
             )
             .cuda()
             .eval()
         )
+
+    @torch.inference_mode()
+    def handle_request(self, request):
+        if request["type"] == "add_learned_prompt":
+            prompt = getattr(self.model.detector.backbone, "learned_prompt", None)
+            if prompt is None:
+                raise ValueError("Build the predictor with learned_prompt_path first")
+            prompt.require_target(request["target_id"])
+            return self.add_prompt(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+                # Internal identifier only, never passed to a text encoder.
+                text="learned:" + prompt.target_id,
+            )
+        if request["type"] == "add_prompt" and request.get("text") is not None:
+            if hasattr(self.model.detector.backbone, "learned_prompt"):
+                raise ValueError("Use add_learned_prompt in learned-feature mode")
+        return super().handle_request(request)
 
     def remove_object(
         self,

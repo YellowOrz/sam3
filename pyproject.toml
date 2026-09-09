@@ -25,6 +25,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "torch>=2.7",
+    "torchvision",
+    "pillow",
+    "triton; sys_platform == 'linux'",
     "timm>=1.0.17",
     "numpy>=1.26,<2",
     "tqdm",
@@ -72,6 +76,7 @@ notebooks = [
 ]
 train = [
     "hydra-core",
+    "omegaconf>=2.3",
     "submitit",
     "tensorboard",
     "zstandard",
