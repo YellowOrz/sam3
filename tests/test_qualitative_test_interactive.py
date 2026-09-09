@@ -1259,11 +1259,14 @@ def test_interactive_outputs_write_mask_video_and_metadata(tmp_path: Path) -> No
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["source"]["fps"] == 12.0
     assert metadata["frames_processed"] == 3
-    assert metadata["object_id_to_label"] == {"1": 1}
+    assert metadata["object_id_to_label"] == {"0": 1}
+    assert metadata["original_object_id_to_object_id"] == {"1": 0}
     assert metadata["outputs"]["instance_masks_codec"] == "FFV1"
     interactions = json.loads(interactions_path.read_text(encoding="utf-8"))
     assert interactions["propagation_direction"] == "forward"
     assert interactions["confirmed_points"][0]["frame_index"] == 1
+    assert interactions["confirmed_points"][0]["obj_id"] == 0
+    assert interactions["confirmed_points"][0]["original_obj_id"] == 1
 
 
 def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
@@ -1294,6 +1297,12 @@ def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
         chunks.append((start, start + frame_count, app.output_dir))
 
     output_dir = tmp_path / "merged"
+    frame_dir = tmp_path / "all-frames"
+    frame_dir.mkdir()
+    for index in range(3):
+        cv2.imwrite(
+            str(frame_dir / f"{index:05d}.jpg"), np.zeros((8, 10, 3), dtype=np.uint8)
+        )
     qualitative.merge_chunk_outputs(
         chunks,
         output_dir,
@@ -1302,6 +1311,7 @@ def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
         "hand",
         "sam3.1",
         2,
+        frame_dir,
     )
 
     capture = cv2.VideoCapture(str(output_dir / "result.mp4"))

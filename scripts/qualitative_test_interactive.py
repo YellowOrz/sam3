@@ -19,7 +19,25 @@
 如果输出目录中已经存在结果，请增加 ``--overwrite``。
 
 ``--chunk-frames`` 默认为 0，表示不开启分块；启用时必须不少于 100 帧。程序会
-逐段创建独立 tracker session，完成交互后自动汇总。对象编号和 mask 标签按段独立。
+逐段创建独立 tracker session，每段结束时按剩余原 ID 升序紧凑编号为 0、1、2……。
+编辑过程中不改号。不分段时在整个视频结束导出时进行同样的编号整理。
+
+分段汇总与终端复核
+------------------
+
+* 所有段完成后，默认相同局部 ID 对应同一物体，生成全视频标签并自动回放。
+  画面中 ``chunk`` 为从 1 开始的段号，``local`` 为本段紧凑 ID，``id`` 为全局 ID。
+* 回放中空格暂停/继续，拖动 Frame 滑条定位；播放结束、按 Q/Esc 或关闭窗口回到终端。
+* 输入 ``show`` 查看对应表。``map 2 1=2`` 表示第 2 段局部 ID 1 对应全局 ID 2。
+  对应关系作用于整段。可使用未占用的全局 ID 表示新的独立物体。
+* 同段不能有两个局部 ID 对应同一个全局 ID；交换时一次输入 ``map 2 1=2 2=1``。
+  不合法的命令不会修改结果。全视频最多支持 255 个不同物体。
+* 每次有效修改都会重新写出视频、无损掩码和对应表；输入 ``replay`` 可以重复回放。
+  本阶段仅调整身份对应，不修改掩码形状或重新运行传播。
+* 只有终端输入 ``ok`` 才确认结果：全局 ID 按升序再次紧凑化为 0、1、2……，同步写出
+  全部结果。灰度像素标签从 1 开始，0 始终是背景，最终对象 ID 对应像素标签 ID+1。
+* 复核期间结果标记为 ``unconfirmed``；EOF 或 Ctrl+C 会保留最近写出的结果及对应表，
+  并以非零状态退出。本脚本不提供重启后恢复复核的命令。
 
 CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 ``float16``。
 主线程在启动时进入 autocast；传播工作线程会再进入一次（autocast 是线程局部的）。
@@ -71,7 +89,10 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
 * ``result.mp4``：使用原视频帧率、叠加最终 mask 的完整视频。
 * ``masks.mkv``：FFV1 无损灰度标签视频；0 为背景，1--255 为对象标签。
 * ``metadata.json``：输入、模型、对象标签映射和输出格式元数据。
+  包含原始到紧凑 ID 映射；分段汇总额外包含每段局部到全局 ID 对应及复核确认状态。
 * ``interactions.json``：文本提示、确认点和交互事件记录。
+  对象引用同步使用导出 ID，保留 ``original_obj_id``，分段时另保留 ``local_obj_id``；
+  已删除对象的导出 ID 为 null，原始 ID 仍保留用于追溯。
 """
 
 import argparse
@@ -391,6 +412,7 @@ def render_frame_bgr(
     active_obj: Optional[int] = None,
     stale: bool = False,
     status: Optional[str] = None,
+    object_names: Optional[Dict[int, str]] = None,
 ) -> np.ndarray:
     probabilities_by_obj = probabilities_by_obj or {}
     object_to_label = object_to_label or {}
@@ -436,6 +458,8 @@ def render_frame_bgr(
         if len(xs):
             center = (int(np.median(xs)), int(np.median(ys)))
             text = f"label={label} id={obj_id}"
+            if object_names is not None:
+                text = object_names[obj_id]
             if obj_id in probabilities_by_obj:
                 text += f" p={probabilities_by_obj[obj_id]:.2f}"
             cv2.putText(
@@ -1974,7 +1998,22 @@ def build_label_image(
     return label_image
 
 
+def remap_interaction(item: Dict[str, Any], mapping: Dict[int, int]) -> Dict[str, Any]:
+    """Keep tracker IDs for audit; deleted objects have no exported ID."""
+    result = dict(item)
+    for key in ("obj_id", "active_obj"):
+        if key in result and result[key] is not None:
+            original = int(result[key])
+            result[f"original_{key}"] = original
+            result[key] = mapping.get(original)
+    return result
+
+
 def write_interactive_outputs(app: InteractiveApp) -> None:
+    original_ids = sorted({obj_id for masks in app.cache.values() for obj_id in masks})
+    id_mapping = {obj_id: index for index, obj_id in enumerate(original_ids)}
+    if len(id_mapping) > 255:
+        raise RuntimeError("more than 255 tracked instances; uint8 labels overflow")
     app.output_dir.mkdir(parents=True, exist_ok=True)
     result_path = app.output_dir / "result.mp4"
     masks_path = app.output_dir / "masks.mkv"
@@ -2006,10 +2045,13 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
         raise RuntimeError(f"cannot create lossless mask video: {temporary_masks}")
-    object_to_label: Dict[int, int] = {}
+    object_to_label = {obj_id: obj_id + 1 for obj_id in id_mapping.values()}
     try:
         for frame_index in range(app.frame_count):
-            masks_by_obj = app.cache[frame_index]
+            masks_by_obj = {
+                id_mapping[obj_id]: mask
+                for obj_id, mask in app.cache[frame_index].items()
+            }
             label_image = build_label_image(
                 masks_by_obj,
                 object_to_label,
@@ -2021,7 +2063,13 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
                 render_frame_bgr(
                     load_frame_bgr(app.frame_dir, frame_index),
                     masks_by_obj,
-                    probabilities_by_obj=app.probability_cache.get(frame_index, {}),
+                    probabilities_by_obj={
+                        id_mapping[obj_id]: probability
+                        for obj_id, probability in app.probability_cache.get(
+                            frame_index, {}
+                        ).items()
+                        if obj_id in id_mapping
+                    },
                     object_to_label=object_to_label,
                     frame_index=app.frame_offset + frame_index,
                     prompt=app.prompt,
@@ -2063,6 +2111,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "model_version": app.version,
             "source": source,
             "frames_processed": app.frame_count,
+            "original_object_id_to_object_id": id_mapping,
             "object_id_to_label": {
                 str(obj_id): label for obj_id, label in sorted(object_to_label.items())
             },
@@ -2081,10 +2130,10 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "source": source,
             "outputs": outputs,
             "confirmed_points": [
-                p.as_json()
+                remap_interaction(p.as_json(), id_mapping)
                 for p in sorted(app.confirmed_points, key=lambda point: point.sequence)
             ],
-            "events": app.events,
+            "events": [remap_interaction(event, id_mapping) for event in app.events],
         },
     )
     print(f"Saved interactive outputs to {app.output_dir}")
@@ -2108,6 +2157,236 @@ def validate_interactive_outputs(output_dir: Path, overwrite: bool) -> None:
         )
 
 
+def remap_chunk_interaction(
+    item: Dict[str, Any], mapping: Dict[int, int]
+) -> Dict[str, Any]:
+    result = dict(item)
+    for key in ("obj_id", "active_obj"):
+        if key in result:
+            local_id = result[key]
+            result[f"local_{key}"] = local_id
+            result[key] = mapping.get(local_id)
+    return result
+
+
+def validate_chunk_mappings(
+    mappings: Sequence[Dict[int, int]], local_ids: Sequence[Dict[int, int]]
+) -> None:
+    if len(mappings) != len(local_ids):
+        raise ValueError("one mapping is required per chunk")
+    for index, (mapping, ids) in enumerate(zip(mappings, local_ids), 1):
+        if mapping.keys() != ids.keys():
+            raise ValueError(f"chunk {index}: mapping must cover exactly its local IDs")
+        if any(not isinstance(value, int) or value < 0 for value in mapping.values()):
+            raise ValueError("global IDs must be non-negative integers")
+        if len(set(mapping.values())) != len(mapping):
+            raise ValueError(
+                f"chunk {index}: duplicate global ID; submit swaps together, "
+                f"e.g. map {index} 1=2 2=1"
+            )
+    if len({value for mapping in mappings for value in mapping.values()}) > 255:
+        raise ValueError("more than 255 global objects; uint8 labels overflow")
+
+
+def parse_mapping_command(
+    command: str, mappings: Sequence[Dict[int, int]]
+) -> List[Dict[int, int]]:
+    tokens = command.split()
+    if len(tokens) < 3 or tokens[0] != "map":
+        raise ValueError("usage: map CHUNK LOCAL=GLOBAL [LOCAL=GLOBAL ...]")
+    try:
+        chunk_index = int(tokens[1]) - 1
+    except ValueError as exc:
+        raise ValueError("chunk number must be an integer starting at 1") from exc
+    if not 0 <= chunk_index < len(mappings):
+        raise ValueError(f"chunk number must be between 1 and {len(mappings)}")
+    updated = [dict(mapping) for mapping in mappings]
+    changes = {}
+    for token in tokens[2:]:
+        try:
+            local_id, global_id = (int(value) for value in token.split("="))
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid correspondence: {token}; expected LOCAL=GLOBAL"
+            ) from exc
+        if local_id not in updated[chunk_index]:
+            raise ValueError(f"chunk {chunk_index + 1} has no local ID {local_id}")
+        if local_id in changes:
+            raise ValueError(f"local ID {local_id} was specified more than once")
+        changes[local_id] = global_id
+    updated[chunk_index].update(changes)
+    validate_chunk_mappings(updated, mappings)
+    return updated
+
+
+def replay_merged_outputs(output_dir: Path, window_width: int) -> None:
+    """Read-only replay; closing the window always returns to the terminal."""
+    capture = cv2.VideoCapture(str(output_dir / "result.mp4"))
+    window = "SAM 3 final review - Space: pause, Q: terminal"
+    created = False
+    try:
+        if not capture.isOpened():
+            raise RuntimeError("cannot open merged result for review")
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if frame_count < 1 or fps <= 0:
+            raise RuntimeError("merged result has invalid frame count or FPS")
+        cv2.namedWindow(window, WINDOW_FLAGS)
+        created = True
+        position = 0
+        playing = True
+        seek_to = None
+        setting_slider = False
+
+        def seek(value: int) -> None:
+            nonlocal seek_to, playing
+            if not setting_slider:
+                seek_to = value
+                playing = False
+
+        cv2.createTrackbar("Frame", window, 0, max(1, frame_count - 1), seek)
+        seek_to = None
+        playing = True
+        frame = None
+        while True:
+            started = time.monotonic()
+            if seek_to is not None:
+                position = min(seek_to, frame_count - 1)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, position)
+                seek_to = None
+                frame = None
+            if frame is None or playing:
+                ok, frame = capture.read()
+                if not ok:
+                    raise RuntimeError(f"cannot read review frame {position}")
+                scale = min(1.0, window_width / frame.shape[1])
+                if scale < 1.0:
+                    frame = cv2.resize(
+                        frame,
+                        (
+                            max(1, int(frame.shape[1] * scale)),
+                            max(1, int(frame.shape[0] * scale)),
+                        ),
+                    )
+                cv2.imshow(window, frame)
+                setting_slider = True
+                cv2.setTrackbarPos("Frame", window, position)
+                setting_slider = False
+            delay = max(1, round(1000 * (1 / fps - (time.monotonic() - started))))
+            key = cv2.waitKey(delay if playing else 30) & 0xFF
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    return
+            except cv2.error:
+                # Some HighGUI backends destroy the window before this query.
+                return
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            if key == ord(" "):
+                playing = not playing
+            if seek_to is not None:
+                continue
+            if playing:
+                if position >= frame_count - 1:
+                    return
+                position += 1
+    finally:
+        capture.release()
+        if created:
+            try:
+                cv2.destroyWindow(window)
+            except cv2.error:
+                pass
+
+
+def review_chunk_outputs(
+    chunks: Sequence[Tuple[int, int, Path]],
+    output_dir: Path,
+    video_path: Path,
+    video_info: VideoInfo,
+    prompt: str,
+    version: str,
+    chunk_frames: int,
+    frame_dir: Path,
+    window_width: int,
+) -> bool:
+    mappings = []
+    for _, _, directory in chunks:
+        metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        mappings.append(
+            {int(obj_id): int(obj_id) for obj_id in metadata["object_id_to_label"]}
+        )
+
+    def save(current: Sequence[Dict[int, int]], confirmed: bool = False) -> None:
+        merge_chunk_outputs(
+            chunks,
+            output_dir,
+            video_path,
+            video_info,
+            prompt,
+            version,
+            chunk_frames,
+            frame_dir,
+            current,
+            confirmed,
+        )
+
+    def show() -> None:
+        for index, mapping in enumerate(mappings, 1):
+            pairs = " ".join(
+                f"{local}={global_id}" for local, global_id in sorted(mapping.items())
+            )
+            print(f"chunk {index}: {pairs or '(no objects)'}")
+
+    save(mappings)
+    print("Final review: same local IDs initially refer to the same global object.")
+    print("map CHUNK LOCAL=GLOBAL [...] | show | replay | ok")
+    print(
+        "Example: map 2 1=2 2=1 swaps chunk 2 IDs. An unused global ID separates an object."
+    )
+    print(
+        "Close playback or press Q to return here; only terminal 'ok' confirms the result."
+    )
+    try:
+        show()
+        replay_merged_outputs(output_dir, window_width)
+        while True:
+            command = input("Review [map/show/replay/ok]: ").strip()
+            if command == "ok":
+                ids = sorted(
+                    {value for mapping in mappings for value in mapping.values()}
+                )
+                compact = {value: index for index, value in enumerate(ids)}
+                finalized = [
+                    {local: compact[global_id] for local, global_id in mapping.items()}
+                    for mapping in mappings
+                ]
+                save(finalized, confirmed=True)
+                print(f"Confirmed. Final global ID compaction: {compact}")
+                return True
+            if command == "replay":
+                replay_merged_outputs(output_dir, window_width)
+            elif command == "show":
+                show()
+            elif command.split()[:1] == ["map"]:
+                try:
+                    updated = parse_mapping_command(command, mappings)
+                except ValueError as exc:
+                    print(f"Invalid mapping: {exc}")
+                    continue
+                save(updated)
+                mappings = updated
+                show()
+                print("Mapping saved; use replay to review, or ok to confirm.")
+            else:
+                print("Commands: map CHUNK LOCAL=GLOBAL [...] | show | replay | ok")
+    except (EOFError, KeyboardInterrupt):
+        print(
+            f"\nReview interrupted. Unconfirmed outputs and mappings retained in {output_dir}"
+        )
+        return False
+
+
 def merge_chunk_outputs(
     chunks: Sequence[Tuple[int, int, Path]],
     output_dir: Path,
@@ -2116,7 +2395,26 @@ def merge_chunk_outputs(
     prompt: str,
     version: str,
     chunk_frames: int,
+    frame_dir: Path,
+    mappings: Optional[Sequence[Dict[int, int]]] = None,
+    confirmed: bool = False,
 ) -> None:
+    metadata_by_chunk = [
+        json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        for _, _, directory in chunks
+    ]
+    local_labels = [
+        {
+            int(obj_id): int(label)
+            for obj_id, label in meta["object_id_to_label"].items()
+        }
+        for meta in metadata_by_chunk
+    ]
+    if mappings is None:
+        mappings = [{obj_id: obj_id for obj_id in labels} for labels in local_labels]
+    validate_chunk_mappings(mappings, local_labels)
+    global_ids = sorted({obj_id for mapping in mappings for obj_id in mapping.values()})
+    global_labels = {obj_id: index + 1 for index, obj_id in enumerate(global_ids)}
     output_dir.mkdir(parents=True, exist_ok=True)
     temporary_result = output_dir / ".result.tmp.mp4"
     temporary_masks = output_dir / ".masks.tmp.mkv"
@@ -2148,27 +2446,52 @@ def merge_chunk_outputs(
     sequence_offset = 0
     try:
         for chunk_index, (start, end, chunk_dir) in enumerate(chunks, 1):
-            result_capture = cv2.VideoCapture(str(chunk_dir / "result.mp4"))
+            mapping = mappings[chunk_index - 1]
+            labels = local_labels[chunk_index - 1]
             mask_capture = cv2.VideoCapture(str(chunk_dir / "masks.mkv"))
             try:
-                if not result_capture.isOpened() or not mask_capture.isOpened():
+                if not mask_capture.isOpened():
                     raise RuntimeError(f"cannot open outputs for chunk {chunk_index}")
-                for _ in range(end - start):
-                    result_ok, result_frame = result_capture.read()
+                for frame_index in range(start, end):
                     mask_ok, mask_frame = mask_capture.read()
-                    if not result_ok or not mask_ok:
+                    if not mask_ok:
                         raise RuntimeError(f"chunk {chunk_index} output is incomplete")
-                    if result_frame.shape[:2] != (video_info.height, video_info.width):
+                    if mask_frame.shape[:2] != (video_info.height, video_info.width):
                         raise RuntimeError(f"chunk {chunk_index} dimensions differ")
-                    result_writer.write(result_frame)
-                    mask_writer.write(cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY))
+                    local_image = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+                    if not set(np.unique(local_image)).issubset({0, *labels.values()}):
+                        raise RuntimeError(
+                            f"chunk {chunk_index} contains unknown labels"
+                        )
+                    masks = {
+                        mapping[local_id]: local_image == label
+                        for local_id, label in labels.items()
+                    }
+                    mask_writer.write(
+                        build_label_image(
+                            masks, global_labels, video_info.width, video_info.height
+                        )
+                    )
+                    result_writer.write(
+                        render_frame_bgr(
+                            load_frame_bgr(frame_dir, frame_index),
+                            masks,
+                            object_to_label=global_labels,
+                            frame_index=frame_index,
+                            prompt=f"chunk={chunk_index} {prompt}",
+                            object_names={
+                                global_id: (
+                                    f"chunk={chunk_index} local={local_id} "
+                                    f"id={global_id}"
+                                )
+                                for local_id, global_id in mapping.items()
+                            },
+                        )
+                    )
             finally:
-                result_capture.release()
                 mask_capture.release()
 
-            metadata = json.loads(
-                (chunk_dir / "metadata.json").read_text(encoding="utf-8")
-            )
+            metadata = metadata_by_chunk[chunk_index - 1]
             interactions = json.loads(
                 (chunk_dir / "interactions.json").read_text(encoding="utf-8")
             )
@@ -2179,6 +2502,10 @@ def merge_chunk_outputs(
                     "end_frame_exclusive": end,
                     "frame_count": end - start,
                     "object_id_to_label": metadata["object_id_to_label"],
+                    "original_object_id_to_object_id": metadata.get(
+                        "original_object_id_to_object_id", {}
+                    ),
+                    "local_object_id_to_global_object_id": mapping,
                 }
             )
             local_sequences = [
@@ -2189,11 +2516,13 @@ def merge_chunk_outputs(
                 ]
             ]
             for item in interactions.get("confirmed_points", []):
+                item = remap_chunk_interaction(item, mapping)
                 item["sequence"] += sequence_offset
                 item["frame_index"] += start
                 item["chunk_index"] = chunk_index
                 confirmed_points.append(item)
             for item in interactions.get("events", []):
+                item = remap_chunk_interaction(item, mapping)
                 item["sequence"] += sequence_offset
                 for key in ("frame_index", "target_frame", "checkpoint_frame"):
                     if key in item:
@@ -2208,6 +2537,8 @@ def merge_chunk_outputs(
                 events.append(item)
             sequence_offset += max(local_sequences, default=0)
     except BaseException:
+        result_writer.release()
+        mask_writer.release()
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
         raise
@@ -2230,10 +2561,12 @@ def merge_chunk_outputs(
         "visualization_video": "result.mp4",
         "label_dtype": "uint8",
         "background_label": 0,
-        "label_scope": "chunk",
+        "label_scope": "video",
     }
     common = {
-        "status": "success",
+        "status": "success" if confirmed else "unconfirmed",
+        "review_confirmed": confirmed,
+        "object_id_to_label": global_labels,
         "input_video": str(video_path),
         "model_version": version,
         "source": source,
@@ -2248,7 +2581,7 @@ def merge_chunk_outputs(
             "completed_at": utc_now(),
             "prompt": prompt,
             "frames_processed": video_info.frame_count,
-            "object_identity_scope": "chunk",
+            "object_identity_scope": "video",
         },
     )
     atomic_write_json(
@@ -2457,7 +2790,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         frame_offset=start,
                     )
                     chunks.append((start, end, chunk_output_dir))
-                merge_chunk_outputs(
+                confirmed = review_chunk_outputs(
                     chunks,
                     output_dir,
                     video_path,
@@ -2465,7 +2798,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.text_prompt,
                     args.version,
                     args.chunk_frames,
+                    frame_dir,
+                    args.window_width,
                 )
+                if not confirmed:
+                    return 1
     finally:
         predictor.shutdown()
     return 0
