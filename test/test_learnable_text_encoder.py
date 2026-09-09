@@ -5,6 +5,7 @@ import torch
 
 from sam3.model.learnable_text_encoder import (
     LearnableClassTextEncoder,
+    filter_checkpoint_for_learnable_class_tokens,
     freeze_for_learnable_class_tokens,
 )
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
@@ -119,6 +120,24 @@ class LearnableClassTextEncoderTest(unittest.TestCase):
         parameters = inspect.signature(Sam3VideoPredictor.__init__).parameters
         self.assertIn("text_encoder_type", parameters)
         self.assertIn("tokens_per_class", parameters)
+
+    def test_checkpoint_filter_keeps_trained_tokens_and_non_language_weights(self):
+        checkpoint = {
+            "detector.backbone.language_backbone.encoder.weight": torch.tensor(1),
+            "detector.backbone.language_backbone.resizer.weight": torch.tensor(2),
+            "detector.backbone.language_backbone.class_tokens": torch.tensor(3),
+            "detector.backbone.vision_backbone.weight": torch.tensor(4),
+        }
+
+        filtered = filter_checkpoint_for_learnable_class_tokens(checkpoint)
+
+        self.assertEqual(
+            set(filtered),
+            {
+                "detector.backbone.language_backbone.class_tokens",
+                "detector.backbone.vision_backbone.weight",
+            },
+        )
 
 
 if __name__ == "__main__":

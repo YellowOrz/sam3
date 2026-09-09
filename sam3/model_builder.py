@@ -21,7 +21,10 @@ from sam3.model.decoder import (
 )
 from sam3.model.encoder import TransformerEncoderFusion, TransformerEncoderLayer
 from sam3.model.geometry_encoders import SequenceGeometryEncoder
-from sam3.model.learnable_text_encoder import LearnableClassTextEncoder
+from sam3.model.learnable_text_encoder import (
+    filter_checkpoint_for_learnable_class_tokens,
+    LearnableClassTextEncoder,
+)
 from sam3.model.maskformer_segmentation import PixelDecoder, UniversalSegmentationHead
 from sam3.model.memory import (
     CXBlock,
@@ -831,11 +834,7 @@ def build_sam3_video_model(
             ckpt = ckpt["model"]
 
         if text_encoder_type == "learnable_class":
-            ckpt = {
-                key: value
-                for key, value in ckpt.items()
-                if "language_backbone." not in key
-            }
+            ckpt = filter_checkpoint_for_learnable_class_tokens(ckpt)
 
         use_strict_loading = (
             strict_state_dict_loading and text_encoder_type == "ve"

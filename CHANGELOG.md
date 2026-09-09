@@ -28,6 +28,7 @@
   - `tokens_per_class=1`。
 - 默认 `ve` 行为保持不变。
 - learnable 模式加载 checkpoint 时忽略原 `language_backbone` 权重，视觉、decoder、tracker 等权重继续加载。
+- 训练后 checkpoint 中的 `language_backbone.class_tokens` 会被保留并重新加载；只过滤旧 tokenizer/Text Transformer/resizer 权重。
 
 ## 4. 接入 Video Predictor
 

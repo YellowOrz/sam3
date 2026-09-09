@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-from typing import Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -100,4 +100,16 @@ def freeze_for_learnable_class_tokens(model: nn.Module) -> Set[str]:
         name
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
+    }
+
+
+def filter_checkpoint_for_learnable_class_tokens(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Drop legacy text-encoder weights while retaining trained class tokens."""
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if "language_backbone." not in key
+        or key.endswith("language_backbone.class_tokens")
     }
