@@ -311,3 +311,41 @@ def test_video_request_compatibility_and_target_selection():
         predictor.handle_request(ordinary)
     points = {"type": "add_prompt", "points": [[0.5, 0.5]]}
     assert predictor.handle_request(points) == ("original", points)
+
+
+def test_prepare_random_without_text_encoder(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "prepare_prompt", ROOT / "scripts/prepare_learned_prompt.py"
+    )
+    prepare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prepare)
+    monkeypatch.setitem(sys.modules, "sam3.model.learned_prompt", learned)
+    monkeypatch.setitem(sys.modules, "sam3.model_builder", None)
+    checkpoint = tmp_path / "base.pt"
+    checkpoint.write_bytes(b"hash only; no model loading")
+    args = ["--checkpoint", str(checkpoint), "--target-id", "right_hand"]
+    for count in (1, 4, 32):
+        output = tmp_path / f"random_{count}.pt"
+        options = args + ["--output", str(output), "--init", "random"]
+        for invalid in ([], ["--num-tokens", "0"], ["--num-tokens", "33"]):
+            with pytest.raises(SystemExit):
+                prepare.parse_args(options + invalid)
+        prepare.main(options + ["--num-tokens", str(count)])
+        prompt = learned.LearnedPrompt.load(output, checkpoint)
+        assert prompt.features.shape == (count, 256)
+        assert torch.equal(prompt.padding_mask, torch.arange(32) >= count)
+        expected = torch.randn((32, 256), generator=torch.Generator().manual_seed(0))
+        assert torch.equal(prompt.full_features(), expected * 0.02)
+        assert prompt.metadata["reference_text"] is None
+        assert prompt.metadata["num_tokens"] == count
+        with pytest.raises(SystemExit):
+            prepare.main(options + ["--num-tokens", str(count)])
+    output_args = args + ["--output", str(tmp_path / "unused.pt")]
+    for invalid in (
+        [],
+        ["--reference-text", " "],
+        ["--reference-text", "hand", "--num-tokens", "4"],
+        ["--init", "random", "--num-tokens", "4", "--reference-text", "hand"],
+    ):
+        with pytest.raises(SystemExit):
+            prepare.parse_args(output_args + invalid)

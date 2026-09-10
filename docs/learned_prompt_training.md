@@ -15,10 +15,10 @@ python scripts/prepare_learned_prompt.py --checkpoint /models/sam3.pt --target-i
 随机初始化：
 
 ```bash
-python scripts/prepare_learned_prompt.py --checkpoint /models/sam3.pt --target-id left_hand --reference-text "left hand" --init random --random-std 0.02 --seed 0 --device cuda --output outputs/left_hand_random.pt
+python scripts/prepare_learned_prompt.py --checkpoint /models/sam3.pt --target-id left_hand --init random --num-tokens 4 --random-std 0.02 --seed 0 --device cuda --output outputs/left_hand_random.pt
 ```
 
-这一步单独构建并加载原始文本编码器。文本初始化保存其投影后的 `32 × 256` 特征和有效 token mask；随机初始化使用相同参考文本的 mask，将特征替换为给定标准差的高斯随机数。两种方式都不改变有效 token 布局。之后训练和推理只读取特征文件，不接收自然语言提示、不加载 text encoder。
+文本初始化单独构建并加载原始文本编码器，保存其投影后的 `32 × 256` 特征和有效 token mask。随机初始化不构建文本编码器，不接收 `--reference-text`，必须用 `--num-tokens` 指定有效 token 总数（1–32），前 N 个位置有效，其余为 padding，特征使用给定标准差的高斯随机数。这里的数量不是单词数，也不会自动加起止 token；要匹配默认 tokenizer 的 `left hand` / `right hand` 布局，应设为 4（两个文本 token 加两个起止 token）。随机模式在 CPU 上生成特征，checkpoint 仅用于记录 SHA-256。之后训练和推理只读取特征文件，不接收自然语言提示、不加载 text encoder。
 
 只有有效 token 对应的数值是参数；padding 位置作为固定 buffer 保存，不受梯度或 weight decay 影响。因此可训练参数量是 `有效 token 数 × 256`，接口始终恢复为 `32 × B × 256`。文本初始化在训练前精确保留原始特征和 mask。
 
