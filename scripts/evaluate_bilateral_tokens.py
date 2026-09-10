@@ -490,10 +490,16 @@ def average_precision(records: Sequence[dict]) -> float | None:
     ranked = sorted(records, key=lambda record: float(record["top_confidence"]), reverse=True)
     true_positives = 0
     precision_sum = 0.0
-    for rank, record in enumerate(ranked, 1):
-        if record["target_present"]:
-            true_positives += 1
-            precision_sum += true_positives / rank
+    start = 0
+    while start < len(ranked):
+        end = start + 1
+        score = float(ranked[start]["top_confidence"])
+        while end < len(ranked) and float(ranked[end]["top_confidence"]) == score:
+            end += 1
+        group_positives = sum(bool(row["target_present"]) for row in ranked[start:end])
+        true_positives += group_positives
+        precision_sum += group_positives * true_positives / end
+        start = end
     return precision_sum / positives
 
 
@@ -657,11 +663,14 @@ def render_montages(
             for prompt in CLASS_NAMES:
                 record = records_by_key[(label, dataset_index, prompt)]
                 mask = masks[(label, dataset_index, prompt)]
+                if not record["detected"]:
+                    mask = np.zeros_like(mask)
                 role = "correct" if record["target_present"] else "opposite/negative"
                 title = (
                     f"{prompt} ({role}) | conf={record['top_confidence']:.3f} "
                     f"pres={record['presence_probability']:.3f} "
-                    f"dice={record['top_dice_with_physical_hand']:.3f}"
+                    f"det={int(record['detected'])} "
+                    f"dice={record['detected_dice_with_physical_hand']:.3f}"
                 )
                 row.append(overlay_panel(rgb, gt, mask, title))
             rows.append(row)
