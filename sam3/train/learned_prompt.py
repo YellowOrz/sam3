@@ -16,10 +16,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
-from tqdm import tqdm
-from tqdm.contrib import DummyTqdmFile
 
 from sam3.model.utils.misc import copy_data_to_device
 from sam3.model_builder import build_sam3_image_model
@@ -29,7 +25,6 @@ from sam3.train.data.sam3_image_dataset import Sam3ImageDataset
 from sam3.train.data.uni_hoi import UniHoiTargetCOCO
 from sam3.train.loss.loss_fns import Boxes, CORE_LOSS_KEY, IABCEMdetr, Masks
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
-from sam3.train.utils.logger import make_tensorboard_logger
 from sam3.train.matcher import BinaryOneToManyMatcher
 from sam3.train.transforms.basic_for_api import (
     NormalizeAPI,
@@ -41,6 +36,11 @@ from sam3.train.transforms.filter_query_transforms import (
     FlexibleFilterFindGetQueries,
 )
 from sam3.train.transforms.segmentation import DecodeRle
+from sam3.train.utils.logger import make_tensorboard_logger
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
+from tqdm.contrib import DummyTqdmFile
 
 
 class TargetCOCO(COCO_FROM_JSON):
@@ -184,6 +184,59 @@ def _tb_payload(prefix: str, metrics: dict) -> dict:
     return {f"{prefix}/{key}": value for key, value in metrics.items()}
 
 
+def _log_val_images(
+    writer,
+    batch,
+    output: dict,
+    target: dict,
+    step: int,
+    start: int,
+    limit: int,
+    threshold: float,
+) -> None:
+    """Log RGB / GT / prediction panels for this single-target batch."""
+    offset = 0
+    for query, image_id in enumerate(batch.find_inputs[0].img_ids):
+        if start + query >= limit:
+            break
+        image = batch.img_batch[image_id].detach().float().cpu()
+        image = (image * 0.5 + 0.5).clamp(0, 1)
+        size = image.shape[-2:]
+        num_boxes = int(target["num_boxes"][query])
+        gt = torch.zeros(size, dtype=torch.bool)
+        if num_boxes:
+            gt = (
+                target["masks"][offset : offset + num_boxes]
+                .detach()
+                .cpu()
+                .bool()
+                .any(0)
+            )
+        offset += num_boxes
+        scores = output["pred_logits"][query].detach().float().sigmoid().squeeze(-1)
+        scores = scores * output["presence_logit_dec"][query].detach().float().sigmoid()
+        masks = output["pred_masks"][query][scores > threshold].detach().float().cpu()
+        pred = torch.zeros(size, dtype=torch.bool)
+        if len(masks):
+            pred = (
+                torch.nn.functional.interpolate(
+                    masks[:, None], size=size, mode="bilinear", align_corners=False
+                )[:, 0]
+                .sigmoid()
+                .gt(0.5)
+                .any(0)
+            )
+        color = image.new_tensor([0.0, 1.0, 0.0])[:, None, None]
+        panels = [image]
+        for mask in (gt, pred):
+            panels.append(torch.where(mask[None], image * 0.5 + color * 0.5, image))
+        writer.add_image(
+            f"val/images/{start + query:03d}",
+            torch.cat(panels, dim=2),
+            global_step=step,
+        )
+
+
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -207,6 +260,7 @@ def run_epoch(
             module.eval()
     totals, count = {}, 0
     interval = int(config.get("tensorboard_interval", 100))
+    image_limit = config.get("val_visualization_max_images", 8)
     batch_index = 0
     real_out, real_err = sys.stdout, sys.stderr
     try:
@@ -231,7 +285,9 @@ def run_epoch(
                     enabled=config.amp,
                 ):
                     outputs = model(batch)
-                    targets = [core.back_convert(target) for target in batch.find_targets]
+                    targets = [
+                        core.back_convert(target) for target in batch.find_targets
+                    ]
                     if not training:
                         for output, target in zip(outputs, targets):
                             core._compute_matching(output, target)
@@ -249,6 +305,23 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_([features], config.max_grad_norm)
                     optimizer.step()
                 size = batch.img_batch.shape[0]
+                if (
+                    not training
+                    and count < image_limit
+                    and tb_logger is not None
+                    and _rank0()
+                    and tb_logger.writer is not None
+                ):
+                    _log_val_images(
+                        tb_logger.writer,
+                        batch,
+                        outputs[0],
+                        targets[0],
+                        tb_step,
+                        count,
+                        image_limit,
+                        config.get("val_visualization_threshold", 0.5),
+                    )
                 count += size
                 for key, value in losses.items():
                     totals[key] = totals.get(key, 0.0) + float(value.detach()) * size
@@ -294,6 +367,15 @@ def train(config: DictConfig, resume: str | None = None) -> None:
         raise ValueError("lr and max_grad_norm must be positive")
     if int(config.get("tensorboard_interval", 100)) < 1:
         raise ValueError("tensorboard_interval must be positive")
+    visualize_every = config.get("val_visualization_interval", 1)
+    if type(visualize_every) is not int or visualize_every < 1:
+        raise ValueError("val_visualization_interval must be a positive integer")
+    image_limit = config.get("val_visualization_max_images", 8)
+    if type(image_limit) is not int or image_limit < 0:
+        raise ValueError("val_visualization_max_images must be a nonnegative integer")
+    threshold = config.get("val_visualization_threshold", 0.5)
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+        raise ValueError("val_visualization_threshold must be a number in [0, 1]")
     requested_device = str(config.device)
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("LOCAL_RANK", "0")
@@ -396,6 +478,7 @@ def train(config: DictConfig, resume: str | None = None) -> None:
                     loss_fn,
                     config,
                     progress_desc=f"epoch {epoch_id}/{config.epochs} val",
+                    tb_logger=tb_logger if epoch_id % visualize_every == 0 else None,
                     tb_step=tb_step,
                 )
             tb_logger.log_dict(_tb_payload("train", train_metrics), tb_step)
@@ -427,7 +510,11 @@ def train(config: DictConfig, resume: str | None = None) -> None:
                     shutil.copyfile(
                         output / "last.pt", output / f"epoch_{epoch_id:04d}.pt"
                     )
-                metrics = {"epoch": epoch_id, "train": train_metrics, "val": val_metrics}
+                metrics = {
+                    "epoch": epoch_id,
+                    "train": train_metrics,
+                    "val": val_metrics,
+                }
                 with (output / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(metrics) + "\n")
                 tqdm.write(json.dumps(metrics))
@@ -436,7 +523,9 @@ def train(config: DictConfig, resume: str | None = None) -> None:
             dist.destroy_process_group()
 
 
-def _spawn_train(rank: int, world_size: int, config_dict: dict, resume: str | None) -> None:
+def _spawn_train(
+    rank: int, world_size: int, config_dict: dict, resume: str | None
+) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)

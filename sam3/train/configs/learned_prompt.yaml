@@ -19,6 +19,11 @@ max_grad_norm: 1.0
 amp: true
 seed: 0
 tensorboard_interval: 100
+# Log RGB / GT overlay / prediction overlay on epochs n, 2n, ...
+val_visualization_interval: 1
+# Fixed first N validation images; 0 disables visualization.
+val_visualization_max_images: 8
+val_visualization_threshold: 0.5
 train:
   split: train
 # Set val: null only if no held-out annotations are available.

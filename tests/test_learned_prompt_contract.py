@@ -20,8 +20,7 @@ class LearnedPromptContractTests(unittest.TestCase):
 
         tree = ast.parse((ROOT / "sam3/train/learned_prompt.py").read_text())
         train = next(
-            n for n in tree.body
-            if isinstance(n, ast.FunctionDef) and n.name == "train"
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "train"
         )
         model = Mock()
         prompt = model.backbone.learned_prompt
@@ -34,8 +33,14 @@ class LearnedPromptContractTests(unittest.TestCase):
         torch.get_rng_state.return_value = []
         torch.device.return_value.type = "cpu"
         namespace = dict(
-            DictConfig=object, Path=Path, random=random, shutil=shutil,
-            json=json, np=Mock(), torch=torch, OmegaConf=Mock(),
+            DictConfig=object,
+            Path=Path,
+            random=random,
+            shutil=shutil,
+            json=json,
+            np=Mock(),
+            torch=torch,
+            OmegaConf=Mock(),
             build_sam3_image_model=Mock(return_value=model),
             make_loader=Mock(return_value=types.SimpleNamespace(sampler=None)),
             make_loss=Mock(),
@@ -61,15 +66,35 @@ class LearnedPromptContractTests(unittest.TestCase):
         prompt.save.side_effect = save
         with tempfile.TemporaryDirectory() as directory:
             config = types.SimpleNamespace(
-                epochs=5, batch_size=1, num_workers=0, lr=0.001,
-                max_grad_norm=1.0, seed=0, output_dir=directory,
-                checkpoint="base.pt", initial_feature="initial.pt",
-                target_id="left", category_id=1, device="cpu", loss={},
+                epochs=5,
+                batch_size=1,
+                num_workers=0,
+                lr=0.001,
+                max_grad_norm=1.0,
+                seed=0,
+                output_dir=directory,
+                checkpoint="base.pt",
+                initial_feature="initial.pt",
+                target_id="left",
+                category_id=1,
+                device="cpu",
+                loss={},
                 save_every_n_epochs=2,
+                val={"split": "val"},
+                val_visualization_interval=2,
             )
             config.get = lambda key, default=None: getattr(config, key, default)
             with patch("builtins.print"):
                 namespace["train"](config)
+            val_calls = [
+                call
+                for call in namespace["run_epoch"].call_args_list
+                if call.kwargs["progress_desc"].endswith(" val")
+            ]
+            self.assertEqual(
+                [call.kwargs["tb_logger"] is not None for call in val_calls],
+                [False, True, False, True, False],
+            )
             output = Path(directory)
             self.assertEqual(
                 sorted(p.name for p in output.glob("epoch_*.pt")),
@@ -84,6 +109,7 @@ class LearnedPromptContractTests(unittest.TestCase):
             config.epochs = 6
             with patch("builtins.print"):
                 namespace["train"](config, resume=str(output / "last.pt"))
+            self.assertIsNotNone(namespace["run_epoch"].call_args.kwargs["tb_logger"])
             self.assertEqual(
                 (output / "epoch_0006.pt").read_bytes(),
                 (output / "last.pt").read_bytes(),
@@ -102,6 +128,21 @@ class LearnedPromptContractTests(unittest.TestCase):
                 config.save_every_n_epochs = invalid
                 with self.assertRaisesRegex(ValueError, "save_every_n_epochs"):
                     namespace["train"](config)
+            config.save_every_n_epochs = 0
+            for key, invalid_values, default in (
+                ("val_visualization_interval", (0, -1, 1.5, True, "2"), 1),
+                ("val_visualization_max_images", (-1, 1.5, True, "8"), 8),
+                (
+                    "val_visualization_threshold",
+                    (-0.1, 1.1, float("nan"), True, "0.5"),
+                    0.5,
+                ),
+            ):
+                for invalid in invalid_values:
+                    setattr(config, key, invalid)
+                    with self.assertRaisesRegex(ValueError, key):
+                        namespace["train"](config)
+                setattr(config, key, default)
 
     def test_existing_builder_positional_signatures_are_preserved(self):
         tree = ast.parse((ROOT / "sam3/model_builder.py").read_text(encoding="utf-8"))
@@ -170,7 +211,10 @@ class LearnedPromptContractTests(unittest.TestCase):
             if isinstance(item, ast.FunctionDef) and item.name == "_cuda_ids"
         )
         namespace = {}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "cuda_ids", "exec"), namespace)
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "cuda_ids", "exec"),
+            namespace,
+        )
         parse = namespace["_cuda_ids"]
         self.assertEqual(parse("cuda:1,2,3"), [1, 2, 3])
         self.assertEqual(parse("cuda:1"), [1])

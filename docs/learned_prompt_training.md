@@ -56,6 +56,8 @@ python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.y
 - `config.yaml`、`metrics.jsonl`：运行配置和逐轮训练／验证损失。
 - `tensorboard/`：训练时每 `tensorboard_interval` 个 batch 写入 running train loss，每个 epoch 结束再写入全局聚合的 `train/*` 和 `val/*`。查看：`tensorboard --logdir outputs/learned_right_hand/tensorboard`。
 
+TensorBoard 的 Images 页签中，`val/images/*` 按从左到右展示原图、GT 掩码叠加、预测掩码叠加（绿色，多个目标实例取并集）。图像使用验证输入的 1008 × 1008 尺寸，仅主进程写入，step 与该轮 loss 使用同一累计训练步数。YAML 中 `val_visualization_interval: 1` 表示每轮可视化，设为 n 则在第 n、2n…轮写入；`val_visualization_max_images: 8` 固定记录验证集前 8 张，设为 0 关闭；`val_visualization_threshold: 0.5` 为预测置信度阈值，沿用推理中的分类概率乘 presence 概率，掩码缩放后按概率 > 0.5 二值化。空 GT 或无预测时，对应面板保留原图。没有验证集时不写图像，验证 loss 仍按原有频率记录。
+
 恢复训练时，`epochs` 是希望达到的总轮数。恢复会沿用保存的优化器状态和学习率；如需新的学习率重新微调，可将 `initial_feature` 设为训练后的特征，使用新的输出目录，不传 `--resume`。
 
 ```bash
