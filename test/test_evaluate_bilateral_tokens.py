@@ -1,12 +1,38 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
+import torch
 from pycocotools import mask as mask_utils
 
-from scripts.evaluate_bilateral_tokens import average_precision, decode_gt_mask, dice_iou
+from scripts.evaluate_bilateral_tokens import (
+    average_precision, decode_gt_mask, dice_iou, validate_batch_identity,
+)
 
 
 class EvaluationMetricsTest(unittest.TestCase):
+    def test_loader_substitution_and_category_mismatch_are_rejected(self):
+        metadata = SimpleNamespace(
+            coco_image_id=torch.tensor([20, 20, 10, 10]),
+            original_category_id=torch.tensor([1, 2, 1, 2]),
+        )
+        batch = SimpleNamespace(
+            find_inputs=[SimpleNamespace(
+                img_ids=torch.tensor([0, 0, 1, 1]),
+                text_ids=torch.tensor([0, 1, 0, 1]),
+            )],
+            find_metadatas=[metadata],
+        )
+        images = [{"id": 10}, {"id": 20}]
+        validate_batch_identity(batch, [1, 0], images)
+        metadata.coco_image_id[0] = 30
+        with self.assertRaisesRegex(RuntimeError, "substituted image"):
+            validate_batch_identity(batch, [1, 0], images)
+        metadata.coco_image_id[0] = 20
+        metadata.original_category_id[0] = 2
+        with self.assertRaisesRegex(RuntimeError, "Prompt/category mismatch"):
+            validate_batch_identity(batch, [1, 0], images)
+
     def test_tied_scores_do_not_depend_on_ground_truth_order(self):
         rows = [
             {"target_present": True, "top_confidence": 0.5},

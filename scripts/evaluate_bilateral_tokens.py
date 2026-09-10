@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
         help="Used only to report the original rgb.mkv/mask.mkv mapping",
     )
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--gpu-memory-fraction", type=float, default=None,
+        help="Optional per-process PyTorch allocator limit for shared GPUs (0 < fraction <= 1)",
+    )
     parser.add_argument("--detection-threshold", type=float, default=0.5)
     parser.add_argument("--mask-threshold", type=float, default=0.5)
     parser.add_argument(
@@ -74,6 +78,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide --learned-checkpoint and/or --include-ve")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.gpu_memory_fraction is not None and not 0 < args.gpu_memory_fraction <= 1:
+        parser.error("--gpu-memory-fraction must be within (0, 1]")
     if args.samples_per_group < 0 or args.render_count_per_group < 0:
         parser.error("sample counts cannot be negative")
     for name in ("detection_threshold", "mask_threshold"):
@@ -326,6 +332,19 @@ def source_mapping(image: dict, unified_root: Path) -> dict:
     }
 
 
+def validate_batch_identity(batch, dataset_indices: Sequence[int], images: Sequence[dict]):
+    """Reject loader fallback or category mismatches before comparing with GT."""
+    stage = batch.find_inputs[0]
+    metadata = batch.find_metadatas[0]
+    for row, local_index in enumerate(stage.img_ids.tolist()):
+        expected_id = int(images[dataset_indices[local_index]]["id"])
+        if int(metadata.coco_image_id[row]) != expected_id:
+            raise RuntimeError(f"Dataset substituted image {expected_id} during evaluation")
+        expected_category = int(stage.text_ids[row]) + 1
+        if int(metadata.original_category_id[row]) != expected_category:
+            raise RuntimeError(f"Prompt/category mismatch on image {expected_id}")
+
+
 def evaluate_variant(
     *,
     model,
@@ -353,6 +372,9 @@ def evaluate_variant(
     for batch_number, dataset_indices in enumerate(batches(eval_indices, batch_size), 1):
         samples = [dataset[index] for index in dataset_indices]
         batch = collate_fn_api(samples, dict_key="eval", with_seg_masks=True)["eval"]
+        # The dataset can recover from a read error by returning another image.
+        # Refuse that fallback here: otherwise prediction and GT would diverge.
+        validate_batch_identity(batch, dataset_indices, images)
         batch = copy_data_to_device(batch, device, non_blocking=True)
         if tuple(batch.find_text_batch) != CLASS_NAMES:
             raise RuntimeError(f"Unexpected dataset prompts: {batch.find_text_batch!r}")
@@ -701,6 +723,8 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for SAM3 evaluation")
+    if args.gpu_memory_fraction is not None:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
     if not args.base_checkpoint.is_file():
         raise FileNotFoundError(args.base_checkpoint)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -816,6 +840,9 @@ def main() -> None:
         "evaluated_dataset_indices": eval_indices,
         "detection_threshold": args.detection_threshold,
         "mask_threshold": args.mask_threshold,
+        "gpu_memory_fraction": args.gpu_memory_fraction,
+        "peak_gpu_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2,
+        "peak_gpu_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2,
         "confidence_definition": "sigmoid(pred_logits) * sigmoid(presence_logit_dec)",
         "models": model_metadata,
         "metrics": metrics,
