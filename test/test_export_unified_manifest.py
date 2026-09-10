@@ -1,9 +1,12 @@
 import unittest
 
-from scripts.export_unified_manifest import image_file_name
+from scripts.export_unified_manifest import CATEGORY_IDS, image_file_name
 
 
 class ExportUnifiedManifestTest(unittest.TestCase):
+    def test_bilateral_category_ids_follow_token_encoder_order(self):
+        self.assertEqual(CATEGORY_IDS, {"left_hand": 1, "right_hand": 2})
+
     def test_image_name_contains_view_and_frame_to_avoid_collisions(self):
         record = {
             "source": "dexycb",
