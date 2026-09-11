@@ -14,6 +14,7 @@ from scripts import residual_ddp_checkpoint as checkpoint
 from scripts.residual_ddp_runtime import (
     DeterministicGlobalBatchSampler, capture_rng_state, restore_rng_state,
 )
+from scripts.residual_selection import new_selection_state, update_selection
 
 
 def make_encoder():
@@ -170,6 +171,130 @@ class CheckpointContractTest(unittest.TestCase):
             state, config, ids, initial, _, _ = make_fixture(step)
             self.assertEqual(checkpoint.validate_resume(state, config, ids, initial), step)
             self.assertEqual(state["progress"]["training_complete"], step == 6)
+
+
+class ValidationRecoveryContractTest(unittest.TestCase):
+    def config(self, *, initial=True, every=1):
+        return {**configuration(), "validation": {
+            "enabled": True, "initial_validation": initial, "every_epochs": every,
+            "annotations_sha256": "1" * 64,
+            "selection_policy": {"patience": 3, "min_delta": .001}}}
+
+    def value(self, steps=(), *, last=None, config=None):
+        config = config or self.config()
+        policy = config["validation"]
+        selection = new_selection_state(policy["annotations_sha256"], **policy["selection_policy"])
+        metrics = {"images": 3, "queries": 6, "targets": 4,
+                   **{f"{side}/{key}": number for side in ("left_hand", "right_hand")
+                      for key, number in {"positive_count": 2, "absent_count": 1,
+                                          "false_negative_count": 0, "false_positive_count": 0,
+                                          "miss_zero_dice": .5}.items()}}
+        for step in steps:
+            selection, _ = update_selection(selection, metrics, step=step,
+                epoch=step // config["steps_per_epoch"], validation_sha256=policy["annotations_sha256"])
+        return {"last_validation_step": last if last is not None else (steps[-1] if steps else None),
+                "selection": selection}
+
+    def test_baseline_epoch_pending_and_validated_boundaries(self):
+        config = self.config()
+        for step, selected_steps, expected_pending in (
+                (0, (), 0), (0, (0,), None), (1, (0,), None),
+                (2, (0,), 2), (2, (0, 2), None), (3, (0, 2), None),
+                (4, (0, 2), 4), (4, (0, 2, 4), None)):
+            with self.subTest(step=step, selected=selected_steps):
+                value = self.value(selected_steps)
+                validated = checkpoint.validate_validation_state(value, config, step)
+                self.assertEqual(validated, value)
+                self.assertIsNot(validated, value)
+                self.assertEqual(checkpoint.pending_selection_validation_step(value, config, step), expected_pending)
+
+    def test_skipped_required_epoch_or_baseline_rejected_after_training_advances(self):
+        for step, selected in ((1, ()), (3, (0,)), (5, (0, 2)), (6, (0, 4))):
+            with self.subTest(step=step, selected=selected), self.assertRaisesRegex(ValueError, "skipped"):
+                checkpoint.validate_validation_state(self.value(selected), self.config(), step)
+
+    def test_partial_diagnostic_is_retained_without_selecting_partial_epoch(self):
+        value = self.value((0,), last=1)
+        self.assertEqual(checkpoint.validate_validation_state(value, self.config(), 1), value)
+        config = self.config(initial=False)
+        partial_selection = self.value((1,), config=config)
+        with self.assertRaisesRegex(ValueError, "partial epoch"):
+            checkpoint.validate_validation_state(partial_selection, config, 1)
+
+    def test_disabled_initial_and_every_two_epochs_schedules(self):
+        config = self.config(initial=False, every=2)
+        for step in (0, 1, 2, 3):
+            self.assertIsNone(checkpoint.pending_selection_validation_step(self.value(config=config), config, step))
+        self.assertEqual(checkpoint.pending_selection_validation_step(self.value(config=config), config, 4), 4)
+        selected = self.value((4,), config=config)
+        self.assertIsNone(checkpoint.pending_selection_validation_step(selected, config, 6))
+
+    def test_terminal_selection_cannot_be_followed_by_more_optimizer_steps(self):
+        config = self.config()
+        config["validation"]["selection_policy"]["patience"] = 1
+        stopped = self.value((0, 2), config=config)
+        self.assertTrue(stopped["selection"]["stopped"])
+        checkpoint.validate_validation_state(stopped, config, 2)
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            checkpoint.validate_validation_state(stopped, config, 3)
+
+    def test_invalid_last_step_history_epoch_scope_digest_and_policy_rejected(self):
+        config = self.config()
+        original = self.value((0, 2))
+        for last in (None, -1, 1, 4, True, 3.0):
+            changed = deepcopy(original)
+            changed["last_validation_step"] = last
+            with self.subTest(last=last), self.assertRaises(ValueError):
+                checkpoint.validate_validation_state(changed, config, 3)
+        for key, replacement in (("annotations_sha256", "2" * 64),
+                                 ("selection_policy", {"patience": 4, "min_delta": .001}),
+                                 ("every_epochs", True), ("initial_validation", 1)):
+            changed = deepcopy(config)
+            changed["validation"][key] = replacement
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                checkpoint.validate_validation_state(original, changed, 3)
+        wrong_epoch = self.value((2,), config=self.config(initial=False))
+        wrong_epoch["selection"]["history"][0]["epoch"] = 2
+        with self.assertRaises(ValueError):
+            checkpoint.validate_validation_state(wrong_epoch, self.config(initial=False), 2)
+
+    def test_new_checkpoint_requires_selection_and_roundtrip_preserves_pending_phase(self):
+        original, old_config, ids, initial, encoder, optimizer = make_fixture(step=2)
+        config = self.config()
+        value = self.value((0,))
+        saved = checkpoint.make_checkpoint(encoder, optimizer, config, 2, initial,
+                                           original["rank_states"], validation_state=value)
+        self.assertEqual(checkpoint.validate_resume(saved, config, ids, initial), 2)
+        self.assertEqual(checkpoint.pending_selection_validation_step(saved["validation_state"], config, 2), 2)
+        value["selection"]["bad_epochs"] = 999
+        self.assertEqual(saved["validation_state"]["selection"]["bad_epochs"], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pending.pt"
+            checkpoint.atomic_checkpoint(path, saved)
+            loaded = torch.load(path, weights_only=True)
+            self.assertEqual(checkpoint.validate_resume(loaded, config, ids, initial), 2)
+            self.assertEqual(loaded["validation_state"], saved["validation_state"])
+        missing = deepcopy(saved)
+        del missing["validation_state"]
+        with self.assertRaisesRegex(ValueError, "Missing checkpoint validation state"):
+            checkpoint.validate_resume(missing, config, ids, initial)
+        with self.assertRaises(ValueError):
+            checkpoint.make_checkpoint(encoder, optimizer, config, 2, initial, original["rank_states"])
+        # Old contract remains readable only with that exact old config, not
+        # silently promoted to the new selection-aware training configuration.
+        self.assertEqual(checkpoint.validate_resume(original, old_config, ids, initial), 2)
+        with self.assertRaisesRegex(ValueError, "config mismatch"):
+            checkpoint.validate_resume(original, config, ids, initial)
+
+    def test_disabled_validation_has_explicit_none_and_rejects_selector(self):
+        original, config, ids, initial, encoder, optimizer = make_fixture(step=2)
+        config = {**config, "validation": {"enabled": False}}
+        saved = checkpoint.make_checkpoint(encoder, optimizer, config, 2, initial, original["rank_states"])
+        self.assertIn("validation_state", saved)
+        self.assertIsNone(saved["validation_state"])
+        self.assertEqual(checkpoint.validate_resume(saved, config, ids, initial), 2)
+        with self.assertRaisesRegex(ValueError, "Disabled validation"):
+            checkpoint.validate_validation_state(self.value((0,)), config, 2)
 
 
 class ExactResumeTest(unittest.TestCase):

@@ -129,7 +129,15 @@ class _Event:
         return 0.1
 
 
-def _loop_patches(stack, validation_calls):
+def _validation_metrics(score=.5):
+    return {"images": 3, "queries": 6, "targets": 4, "total_loss": 1.,
+            **{f"{side}/{key}": value for side in ("left_hand", "right_hand")
+               for key, value in {"positive_count": 2, "absent_count": 1,
+                                  "false_negative_count": 0, "false_positive_count": 0,
+                                  "miss_zero_dice": score}.items()}}
+
+
+def _loop_patches(stack, validation_calls, *, scores=None, fail_at_step=None):
     context = DistributedContext(0, 0, 1, torch.device("cpu"), None)
     stack.enter_context(mock.patch.object(training, "initialize_distributed", return_value=context))
     stack.enter_context(mock.patch.object(training, "implementation_hashes", return_value={"scripts/fixture.py": "a" * 64}))
@@ -155,13 +163,179 @@ def _loop_patches(stack, validation_calls):
         random.random()
         np.random.random(31)
         torch.rand(53)
-        return {"total_loss": 1.0}
+        if step == fail_at_step:
+            raise RuntimeError("Synthetic validation interrupted after epoch checkpoint")
+        return _validation_metrics(scores[step] if scores is not None else .5)
 
     stack.enter_context(mock.patch.object(validation, "evaluate_validation", side_effect=evaluate))
     stack.enter_context(redirect_stdout(io.StringIO()))
 
 
 class MainEntryTests(unittest.TestCase):
+    def test_cli_early_stop_defaults_and_invalid_policies(self):
+        required = ["--approval", "/fixture/a", "--base-checkpoint", "/fixture/b",
+                    "--initial-cache", "/fixture/c", "--output-dir", "/fixture/o"]
+        args = training.parse_args(required)
+        self.assertEqual(args.early_stopping_patience, 3)
+        self.assertEqual(args.early_stopping_min_delta, .001)
+        for options in (("--early-stopping-patience", "0"),
+                        ("--early-stopping-min-delta", "-0.1"),
+                        ("--early-stopping-min-delta", "nan")):
+            with self.subTest(options=options), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    training.parse_args(required + list(options))
+
+    def test_all_rank_stop_state_must_match_not_just_scalar_best(self):
+        state = {"last_validation_step": 3, "selection": {"best_metric": .5, "bad_epochs": 1}}
+        training.require_rank_validation_consistency([state, deepcopy(state), deepcopy(state)])
+        different = deepcopy(state)
+        different["selection"]["bad_epochs"] = 2
+        with self.assertRaisesRegex(ValueError, "across ranks"):
+            training.require_rank_validation_consistency([state, state, different])
+        with self.assertRaises(ValueError):
+            training.require_rank_validation_consistency([])
+
+    def test_implementation_hash_paths_are_identical_through_a_repository_symlink(self):
+        project = Path(training.__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "repo-alias"
+            link.symlink_to(project, target_is_directory=True)
+            with mock.patch.object(training.shared.evaluation, "sha256", return_value="a" * 64):
+                physical = training.implementation_hashes()
+                with mock.patch.object(training, "__file__", str(link / "scripts/train_residual_ddp.py")):
+                    symbolic = training.implementation_hashes()
+            self.assertEqual(physical, symbolic)
+            self.assertIn("scripts/train_residual_ddp.py", physical)
+            self.assertIn("scripts/residual_selection.py", physical)
+
+    def test_early_stop_saves_actual_best_even_when_small_gain_exhausts_patience(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = _fixture(Path(temporary))
+            args.epochs, args.early_stopping_patience = 8, 2
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls, scores={0: .5, 3: .6, 6: .6005, 9: .6006})
+                training.run(args)
+            self.assertEqual(calls, [0, 3, 6, 9])
+            latest = torch.load(args.output_dir / "latest.pt", weights_only=True)
+            best = torch.load(args.output_dir / "best.pt", weights_only=True)
+            self.assertEqual(latest["progress"]["global_step"], 9)
+            self.assertFalse(latest["progress"]["training_complete"])
+            self.assertEqual(best["progress"]["global_step"], 9)
+            self.assertEqual(best["validation_state"]["selection"]["best_metric"], .6006)
+            self.assertTrue(latest["validation_state"]["selection"]["stopped"])
+            self.assertTrue(torch.equal(best["cache_state_dict"]["delta"], latest["cache_state_dict"]["delta"]))
+            summary = json.loads((args.output_dir / "summary.json").read_text())
+            self.assertEqual(summary["status"], "early_stopped")
+            self.assertEqual(summary["best_checkpoint"], str(args.output_dir / "best.pt"))
+            self.assertEqual(summary["selection"]["early_stop_reference_metric"], .6)
+
+    def test_tensorboard_records_baseline_and_epoch_selection_metric_with_actual_steps(self):
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        with tempfile.TemporaryDirectory() as temporary:
+            args = _fixture(Path(temporary))
+            args.epochs, args.tensorboard = 1, True
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls, scores={0: .5, 3: .6})
+                training.run(args)
+            events = EventAccumulator(str(args.output_dir / "tensorboard"))
+            events.Reload()
+            values = events.Scalars("validation/dexycb_val_selection/macro_miss_zero_dice")
+            self.assertEqual([event.step for event in values], [0, 3])
+            self.assertAlmostEqual(values[0].value, .5)
+            self.assertAlmostEqual(values[1].value, .6)
+            self.assertIn("train/total_loss", events.Tags()["scalars"])
+            best = torch.load(args.output_dir / "best.pt", weights_only=True)
+            self.assertEqual(best["progress"]["global_step"], 3)
+
+    def test_epoch_prevalidation_recovery_services_pending_validation_before_training(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            args = _fixture(directory)
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls, fail_at_step=3)
+                with self.assertRaisesRegex(RuntimeError, "validation interrupted"):
+                    training.run(args)
+            pending_path = args.output_dir / "step-00000003-recovery.pt"
+            pending = torch.load(pending_path, weights_only=True)
+            self.assertEqual(pending["progress"]["global_step"], 3)
+            self.assertEqual(pending["validation_state"]["selection"]["last_validation_step"], 0)
+            calls.clear()
+            resumed = deepcopy(args)
+            resumed.output_dir, resumed.resume = directory / "resumed-pending", pending_path
+            continuous = deepcopy(args)
+            continuous.output_dir = directory / "continuous"
+            with ExitStack() as stack:
+                _loop_patches(stack, calls)
+                training.run(resumed)
+                self.assertEqual(calls, [3, 6])
+                training.run(continuous)
+            actual = torch.load(resumed.output_dir / "latest.pt", weights_only=True)
+            expected = torch.load(continuous.output_dir / "latest.pt", weights_only=True)
+            self.assertEqual(actual["validation_state"], expected["validation_state"])
+            self.assertTrue(torch.equal(actual["cache_state_dict"]["delta"], expected["cache_state_dict"]["delta"]))
+            self.assertTrue(torch.equal(actual["optimizer"]["state"][0]["exp_avg"], expected["optimizer"]["state"][0]["exp_avg"]))
+
+    def test_resume_inherits_earlier_best_and_terminal_resume_does_not_revalidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            args = _fixture(directory)
+            args.epochs, args.early_stopping_patience = 5, 1
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls, scores={0: .8, 3: .7})
+                training.run(args)
+                resumed = deepcopy(args)
+                resumed.output_dir, resumed.resume = directory / "terminal-resume", args.output_dir / "latest.pt"
+                calls.clear()
+                training.run(resumed)
+                self.assertEqual(calls, [])
+            best = torch.load(resumed.output_dir / "best.pt", weights_only=True)
+            latest = torch.load(resumed.output_dir / "latest.pt", weights_only=True)
+            self.assertEqual(best["progress"]["global_step"], 0)
+            self.assertEqual(latest["progress"]["global_step"], 3)
+            self.assertTrue(torch.equal(best["cache_state_dict"]["delta"], torch.zeros(2, 4, 256)))
+            self.assertFalse(torch.equal(best["cache_state_dict"]["delta"], latest["cache_state_dict"]["delta"]))
+
+    def test_missing_historical_best_rejected_instead_of_exporting_latest_as_best(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            args = _fixture(directory)
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls)
+                training.run(args)
+                (args.output_dir / "step-00000000-best.pt").unlink()
+                resumed = deepcopy(args)
+                resumed.output_dir, resumed.resume = directory / "missing-best", args.output_dir / "latest.pt"
+                with self.assertRaisesRegex(RuntimeError, "FileNotFoundError"):
+                    training.run(resumed)
+
+    def test_validation_can_be_disabled_and_partial_diagnostics_do_not_enter_selector(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            args = _fixture(directory)
+            args.stop_after_step = 2
+            calls = []
+            with ExitStack() as stack:
+                _loop_patches(stack, calls)
+                training.run(args)
+                partial = torch.load(args.output_dir / "latest.pt", weights_only=True)
+                self.assertEqual(partial["validation_state"]["last_validation_step"], 2)
+                self.assertEqual([row["step"] for row in partial["validation_state"]["selection"]["history"]], [0])
+                disabled = deepcopy(args)
+                disabled.validation = False
+                disabled.output_dir = directory / "disabled"
+                calls.clear()
+                training.run(disabled)
+                self.assertEqual(calls, [])
+            saved = torch.load(disabled.output_dir / "latest.pt", weights_only=True)
+            self.assertIsNone(saved["validation_state"])
+            self.assertEqual(saved["training_config"]["validation"], {"enabled": False})
+            self.assertFalse((disabled.output_dir / "best.pt").exists())
+
     def test_preflight_uses_real_contract_and_cache_without_cuda_groups_or_file_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -236,7 +410,7 @@ class MainEntryTests(unittest.TestCase):
                 resume.resume, resume.output_dir = args.output_dir / "step-00000003-final.pt", directory / "completed-resume"
                 calls.clear()
                 training.run(resume)
-                self.assertEqual(calls, [3])
+                self.assertEqual(calls, [])
                 before = {path.name: _digest(path) for path in args.output_dir.iterdir() if path.is_file()}
                 with self.assertRaisesRegex(RuntimeError, "FileExistsError"):
                     training.run(args)
@@ -290,14 +464,16 @@ class MainEntryTests(unittest.TestCase):
             initial = {"delta": torch.zeros(2, 4, 256)}
             fingerprints = {"base": "a" * 64, "tokenizer": "b" * 64, "cache": "c" * 64,
                             "implementation": {"scripts/example.py": "d" * 64}}
-            expected = training.training_configuration(args, contracts["train"], approval_hash, 3, initial, fingerprints)
+            expected = training.training_configuration(args, contracts["train"], approval_hash, 3, initial, fingerprints,
+                                                        contracts["val"])
             relocated = deepcopy(args)
             relocated.data_root, relocated.val_root = directory / "new-server/train", directory / "new-server/val"
             shutil.copytree(directory / "train", relocated.data_root)
             shutil.copytree(directory / "val", relocated.val_root)
             relocated.num_workers, relocated.prefetch_factor = 5, 3
             _, relocated_hash, relocated_contracts = training.approval_contracts(relocated)
-            actual = training.training_configuration(relocated, relocated_contracts["train"], relocated_hash, 3, initial, fingerprints)
+            actual = training.training_configuration(relocated, relocated_contracts["train"], relocated_hash, 3, initial, fingerprints,
+                                                      relocated_contracts["val"])
             self.assertEqual(expected, actual)
 
     def test_builder_moves_entire_objective_to_rank_device_after_legacy_cuda_string_handling(self):

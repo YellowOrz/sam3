@@ -15,6 +15,7 @@ import torch
 
 from scripts import train_ve_initialized_tokens as shared
 from scripts.residual_ddp_runtime import DeterministicGlobalBatchSampler
+from scripts.residual_selection import restore_selection_state
 
 FORMAT = "sam3-output-residual-ddp-v1"
 RANK_CACHE_AUDIT_FORMAT = "sam3-ddp-rank-cache-consistency-v1"
@@ -127,6 +128,70 @@ def expected_rank_ids(image_ids, config, step, rank):
     return result
 
 
+def validate_validation_state(value, config, step):
+    """Validate completed validation history, allowing only a current due event to be pending.
+
+    A recovery checkpoint written immediately before epoch validation is valid;
+    skipping that validation and advancing to a later optimizer step is not.
+    Partial-run diagnostic validation never enters the epoch selector history.
+    """
+    progress_at(step, config)
+    policy = config.get("validation")
+    if policy is None:
+        if value is not None:
+            raise ValueError("Legacy configuration cannot carry unbound selection state")
+        return None
+    if not isinstance(policy, dict) or type(policy.get("enabled")) is not bool:
+        raise ValueError("Malformed validation configuration")
+    if not policy["enabled"]:
+        if policy != {"enabled": False} or value is not None:
+            raise ValueError("Disabled validation cannot carry a selection state")
+        return None
+    if (set(policy) != {"enabled", "initial_validation", "every_epochs", "annotations_sha256", "selection_policy"}
+            or type(policy["initial_validation"]) is not bool
+            or type(policy["every_epochs"]) is not int or policy["every_epochs"] < 1
+            or not isinstance(policy["selection_policy"], dict)
+            or set(policy["selection_policy"]) != {"patience", "min_delta"}):
+        raise ValueError("Malformed validation selection policy")
+    if not isinstance(value, dict) or set(value) != {"last_validation_step", "selection"}:
+        raise ValueError("Missing or malformed checkpoint validation state")
+    selection = restore_selection_state(value["selection"], validation_sha256=policy["annotations_sha256"],
+                                        **policy["selection_policy"])
+    expected = ([0] if policy["initial_validation"] else []) + [
+        epoch * config["steps_per_epoch"]
+        for epoch in range(1, step // config["steps_per_epoch"] + 1)
+        if epoch % policy["every_epochs"] == 0]
+    observed = [record["step"] for record in selection["history"]]
+    allowed = [expected]
+    if expected and expected[-1] == step:
+        allowed.append(expected[:-1])
+    if observed not in allowed or any(record["epoch"] != record["step"] // config["steps_per_epoch"]
+                                       for record in selection["history"]):
+        raise ValueError("Selection history skipped a required validation or selected a partial epoch")
+    last = value["last_validation_step"]
+    if last is not None and (type(last) is not int or not 0 <= last <= step):
+        raise ValueError("Invalid last validation step")
+    if observed and (last is None or last < observed[-1]):
+        raise ValueError("Last validation step precedes selected validation history")
+    if selection["stopped"] and selection["last_validation_step"] != step:
+        raise ValueError("Optimizer advanced after the terminal early-stop decision")
+    return {"last_validation_step": last, "selection": selection}
+
+
+def pending_selection_validation_step(value, config, step):
+    """Return the current owed baseline/epoch step, otherwise None."""
+    value = validate_validation_state(value, config, step)
+    if value is None:
+        return None
+    policy = config["validation"]
+    due = ((step == 0 and policy["initial_validation"])
+           or (step > 0 and step % config["steps_per_epoch"] == 0
+               and (step // config["steps_per_epoch"]) % policy["every_epochs"] == 0))
+    if due and value["selection"]["last_validation_step"] != step:
+        return step
+    return None
+
+
 def validate_resume(state, config, image_ids, initial_state):
     if state.get("format") != FORMAT or state.get("training_config") != config:
         raise ValueError("Checkpoint/config mismatch: data, code, batch, ranks and optimization must stay fixed")
@@ -135,6 +200,9 @@ def validate_resume(state, config, image_ids, initial_state):
     step = state.get("progress", {}).get("global_step")
     if state.get("progress") != progress_at(step, config):
         raise ValueError("Checkpoint progress is inconsistent")
+    if "validation" in config and "validation_state" not in state:
+        raise ValueError("Missing checkpoint validation state; selection cannot silently reset")
+    validate_validation_state(state.get("validation_state"), config, step)
     if state.get("initial_cache_sha256") != shared.cache_fingerprint(initial_state):
         raise ValueError("Initial semantic cache changed")
     if shared.cache_fingerprint(state.get("initial_cache_state_dict", {})) != shared.cache_fingerprint(initial_state):
@@ -186,13 +254,17 @@ def validate_resume(state, config, image_ids, initial_state):
     return step
 
 
-def make_checkpoint(encoder, optimizer, config, step, initial_state, rank_states, *, rank_cache_audit=None):
+def make_checkpoint(encoder, optimizer, config, step, initial_state, rank_states, *, rank_cache_audit=None,
+                    validation_state=None):
     result = {"format": FORMAT, "training_config": deepcopy(config), "config_sha256": canonical_hash(config),
             "progress": progress_at(step, config), "cache_state_dict": shared.cpu_state(encoder.state_dict()),
             "initial_cache_state_dict": shared.cpu_state(initial_state),
             "initial_cache_sha256": shared.cache_fingerprint(initial_state),
             "optimizer": deepcopy(optimizer.state_dict()), "rank_states": deepcopy(rank_states),
             "trainable_parameter_count": 2048, "accuracy_evaluated": False}
+    validated = validate_validation_state(validation_state, config, step)
+    if "validation" in config:
+        result["validation_state"] = validated
     if rank_cache_audit is not None:
         _validate_rank_cache_audit(rank_cache_audit, result["cache_state_dict"], config["world_size"])
         result["rank_cache_audit"] = deepcopy(rank_cache_audit)

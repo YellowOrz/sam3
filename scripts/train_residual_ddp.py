@@ -28,7 +28,8 @@ from scripts import cached_ve_text_features as cached
 from scripts import train_ve_initialized_tokens as shared
 from scripts.residual_ddp_checkpoint import (
     atomic_checkpoint, canonical_hash, make_checkpoint, progress_at, validate_resume,
-    validate_rank_cache_consistency,
+    validate_rank_cache_consistency, pending_selection_validation_step,
+    validate_validation_state,
 )
 from scripts.residual_ddp_data import load_coco_contract, make_identity_dataset, make_loader
 from scripts.residual_ddp_objective import (
@@ -40,6 +41,7 @@ from scripts.residual_ddp_runtime import (
     initialize_distributed, raise_if_distributed_error, restore_rng_state, torchrun_ranks,
 )
 from scripts.residual_training_monitor import TrainingMonitor
+from scripts.residual_selection import METRIC_NAME, new_selection_state, update_selection
 
 
 def parse_args(argv=None):
@@ -66,24 +68,30 @@ def parse_args(argv=None):
     parser.add_argument("--stop-after-step", type=int,
                         help="Optional bounded smoke/resume stop; does not alter planned epochs")
     parser.add_argument("--validation-every-epochs", type=int, default=1)
+    parser.add_argument("--early-stopping-patience", type=int, default=3,
+                        help="Stop after this many evaluated epochs without a >min-delta gain")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=.001,
+                        help="Absolute macro miss-zero Dice gain required to reset patience; best saves any gain")
     parser.add_argument("--initial-validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--validation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--preflight-only", action="store_true", help="CPU-only validation, no training or file writes")
     args = parser.parse_args(argv)
     for name in ("epochs", "batch_size_per_rank", "prefetch_factor", "log_every", "checkpoint_every",
-                 "validation_every_epochs"):
+                 "validation_every_epochs", "early_stopping_patience"):
         if getattr(args, name) < 1:
             parser.error(f"{name} must be positive")
     if args.num_workers < 0 or args.seed < 0:
         parser.error("num-workers and seed must be nonnegative")
-    for name in ("learning_rate", "anchor_weight", "gpu_memory_fraction"):
+    for name in ("learning_rate", "anchor_weight", "gpu_memory_fraction", "early_stopping_min_delta"):
         if not math.isfinite(getattr(args, name)):
             parser.error(f"{name} must be finite")
     if args.learning_rate <= 0 or args.anchor_weight < 0 or not 0 < args.gpu_memory_fraction <= 1:
         parser.error("Invalid learning rate, anchor weight or GPU memory limit")
     if args.stop_after_step is not None and args.stop_after_step < 1:
         parser.error("stop-after-step must be positive")
+    if args.early_stopping_min_delta < 0:
+        parser.error("early-stopping-min-delta must be nonnegative")
     for name, value in vars(args).items():
         if isinstance(value, Path):
             setattr(args, name, value.resolve())
@@ -114,6 +122,9 @@ def approval_contracts(args):
                        for image in contract.images)):
             raise ValueError("RealSense is reserved for testing, not training or validation selection")
         contracts[role] = contract
+        if role == "val" and any(str(row.get("source_dataset", row.get("source", ""))).lower()
+                                 != "dexycb" for row in contract.images):
+            raise ValueError("Best/early-stop selection requires the fixed approved DexYCB validation split")
     if "val" in contracts:
         train_paths = {(contracts["train"].root / row["file_name"]).resolve() for row in contracts["train"].images}
         val_paths = {(contracts["val"].root / row["file_name"]).resolve() for row in contracts["val"].images}
@@ -126,17 +137,29 @@ def implementation_hashes():
     project = Path(__file__).resolve().parents[1]
     paths = sorted((project / "sam3").rglob("*.py"))
     paths += sorted((project / "scripts").glob("residual_*.py"))
-    paths += [Path(__file__), project / "scripts/cached_ve_text_features.py",
+    paths += [Path(__file__).resolve(), project / "scripts/cached_ve_text_features.py",
               project / "scripts/train_ve_initialized_tokens.py", project / "scripts/train_nakehand_semantic_tokens.py",
               project / "scripts/evaluate_bilateral_tokens.py"]
     return {str(path.relative_to(project)): shared.evaluation.sha256(path) for path in paths}
 
 
-def training_configuration(args, contract, approval_hash, world_size, initial_state, fingerprints):
+def training_configuration(args, contract, approval_hash, world_size, initial_state, fingerprints,
+                           validation_contract=None):
     global_batch = world_size * args.batch_size_per_rank
     steps = len(contract.images) // global_batch
     if not steps:
         raise ValueError("The selected dataset is smaller than one complete global batch")
+    validation_config = {"enabled": False}
+    if args.validation:
+        if validation_contract is None:
+            raise ValueError("Validation configuration requires its approved annotation contract")
+        validation_config = {
+            "enabled": True, "initial_validation": args.initial_validation,
+            "every_epochs": args.validation_every_epochs,
+            "annotations_sha256": validation_contract.annotations_sha256,
+            "selection_policy": {"patience": args.early_stopping_patience,
+                                 "min_delta": args.early_stopping_min_delta},
+        }
     return {"method": "original_natural_VE_plus_zero_initialized_output_delta",
             "dataset_size": len(contract.images), "annotations_sha256": contract.annotations_sha256,
             "image_order_sha256": canonical_hash([row["id"] for row in contract.images]),
@@ -151,7 +174,42 @@ def training_configuration(args, contract, approval_hash, world_size, initial_st
             "initial_state_sha256": shared.cache_fingerprint(initial_state),
             "base_sha256": fingerprints["base"], "tokenizer_sha256": fingerprints["tokenizer"],
             "initial_cache_file_sha256": fingerprints["cache"],
+            "validation": validation_config,
             "implementation_sha256": canonical_hash(fingerprints["implementation"])}
+
+
+def require_rank_validation_consistency(states):
+    """Every rank supplies its own selection/progress state before save/stop."""
+    if not states or any(canonical_hash(value) != canonical_hash(states[0]) for value in states):
+        raise ValueError("Validation selection/early-stop state differs across ranks")
+
+
+def resume_best_checkpoint(resume, resume_path, config, image_ids, initial_state):
+    """Load the immutable historical best; never substitute the latest weights.
+
+    Relocating a resume file also requires its step-XXXXXXXX-best.pt sibling
+    unless the resume checkpoint itself is the selected best.
+    """
+    if not config["validation"]["enabled"]:
+        return None
+    selected = resume["validation_state"]["selection"]
+    best_step = selected["best_step"]
+    if best_step is None:
+        return None
+    if best_step == resume["progress"]["global_step"]:
+        best = resume
+    else:
+        path = resume_path.parent / f"step-{best_step:08d}-best.pt"
+        best = torch.load(path, map_location="cpu", weights_only=True)
+    validate_resume(best, config, image_ids, initial_state)
+    best_selection = best["validation_state"]["selection"]
+    prefix = [record for record in selected["history"] if record["step"] <= best_step]
+    if (best["progress"]["global_step"] != best_step
+            or best_selection["best_step"] != best_step
+            or best_selection["best_metric"] != selected["best_metric"]
+            or best_selection["history"] != prefix):
+        raise ValueError("Historical best checkpoint does not match the resumed selection history")
+    return best
 
 
 def rank_stage(context, function):
@@ -218,7 +276,8 @@ def run(args):
     encoder = shared.load_initial_cache(args.initial_cache, base_hash=fingerprints["base"],
                                         tokenizer_hash=fingerprints["tokenizer"])
     initial_state = shared.cpu_state(encoder.state_dict())
-    config = training_configuration(args, contracts["train"], approval_hash, world, initial_state, fingerprints)
+    config = training_configuration(args, contracts["train"], approval_hash, world, initial_state, fingerprints,
+                                    contracts.get("val"))
     if args.preflight_only:
         print(json.dumps({"status": "preflight_only_no_training", "config": config,
                           "train": contracts["train"].summary,
@@ -250,7 +309,10 @@ def run(args):
         optimizer = torch.optim.AdamW([objective.encoder.delta], lr=args.learning_rate, weight_decay=0.)
         images = contracts["train"].images
         image_ids = [row["id"] for row in images]
-        resume = None
+        resume, inherited_best = None, None
+        validation_state = ({"last_validation_step": None,
+                             "selection": new_selection_state(contracts["val"].annotations_sha256,
+                                 **config["validation"]["selection_policy"])} if args.validation else None)
         if args.resume:
             def load_resume():
                 value = torch.load(args.resume, map_location="cpu", weights_only=True)
@@ -260,6 +322,11 @@ def run(args):
             objective.encoder.load_state_dict(resume["cache_state_dict"])
             optimizer.load_state_dict(resume["optimizer"])
             observed = list(resume["rank_states"][context.rank]["image_ids"])
+            validation_state = rank_stage(context, lambda: validate_validation_state(
+                resume["validation_state"], config, completed))
+            # Only rank zero performs artifact I/O; failure propagates to all ranks.
+            inherited_best = rank_stage(context, lambda: resume_best_checkpoint(
+                resume, args.resume, config, image_ids, initial_state) if context.is_main else None)
         wrapped = (DistributedDataParallel(objective, device_ids=[context.local_rank],
                                           broadcast_buffers=False, find_unused_parameters=False)
                    if context.distributed else objective)
@@ -285,10 +352,18 @@ def run(args):
                            "pin_memory": True, "persistent_workers": args.num_workers > 0},
                 "note": "Train loss is not accuracy. RealSense is reserved for held-out testing."})
         rank_stage(context, write_run)
+        def publish_inherited_best():
+            if context.is_main and inherited_best is not None:
+                best_step = inherited_best["progress"]["global_step"]
+                atomic_checkpoint(args.output_dir / f"step-{best_step:08d}-best.pt", inherited_best)
+                atomic_checkpoint(args.output_dir / "best.pt", inherited_best)
+        rank_stage(context, publish_inherited_best)
 
-        def save_checkpoint(final=False):
+        def save_checkpoint(final=False, *, stage="recovery", is_best=False):
             rank_stage(context, lambda: assert_frozen_versions(versions))
             rank_stage(context, lambda: verify_frozen_inputs(args, contracts, fingerprints, approval_hash, full_hash=final))
+            rank_stage(context, lambda: validate_validation_state(validation_state, config, completed))
+            require_rank_validation_consistency(gather_objects(validation_state, context))
             cache_hash = rank_stage(context, lambda: shared.cache_fingerprint(
                 shared.cpu_state(objective.encoder.state_dict())))
             cache_audit = validate_rank_cache_consistency(
@@ -298,10 +373,13 @@ def run(args):
                 if not context.is_main:
                     return
                 state = make_checkpoint(objective.encoder, optimizer, config, completed, initial_state,
-                                        rank_states, rank_cache_audit=cache_audit)
+                                        rank_states, rank_cache_audit=cache_audit, validation_state=validation_state)
                 validate_resume(state, config, image_ids, initial_state)
-                name = f"step-{completed:08d}{'-final' if final else '-recovery'}.pt"
+                name = f"step-{completed:08d}-{'final' if final else stage}.pt"
                 atomic_checkpoint(args.output_dir / name, state)
+                if is_best:
+                    atomic_checkpoint(args.output_dir / f"step-{completed:08d}-best.pt", state)
+                    atomic_checkpoint(args.output_dir / "best.pt", state, replace=True)
                 atomic_checkpoint(args.output_dir / "latest.pt", state, replace=True)
             rank_stage(context, write)
 
@@ -317,15 +395,44 @@ def run(args):
             finally:
                 restore_rng_state(rng, context.device)
 
-        if args.validation and args.initial_validation and not args.resume:
-            validate()
         # Model construction, DDP initialization, and initial val must not consume resumed RNG.
         if resume:
             restore_rng_state(resume["rank_states"][context.rank]["rng"], context.device)
-        last_validation = completed if args.validation and args.initial_validation and not args.resume else -1
+        def selection_stopped():
+            return validation_state is not None and validation_state["selection"]["stopped"]
+
+        def complete_pending_validation():
+            nonlocal validation_state
+            require_rank_validation_consistency(gather_objects(validation_state, context))
+            pending = rank_stage(context, lambda: pending_selection_validation_step(validation_state, config, completed))
+            if pending is None:
+                return
+            metrics = validate()
+            def select():
+                selected, decision = update_selection(validation_state["selection"], metrics,
+                    step=completed, epoch=completed // config["steps_per_epoch"],
+                    validation_sha256=contracts["val"].annotations_sha256)
+                return {"last_validation_step": completed, "selection": selected}, decision
+            validation_state, decision = rank_stage(context, select)
+            require_rank_validation_consistency(gather_objects(validation_state, context))
+            def log_selection():
+                monitor.log_validation(completed, {
+                    "macro_miss_zero_dice": decision["metric"], "best_macro_miss_zero_dice": decision["best_metric"],
+                    "best_step": decision["best_step"], "bad_epochs": decision["bad_epochs"],
+                    "early_stop": int(decision["should_stop"]),
+                }, scope="dexycb_val_selection")
+                if context.is_main:
+                    print(f"validation step={completed} metric={METRIC_NAME} value={decision['metric']:.6f} "
+                          f"best={decision['best_metric']:.6f} bad_epochs={decision['bad_epochs']} "
+                          f"early_stop={decision['should_stop']}", flush=True)
+            rank_stage(context, log_selection)
+            save_checkpoint(stage="validated", is_best=decision["is_best"])
+
+        # Includes recovery from the exact epoch-checkpoint-before-validation boundary.
+        complete_pending_validation()
         window_started = time.monotonic()
         window_images, window_data, window_h2d, window_compute = 0, 0., 0., 0.
-        while completed < limit:
+        while completed < limit and not selection_stopped():
             epoch, offset = divmod(completed, config["steps_per_epoch"])
             sampler = DeterministicGlobalBatchSampler(len(images), args.batch_size_per_rank,
                 rank=context.rank, world_size=context.world_size, seed=args.seed, epoch=epoch, start_step=offset)
@@ -333,7 +440,7 @@ def run(args):
                 pin_memory=True, persistent_workers=args.num_workers > 0,
                 prefetch_factor=args.prefetch_factor, seed=args.seed + epoch * context.world_size + context.rank)
             iterator = iter(epoch_loader)
-            while completed < limit and completed // config["steps_per_epoch"] == epoch:
+            while completed < limit and completed // config["steps_per_epoch"] == epoch and not selection_stopped():
                 data_started = time.monotonic()
                 batch = rank_stage(context, lambda: next(iterator))
                 window_data += time.monotonic() - data_started
@@ -394,23 +501,26 @@ def run(args):
                 epoch_done = completed % config["steps_per_epoch"] == 0
                 if completed % args.checkpoint_every == 0 or epoch_done:
                     save_checkpoint()
-                if (args.validation and epoch_done
-                        and (completed // config["steps_per_epoch"]) % args.validation_every_epochs == 0):
-                    validate()
-                    last_validation = completed
+                if epoch_done:
+                    complete_pending_validation()
                 del batch, total, components, anchor
             del iterator, epoch_loader
             epoch_loader = None
         # A partial smoke is not a complete epoch; final validation remains explicitly optional.
-        if args.validation and last_validation != completed:
+        if args.validation and validation_state["last_validation_step"] != completed:
             validate()
+            # Bounded partial-epoch diagnostics do not consume an epoch of patience.
+            validation_state = {**validation_state, "last_validation_step": completed}
         rank_stage(context, lambda: assert_frozen_versions(versions))
         save_checkpoint(final=True)
         if context.is_main:
             shared.evaluation.atomic_write_json(args.output_dir / "summary.json", {
-                "status": "completed_requested_steps", "training_config": config,
+                "status": "early_stopped" if selection_stopped() else "completed_requested_steps", "training_config": config,
                 "progress": progress_at(completed, config), "final_checkpoint": str(args.output_dir / f"step-{completed:08d}-final.pt"),
                 "tensorboard": str(args.output_dir / "tensorboard"), "validation_ran": bool(args.validation),
+                "selection": validation_state["selection"] if validation_state is not None else None,
+                "best_checkpoint": str(args.output_dir / "best.pt") if validation_state is not None
+                    and validation_state["selection"]["best_step"] is not None else None,
                 "wall_seconds": time.monotonic()-started, "trainable_parameter_count": 2048,
                 "frozen_parameter_versions_unchanged": True,
                 "all_rank_encoder_states_identical_at_checkpoint": True,
