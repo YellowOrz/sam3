@@ -98,6 +98,9 @@ class ReviewDocsPackageTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'already included'):
             self.run_package(start_with=[private])
 
+    def test_sample_review_is_data_document(self):
+        self.assertEqual(pack.category(Path('egohos-sample-review-20260911.md')), '02-data')
+
     def test_start_index_has_one_source_grounded_description_per_markdown(self):
         (self.docs / "plan.md").write_text("# **边界对照：尚未训练**\n计划，不是结果。\n")
         (self.docs / "simple.md").write_text("本文件说明冻结参考的限制。\n下一行。\n")
@@ -359,7 +362,7 @@ class ReviewDocsPackageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_package(output_dir=self.docs / "recursive")
         with self.assertRaises(ValueError):
-            self.run_package(max_assets=257)
+            self.run_package(max_assets=513)
 
     def test_windows_script_has_only_download_not_remote_execution(self):
         script = (Path(__file__).resolve().parents[1] / "scripts/sync_review_docs_windows.ps1").read_text()

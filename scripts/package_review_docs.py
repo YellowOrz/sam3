@@ -120,7 +120,7 @@ def category(path: Path) -> str:
         return "05-meeting"
     if any(word in name for word in ("mano", "memory", "geometry", "finetuning-stages")):
         return "04-mano-memory"
-    if any(word in name for word in ("dataset", "data-preparation", "split", "external-test-protocol", "conversion-trust-audit", "dex-mask-resize")):
+    if any(word in name for word in ("dataset", "data-preparation", "split", "external-test-protocol", "conversion-trust-audit", "dex-mask-resize", "sample-review")):
         return "02-data"
     if any(word in name for word in ("goal", "plan", "reliability")):
         return "01-goals"
@@ -190,7 +190,7 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
     roots = [clean_path(root) for root in results_roots]
     if not docs.is_dir() or not roots:
         raise ValueError("physical docs and at least one approved results root required")
-    if not 0 <= max_assets <= 256 or not 1 <= max_total_bytes <= 200 * 1024**2:
+    if not 0 <= max_assets <= 512 or not 1 <= max_total_bytes <= 200 * 1024**2:
         raise ValueError("asset count / total size exceeds hard safety budget")
     if not 1 <= max_file_bytes <= 16 * 1024**2:
         raise ValueError("per-file budget exceeds 16 MiB")
