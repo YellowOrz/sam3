@@ -3,9 +3,12 @@
 import argparse
 import os
 
-import cv2
 import numpy as np
 
+from sam3.model.class_token_checkpoint import (
+    copy_class_tokens,
+    load_class_token_checkpoint,
+)
 from sam3.model_builder import build_sam3_predictor
 
 
@@ -28,26 +31,30 @@ def propagate_one_class(predictor, video_path, class_name):
         request={"type": "start_session", "resource_path": video_path}
     )
     session_id = response["session_id"]
-    predictor.handle_request(
-        request={
-            "type": "add_prompt",
-            "session_id": session_id,
-            "frame_index": 0,
-            "text": class_name,
-        }
-    )
-    outputs = {}
-    for response in predictor.handle_stream_request(
-        request={"type": "propagate_in_video", "session_id": session_id}
-    ):
-        outputs[response["frame_index"]] = response["outputs"]
-    predictor.handle_request(
-        request={"type": "close_session", "session_id": session_id}
-    )
-    return outputs
+    try:
+        predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": 0,
+                "text": class_name,
+            }
+        )
+        outputs = {}
+        for response in predictor.handle_stream_request(
+            request={"type": "propagate_in_video", "session_id": session_id}
+        ):
+            outputs[response["frame_index"]] = response["outputs"]
+        return outputs
+    finally:
+        predictor.handle_request(
+            request={"type": "close_session", "session_id": session_id}
+        )
 
 
 def draw_outputs(frame, outputs_by_class):
+    import cv2
+
     result = frame.copy()
     for class_name, frame_outputs in outputs_by_class.items():
         output = frame_outputs.get("current")
@@ -75,20 +82,69 @@ def draw_outputs(frame, outputs_by_class):
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--checkpoint", required=True)
-    args = parser.parse_args()
+def build_automatic_hands_predictor(
+    checkpoint, *, token_checkpoint=None, tokens_per_class=None
+):
+    """Build the base video model and optionally overlay trained hand tokens."""
+    if tokens_per_class is not None and (
+        type(tokens_per_class) is not int or tokens_per_class < 1
+    ):
+        raise ValueError("--tokens-per-class must be a positive integer")
+    tokens = None
+    if token_checkpoint is not None:
+        tokens = load_class_token_checkpoint(
+            token_checkpoint, tokens_per_class=tokens_per_class
+        )
+        tokens_per_class = int(tokens.shape[1])
+    elif tokens_per_class is None:
+        tokens_per_class = 1
 
     predictor = build_sam3_predictor(
         version="sam3",
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint,
         text_encoder_type="learnable_class",
-        tokens_per_class=1,
+        tokens_per_class=tokens_per_class,
         use_fa3=False,
         async_loading_frames=False,
+    )
+    try:
+        if tokens is not None:
+            if getattr(predictor, "world_size", 1) != 1:
+                raise ValueError("Token overlay currently requires a single-GPU predictor")
+            encoder = predictor.model.detector.backbone.language_backbone
+            copy_class_tokens(encoder, tokens)
+        return predictor
+    except BaseException:
+        predictor.shutdown()
+        raise
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--checkpoint", required=True, help="Base/full SAM3 checkpoint")
+    parser.add_argument(
+        "--token-checkpoint",
+        help="Optional token-only training checkpoint; infer K from its class_tokens",
+    )
+    parser.add_argument(
+        "--tokens-per-class",
+        type=int,
+        default=None,
+        help="K (default: token checkpoint K, or 1 without a token checkpoint)",
+    )
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
+    import cv2
+
+    predictor = build_automatic_hands_predictor(
+        args.checkpoint,
+        token_checkpoint=args.token_checkpoint,
+        tokens_per_class=args.tokens_per_class,
     )
     outputs_by_class = {}
     try:
@@ -98,26 +154,34 @@ def main():
             )
 
         cap = cv2.VideoCapture(args.video)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        writer = cv2.VideoWriter(
-            args.out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-        )
-        frame_index = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            current = {
-                name: {"current": results.get(frame_index)}
-                for name, results in outputs_by_class.items()
-            }
-            writer.write(draw_outputs(frame, current))
-            frame_index += 1
-        cap.release()
-        writer.release()
+        writer = None
+        try:
+            if not cap.isOpened():
+                raise OSError(f"Cannot open video: {args.video}")
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+            writer = cv2.VideoWriter(
+                args.out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+            )
+            if not writer.isOpened():
+                raise OSError(f"Cannot create output video: {args.out}")
+            frame_index = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                current = {
+                    name: {"current": results.get(frame_index)}
+                    for name, results in outputs_by_class.items()
+                }
+                writer.write(draw_outputs(frame, current))
+                frame_index += 1
+        finally:
+            cap.release()
+            if writer is not None:
+                writer.release()
         print(f"完成：{frame_index} 帧 → {args.out}")
     finally:
         predictor.shutdown()

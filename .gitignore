@@ -139,6 +139,14 @@ sam3_logs/
 *.npy
 *.npz
 
+# Generated dataset-review RGB/masks stay local; retain the user's review receipt.
+docs/figures/nakehand-manual-review-*/*
+!docs/figures/nakehand-manual-review-*/human-review.json
+
+# Reports/assets live beside this repository in ../docs. A server-local docs
+# symlink may preserve historical paths; do not publish that link or the data.
+/docs
+
 # Logs
 logs/
 runs/

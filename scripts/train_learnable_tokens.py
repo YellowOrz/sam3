@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import math
 import random
 import time
 from collections import Counter
@@ -20,6 +21,102 @@ def build_epoch_order(dataset_size: int, seed: int) -> list[int]:
 
 
 REQUIRED_CLASS_NAMES = ("left_hand", "right_hand")
+
+
+def sha256_argument(value):
+    if len(value) != 64 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        raise argparse.ArgumentTypeError("Expected a 64-character hexadecimal SHA256")
+    return value.lower()
+
+
+def validate_initial_token_hash(initial_tokens, expected=None):
+    """Check initialization before optimization without changing RNG or tensors."""
+    if (not isinstance(initial_tokens, torch.Tensor) or initial_tokens.dtype != torch.float32
+            or not torch.isfinite(initial_tokens).all().item()):
+        raise ValueError("Initial class tokens must be finite float32 values")
+    actual = hashlib.sha256(initial_tokens.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+    if expected is not None and actual != sha256_argument(expected):
+        raise ValueError(f"Initial class tokens SHA256 mismatch: expected {expected}, got {actual}")
+    return actual
+
+
+def validate_training_batch_identity(batch, expected_image_ids, category_ids_by_name):
+    """Fail before forward if the loader substituted a sample or malformed queries.
+
+    Expected IDs follow COCO_FROM_JSON's sorted image-ID dataset order, not
+    dataset.ids (which contains datapoint positions). Inspection is CPU-only
+    and consumes no random numbers. Exactly one query per side/image is needed.
+    """
+    if (len(batch.find_inputs) != 1 or len(batch.find_metadatas) != 1
+            or tuple(batch.find_text_batch) != REQUIRED_CLASS_NAMES):
+        raise RuntimeError("Training identity requires one stage and both canonical hand prompts")
+    if not expected_image_ids or set(category_ids_by_name) != set(REQUIRED_CLASS_NAMES):
+        raise RuntimeError("Training identity requires requested images and both category IDs")
+    stage, metadata = batch.find_inputs[0], batch.find_metadatas[0]
+    columns = [field.tolist() for field in (
+        stage.img_ids, stage.text_ids, metadata.coco_image_id, metadata.original_category_id
+    )]
+    if any(len(column) != 2 * len(expected_image_ids) for column in columns):
+        raise RuntimeError("Training identity requires exactly two query rows per image")
+    seen = set()
+    observed = [None] * len(expected_image_ids)
+    for local_index, text_index, image_id, category_id in zip(*columns):
+        if (type(local_index) is not int or not 0 <= local_index < len(expected_image_ids)
+                or type(text_index) is not int or not 0 <= text_index < len(REQUIRED_CLASS_NAMES)):
+            raise RuntimeError("Training identity has an invalid image/text query index")
+        expected_id = int(expected_image_ids[local_index])
+        if image_id != expected_id:
+            raise RuntimeError(f"Dataset substituted image {expected_id} with {image_id} during training")
+        expected_category = category_ids_by_name[REQUIRED_CLASS_NAMES[text_index]]
+        if category_id != expected_category:
+            raise RuntimeError(f"Prompt/category mismatch on training image {expected_id}")
+        key = (local_index, text_index)
+        if key in seen:
+            raise RuntimeError(f"Duplicate training image/prompt query: {key}")
+        seen.add(key)
+        observed[local_index] = int(image_id)
+    if len(seen) != 2 * len(expected_image_ids) or any(value is None for value in observed):
+        raise RuntimeError("Missing training image/prompt query")
+    return observed
+
+
+def observed_identity_provenance(start_step, end_step, image_ids):
+    """Record only this process's successfully optimized, identity-checked images.
+
+    A resumed checkpoint's historical images are deliberately not reconstructed
+    from its planned epoch order. This diagnostic is not a resume-config field.
+    """
+    digest = hashlib.sha256()
+    for image_id in image_ids:
+        digest.update(f"{int(image_id)}\n".encode("utf-8"))
+    return {
+        "format": "sam3-training-observed-identities-v1",
+        "scope": "current_process_completed_steps_only",
+        "start_step": start_step,
+        "end_step": end_step,
+        "samples": len(image_ids),
+        "queries": 2 * len(image_ids),
+        "image_ids_sha256": digest.hexdigest(),
+        "image_ids_hash_encoding": "decimal_id_newline_utf8",
+    }
+
+
+def describe_training_progress(steps: int, dataset_size: int, batch_size: int, epochs: int) -> dict:
+    """Describe actual progress, including odd final batches, without claiming a truncated run finished epochs."""
+    if any(type(value) is not int or value < 1 for value in (dataset_size, batch_size, epochs)):
+        raise ValueError("dataset_size, batch_size and epochs must be positive integers")
+    steps_per_epoch = (dataset_size + batch_size - 1) // batch_size
+    planned_steps = steps_per_epoch * epochs
+    if type(steps) is not int or not 0 <= steps <= planned_steps:
+        raise ValueError("steps must lie within the planned training range")
+    completed_epochs, partial_steps = divmod(steps, steps_per_epoch)
+    return {
+        "epochs_planned": epochs,
+        "epochs_completed": completed_epochs,
+        "steps_planned": planned_steps,
+        "samples_seen": completed_epochs * dataset_size + partial_steps * batch_size,
+        "full_training_complete": steps == planned_steps,
+    }
 
 
 def build_training_config(args) -> dict:
@@ -122,6 +219,7 @@ def save_training_checkpoint(
     annotation_summary: dict,
     gradient_nonzero_steps: list[int],
     args,
+    observed_identity: dict | None = None,
 ) -> None:
     """Atomically save enough state to resume the current epoch."""
     state = {
@@ -144,7 +242,14 @@ def save_training_checkpoint(
         "epochs": args.epochs,
         "data_root": str(args.data_root),
         "base_checkpoint": str(args.base_checkpoint),
+        "progress": describe_training_progress(
+            next_step, annotation_summary["images"], args.batch_size, args.epochs
+        ),
+        # Runtime allocation policy does not change optimizer/resume semantics.
+        "gpu_memory_fraction": getattr(args, "gpu_memory_fraction", None),
     }
+    if observed_identity is not None:
+        state["observed_identity"] = observed_identity
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(state, temporary_path)
     temporary_path.replace(path)
@@ -174,7 +279,15 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--gpu-memory-fraction", type=float, default=None,
+        help="Optional CUDA allocator cap; does not include all process CUDA overhead",
+    )
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--expected-initial-token-sha256", type=sha256_argument, default=None,
+        help="Optional fail-fast check of original float32 token initialization; not a resume setting",
+    )
     return parser.parse_args()
 
 
@@ -186,12 +299,28 @@ def main() -> None:
         raise ValueError("batch-size must be at least 1")
     if args.epochs < 1:
         raise ValueError("epochs must be at least 1")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("learning-rate must be finite and positive")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValueError("max-steps must be positive")
+    if args.log_every < 1 or args.save_every < 1:
+        raise ValueError("log-every and save-every must be positive")
+    if args.gpu_memory_fraction is not None:
+        if not 0 < args.gpu_memory_fraction <= 1:
+            raise ValueError("gpu-memory-fraction must be within (0, 1]")
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, 0)
     if not args.base_checkpoint.is_file():
         raise FileNotFoundError(args.base_checkpoint)
     annotation_path = args.data_root / "annotations.json"
     if not annotation_path.is_file():
         raise FileNotFoundError(annotation_path)
     annotation_summary = inspect_training_annotations(annotation_path)
+    annotation_data = json.loads(annotation_path.read_bytes())
+    expected_image_ids = sorted(int(image["id"]) for image in annotation_data["images"])
+    category_ids_by_name = {item["name"]: int(item["id"]) for item in annotation_data["categories"]}
+    del annotation_data
+    if hashlib.sha256(annotation_path.read_bytes()).hexdigest() != annotation_summary["sha256"]:
+        raise RuntimeError("Training annotations changed during identity-index setup")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"k{args.tokens_per_class}_epoch{args.epochs}"
@@ -239,6 +368,8 @@ def main() -> None:
         load_segmentation=True,
     )
     print("训练集图片数量:", len(dataset), flush=True)
+    if len(dataset) != len(expected_image_ids):
+        raise RuntimeError("Training dataset/COCO image count differs; identity mapping is invalid")
     print("训练数据契约:", json.dumps(annotation_summary, ensure_ascii=False), flush=True)
 
     print("2. 加载 SAM3", flush=True)
@@ -349,13 +480,23 @@ def main() -> None:
             flush=True,
         )
 
+    initial_token_sha256 = validate_initial_token_hash(
+        initial_class_tokens, args.expected_initial_token_sha256
+    )
+    print("初始化 token SHA256:", initial_token_sha256, flush=True)
+
     total_steps = len(batch_spans)
     if args.max_steps is not None:
         total_steps = min(total_steps, args.max_steps)
+    if not 0 <= start_step <= total_steps:
+        raise ValueError("resume next_step exceeds this run's step limit")
+    if total_steps < len(batch_spans):
+        final_path = args.output_dir / f"{stem}_step{total_steps}_partial.pt"
     print(f"训练范围: step {start_step + 1} 到 {total_steps}", flush=True)
     print("4. 开始训练", flush=True)
 
     completed_steps = start_step
+    observed_image_ids = []
     training_started_at = time.monotonic()
     try:
         for step in range(start_step, total_steps):
@@ -365,6 +506,9 @@ def main() -> None:
             batch = collate_fn_api(
                 samples, dict_key="train", with_seg_masks=True
             )["train"]
+            batch_observed_ids = validate_training_batch_identity(
+                batch, [expected_image_ids[index] for index in dataset_indices], category_ids_by_name
+            )
             batch = copy_data_to_device(batch, torch.device("cuda"), non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
@@ -429,6 +573,7 @@ def main() -> None:
             optimizer.step()
 
             completed_steps = step + 1
+            observed_image_ids.extend(batch_observed_ids)
             loss_value = float(loss.detach().cpu())
             loss_history.append(loss_value)
             current_epoch = (span_end - 1) // len(dataset) + 1
@@ -470,6 +615,7 @@ def main() -> None:
                     annotation_summary,
                     gradient_nonzero_steps,
                     args,
+                    observed_identity=observed_identity_provenance(start_step, completed_steps, observed_image_ids),
                 )
                 print("恢复点已保存:", latest_path, flush=True)
                 if epoch_complete:
@@ -489,6 +635,7 @@ def main() -> None:
                         annotation_summary,
                         gradient_nonzero_steps,
                         args,
+                        observed_identity=observed_identity_provenance(start_step, completed_steps, observed_image_ids),
                     )
                     print(f"第 {current_epoch} 轮完成 checkpoint: {epoch_path}", flush=True)
 
@@ -518,6 +665,7 @@ def main() -> None:
             annotation_summary,
             gradient_nonzero_steps,
             args,
+            observed_identity=observed_identity_provenance(start_step, completed_steps, observed_image_ids),
         )
         print("训练被中断，恢复点已保存:", latest_path, flush=True)
         raise
@@ -542,6 +690,7 @@ def main() -> None:
         annotation_summary,
         gradient_nonzero_steps,
         args,
+        observed_identity=observed_identity_provenance(start_step, completed_steps, observed_image_ids),
     )
     window = min(100, len(loss_history))
     first_average = sum(loss_history[:window]) / window
@@ -552,9 +701,13 @@ def main() -> None:
         "samples_seen": batch_spans[completed_steps - 1][1] if completed_steps else 0,
         "dataset_size": len(dataset),
         "epochs": args.epochs,
+        **describe_training_progress(completed_steps, len(dataset), args.batch_size, args.epochs),
         "batch_size": args.batch_size,
         "amp": args.amp,
+        "gpu_memory_fraction": args.gpu_memory_fraction,
         "annotation_summary": annotation_summary,
+        "observed_identity": observed_identity_provenance(start_step, completed_steps, observed_image_ids),
+        "initial_class_tokens_sha256": initial_token_sha256,
         "learning_rate": args.learning_rate,
         "seed": args.seed,
         "first_average_loss": first_average,
@@ -580,9 +733,16 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"5. {args.epochs} 轮训练完成", flush=True)
-    print("前 100 步平均 loss:", first_average, flush=True)
-    print("后 100 步平均 loss:", last_average, flush=True)
+    if summary["full_training_complete"]:
+        print(f"5. {args.epochs} 轮训练完成", flush=True)
+    else:
+        print(
+            f"5. 短程运行结束：{completed_steps}/{len(batch_spans)} 步，"
+            f"{summary['samples_seen']} 样本，完整轮次 {summary['epochs_completed']}/{args.epochs}；"
+            "并未完成全部计划轮次", flush=True,
+        )
+    print(f"前 {window} 步平均 loss:", first_average, flush=True)
+    print(f"后 {window} 步平均 loss:", last_average, flush=True)
     print("loss 是否下降:", last_average < first_average, flush=True)
     print("左右手 token 最大变化:", summary["class_token_max_change"], flush=True)
     print("最终 checkpoint:", final_path, flush=True)

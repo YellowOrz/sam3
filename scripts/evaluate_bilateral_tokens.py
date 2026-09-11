@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
+        "--visual-style", choices=("separate", "overlay"), default="separate",
+        help="Separate RGB/GT/prediction PNGs (default), or legacy colored overlays",
+    )
+    parser.add_argument(
         "--unified-root",
         type=Path,
         default=Path("/data/xuzhefeng/Datasets/uni-hoi-dataset"),
@@ -719,6 +723,19 @@ def render_montages(
     return manifest
 
 
+def get_visual_renderer(style: str):
+    """Choose the scientific separated output or explicitly requested legacy overlay."""
+    if style == "overlay":
+        return render_montages
+    if style == "separate":
+        if __package__:
+            from .render_separated_masks import render_montages as renderer
+        else:
+            from render_separated_masks import render_montages as renderer
+        return renderer
+    raise ValueError(f"Unsupported visual style: {style!r}")
+
+
 def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
@@ -822,7 +839,7 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     metrics = summarize(all_records, args.detection_threshold)
-    visual_manifest = render_montages(
+    visual_manifest = get_visual_renderer(args.visual_style)(
         root=args.data_root,
         output_dir=args.output_dir / "visuals",
         render_indices=render_indices,
@@ -840,6 +857,7 @@ def main() -> None:
         "evaluated_dataset_indices": eval_indices,
         "detection_threshold": args.detection_threshold,
         "mask_threshold": args.mask_threshold,
+        "visual_style": args.visual_style,
         "gpu_memory_fraction": args.gpu_memory_fraction,
         "peak_gpu_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2,
         "peak_gpu_reserved_mib": torch.cuda.max_memory_reserved() / 1024**2,

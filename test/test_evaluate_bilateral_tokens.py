@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -7,10 +8,24 @@ from pycocotools import mask as mask_utils
 
 from scripts.evaluate_bilateral_tokens import (
     average_precision, decode_gt_mask, dice_iou, validate_batch_identity,
+    get_visual_renderer, parse_args, render_montages,
 )
 
 
 class EvaluationMetricsTest(unittest.TestCase):
+    def test_separated_visuals_are_default_and_legacy_overlay_is_explicit(self):
+        from scripts.render_separated_masks import render_montages as separated
+        argv = ["evaluate", "--data-root", "/data", "--base-checkpoint", "/model.pt",
+                "--output-dir", "/output", "--include-ve"]
+        with patch("sys.argv", argv):
+            self.assertEqual(parse_args().visual_style, "separate")
+        with patch("sys.argv", argv + ["--visual-style", "overlay"]):
+            self.assertEqual(parse_args().visual_style, "overlay")
+        self.assertIs(get_visual_renderer("separate"), separated)
+        self.assertIs(get_visual_renderer("overlay"), render_montages)
+        with self.assertRaises(ValueError):
+            get_visual_renderer("unknown")
+
     def test_loader_substitution_and_category_mismatch_are_rejected(self):
         metadata = SimpleNamespace(
             coco_image_id=torch.tensor([20, 20, 10, 10]),
