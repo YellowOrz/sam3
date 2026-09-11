@@ -352,23 +352,27 @@ def scopes(rows):
                                        for name in ("both", "left_only", "right_only", "none")}}
 
 
-def _model_progress(metadata, group, expected_sha):
-    expected_step = {"mixed": 5021, "nake": 3082}[group]
+def _model_progress(metadata, group, expected_sha, expected_epoch=1):
+    if type(expected_epoch) is not int or expected_epoch not in (1, 2):
+        raise ValueError("Only explicit completed epoch 1 or 2 is supported")
+    steps_per_epoch = {"mixed": 5021, "nake": 3082}[group]
+    expected_step = steps_per_epoch * expected_epoch
     same(metadata.get("checkpoint_sha256"), digest(expected_sha, "preselected checkpoint"), "preselected checkpoint SHA")
     progress, config = metadata.get("progress", {}), metadata.get("training_config", {})
-    for key, value in {"global_step": expected_step, "completed_epochs": 1,
-                       "next_epoch": 1, "next_step_in_epoch": 0, "samples_seen": expected_step * 6}.items():
-        same(progress.get(key), value, f"actual epoch1 {key}")
-    same(config.get("steps_per_epoch"), expected_step, "training steps per epoch")
+    for key, value in {"global_step": expected_step, "completed_epochs": expected_epoch,
+                       "next_epoch": expected_epoch, "next_step_in_epoch": 0, "samples_seen": expected_step * 6}.items():
+        same(progress.get(key), value, f"actual epoch{expected_epoch} {key}")
+    same(config.get("steps_per_epoch"), steps_per_epoch, "training steps per epoch")
     same(config.get("global_batch_size"), 6, "actual training global batch")
-    if integer(config.get("dataset_size"), "training dataset size", 1) // 6 != expected_step:
-        raise ValueError("Training dataset size differs from actual epoch1 exposure")
-    integer(config.get("epochs"), "planned training epochs", 1)
+    if integer(config.get("dataset_size"), "training dataset size", 1) // 6 != steps_per_epoch:
+        raise ValueError("Training dataset size differs from actual per-epoch exposure")
+    if integer(config.get("epochs"), "planned training epochs", 1) < expected_epoch:
+        raise ValueError("Selected completed epoch exceeds planned training epochs")
     for key in ("base_sha256", "tokenizer_sha256", "initial_cache_file_sha256", "annotations_sha256"):
         digest(config.get(key), key)
     for key in ("initial_cache_verified", "actual_training_identities_verified"):
         same(metadata.get(key), True, key)
-    return {"checkpoint_sha256": expected_sha, "actual_global_step": expected_step, "actual_completed_epochs": 1,
+    return {"checkpoint_sha256": expected_sha, "actual_global_step": expected_step, "actual_completed_epochs": expected_epoch,
             "actual_image_exposures": expected_step * 6, "planned_epochs": config["epochs"],
             "original_metadata": metadata}
 
@@ -524,9 +528,12 @@ def load_shard(path, contract):
 
 
 def compare(data_root, *, ve_left_summaries, ve_right_summaries, mixed_summaries, nake_summaries,
-            mixed_checkpoint_sha256, nake_checkpoint_sha256, expected_images=6204, expected_legacy_images=128):
+            mixed_checkpoint_sha256, nake_checkpoint_sha256, expected_images=6204, expected_legacy_images=128,
+            expected_nake_epoch=1):
+    if type(expected_nake_epoch) is not int or expected_nake_epoch not in (1, 2):
+        raise ValueError("Explicit nake epoch must be 1 or 2")
     digest(mixed_checkpoint_sha256, "explicit mixed epoch1 checkpoint")
-    digest(nake_checkpoint_sha256, "explicit nake epoch1 checkpoint")
+    digest(nake_checkpoint_sha256, f"explicit nake epoch{expected_nake_epoch} checkpoint")
     contract = load_contract(data_root, expected_images=expected_images, expected_legacy_images=expected_legacy_images)
     specifications = {"ve-left": ve_left_summaries, "ve-right": ve_right_summaries,
                       "mixed": mixed_summaries, "nake": nake_summaries}
@@ -569,7 +576,8 @@ def compare(data_root, *, ve_left_summaries, ve_right_summaries, mixed_summaries
                                            digest(model["tokenizer_sha256"], "VE tokenizer")]), "VE actual model fingerprints")
             else:
                 expected_sha = mixed_checkpoint_sha256 if group == "mixed" else nake_checkpoint_sha256
-                metadata[group] = _model_progress(model, group, expected_sha)
+                metadata[group] = _model_progress(model, group, expected_sha,
+                                                  expected_nake_epoch if group == "nake" else 1)
                 note = summary.get("checkpoint_selection_note")
                 if not isinstance(note, str) or not note.strip():
                     raise ValueError("Missing predeclared checkpoint selection note")
@@ -647,7 +655,8 @@ def compare(data_root, *, ve_left_summaries, ve_right_summaries, mixed_summaries
                 "raw保留每个已提供参考；质量敏感主指标只排本侧已记录问题，错侧代理额外要求两侧参考均已提供且无问题。",
                 "缺失参考的Dice/IoU/边界/FN/FP均不适用，不得当作全黑负例；原始提供但全黑的参考才进入absent分母。",
                 "旧128帧按原映射单列重聚合，没有重新挑选或改变阈值；已看过的开发帧不包装成独立新增测试样本。",
-                "mixed epoch1=5021更新/30126次图像曝光；nake epoch1=3082更新/18492次曝光，不是等数据量或等更新数对照。",
+                f"mixed epoch1=5021更新/30126次图像曝光；nake epoch{expected_nake_epoch}="
+                f"{3082 * expected_nake_epoch}更新/{18492 * expected_nake_epoch}次曝光，不是等数据量或等更新数对照。",
                 "临近帧相关，不作独立样本的假精确置信区间；不根据本结果挑checkpoint、调参或挑展示图。",
                 "RLE证明所存候选与参考的一致性；没有完整logits，不能单靠RLE重新证明argmax或像素阈值执行。"]}
 
@@ -659,8 +668,8 @@ def markdown_report(result):
              "指标由所有明确指定分片的候选RLE重算；没有用summary的均值替代逐条核验。", "",
              "| 模型 | 实际完成epoch | 更新数 | 图像曝光次数 |", "|---|---:|---:|---:|"]
     for group, progress in result["model_progress"].items():
-        lines += [f"| {group} | 1 | {progress['actual_global_step']} | {progress['actual_image_exposures']} |"]
-    lines += ["", "两种epoch1不等规模；选定checkpoint和原始选点说明保存在JSON，未用best替代。", ""]
+        lines += [f"| {group} | {progress['actual_completed_epochs']} | {progress['actual_global_step']} | {progress['actual_image_exposures']} |"]
+    lines += ["", "两种训练完成点不等规模；选定checkpoint和原始选点说明保存在JSON，未用best替代。", ""]
     for scope, title in (("raw_all_provided", "所有实际提供的原始参考"),
                          ("primary_quality_eligible", "本侧质量敏感主指标"), ("legacy_fixed128", "旧固定128单列")):
         lines += [f"## {title}", "", "| 条件/侧 | 正参考数 | 候选Dice | 漏检置零Dice | 候选IoU | Boundary4px | FN | 空侧FP/空侧数 |",
@@ -685,6 +694,8 @@ def main(argv=None):
         parser.add_argument(f"--{label}-summary", type=Path, action="append", required=True)
     for label in ("mixed", "nake"):
         parser.add_argument(f"--{label}-checkpoint-sha256", required=True)
+    parser.add_argument("--nake-expected-epoch", type=int, choices=(1, 2), default=1,
+                        help="Explicit user-selected completed epoch; never inferred from best or test scores")
     args = parser.parse_args(argv)
     if args.output_dir.exists() or args.output_dir.is_symlink():
         raise ValueError("Comparison output must be new; existing results cannot be overwritten")
@@ -695,7 +706,8 @@ def main(argv=None):
         raise ValueError("Comparison output must be separate from immutable datasets and inference runs")
     result = compare(args.data_root, ve_left_summaries=args.ve_left_summary, ve_right_summaries=args.ve_right_summary,
                      mixed_summaries=args.mixed_summary, nake_summaries=args.nake_summary,
-                     mixed_checkpoint_sha256=args.mixed_checkpoint_sha256, nake_checkpoint_sha256=args.nake_checkpoint_sha256)
+                     mixed_checkpoint_sha256=args.mixed_checkpoint_sha256, nake_checkpoint_sha256=args.nake_checkpoint_sha256,
+                     expected_nake_epoch=args.nake_expected_epoch)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     with (args.output_dir / "comparison.json").open("x", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=2, allow_nan=False)

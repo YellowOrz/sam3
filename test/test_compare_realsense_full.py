@@ -452,6 +452,36 @@ class FullComparisonTests(unittest.TestCase):
         for group in ("ve-left", "ve-right"):
             self.assertEqual(result["metrics_recomputed_from_saved_rle"][group], expected[group])
 
+    def test_explicit_second_epoch_preserves_per_epoch_identity_and_report(self):
+        for path in self.nake:
+            self.change_summary(path, lambda summary: summary["model_metadata"]["progress"].update(
+                global_step=6164, completed_epochs=2, next_epoch=2, samples_seen=36984))
+        with self.assertRaises(ValueError):
+            self.run_comparison()
+        result = self.run_comparison(expected_nake_epoch=2)
+        progress = result["model_progress"]["nake"]
+        self.assertEqual(progress["actual_completed_epochs"], 2)
+        self.assertEqual(progress["actual_global_step"], 6164)
+        self.assertEqual(progress["actual_image_exposures"], 36984)
+        self.assertIn("| nake | 2 | 6164 | 36984 |", compare.markdown_report(result))
+        self.assertIn("nake epoch2=6164", " ".join(result["limitations"]))
+        self.change_summary(self.nake[0], lambda summary: summary["model_metadata"]["progress"].update(next_step_in_epoch=1))
+        with self.assertRaises(ValueError):
+            self.run_comparison(expected_nake_epoch=2)
+
+    def test_second_epoch_request_rejects_first_epoch_or_invalid_selection(self):
+        for epoch in (2, 0, 3, True, 1.0):
+            with self.subTest(epoch=epoch), self.assertRaises(ValueError):
+                self.run_comparison(expected_nake_epoch=epoch)
+
+    def test_second_epoch_must_fit_original_training_plan(self):
+        for path in self.nake:
+            self.change_summary(path, lambda summary: summary["model_metadata"]["progress"].update(
+                global_step=6164, completed_epochs=2, next_epoch=2, samples_seen=36984))
+            self.change_summary(path, lambda summary: summary["model_metadata"]["training_config"].update(epochs=1))
+        with self.assertRaises(ValueError):
+            self.run_comparison(expected_nake_epoch=2)
+
     def test_missing_duplicate_or_wrong_model_shard_rejected(self):
         for paths in (self.mixed[:-1], self.mixed + self.mixed[:1], self.ve):
             with self.subTest(paths=[str(path) for path in paths]), self.assertRaises(ValueError):
