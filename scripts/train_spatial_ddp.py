@@ -23,7 +23,7 @@ from scripts.residual_ddp_objective import (loss_components, global_target_denom
 from scripts.residual_ddp_checkpoint import atomic_checkpoint, validate_rank_cache_consistency
 from scripts.residual_ddp_validation import evaluate_validation
 from scripts.residual_training_monitor import TrainingMonitor
-from scripts.spatial_training_state import FORMAT, validate_state
+from scripts.spatial_training_state import FORMAT, validate_state, transfer_stage
 from sam3.model.spatial_mask_adapter import attach_spatial_mask_adapter
 
 
@@ -67,6 +67,13 @@ def run(args):
         validation=args.validation, initial_validation=args.initial_validation,
         selection="macro_candidate_boundary_iou_4px", implementation=code_hashes,
         loss="original_mask_focal_plus_dice", drop_last=True)
+    stage_source = None
+    if getattr(args, 'stage_source', None):
+        stage_source = torch.load(args.stage_source, map_location='cpu', weights_only=True)
+        config['stage_source_sha256'] = shared.evaluation.sha256(args.stage_source)
+        config['optimizer_step_offset'] = stage_source['step'] + stage_source['config'].get('optimizer_step_offset', 0)
+        from sam3.model.spatial_mask_adapter import SpatialMaskAdapter
+        stage_source = transfer_stage(stage_source, config, SpatialMaskAdapter().state_dict(), config['stage_source_sha256'])
     if args.preflight_only:
         print(json.dumps(config), flush=True)
         return
@@ -105,6 +112,10 @@ def run(args):
             adapter.load_state_dict(resume["adapter"])
             optimizer.load_state_dict(resume["optimizer"])
             step, last_validation, best = resume["step"], resume["last_validation_step"], resume["best_boundary"]
+        elif stage_source is not None:
+            resume = stage_source
+            adapter.load_state_dict(resume['adapter'])
+            optimizer.load_state_dict(resume['optimizer'])
         wrapped = DistributedDataParallel(objective, device_ids=[context.local_rank], broadcast_buffers=False) if context.distributed else objective
         # DDP initialization broadcasts even frozen parameters and increments
         # their version counters; audit optimizer changes AFTER that sync.
@@ -117,6 +128,7 @@ def run(args):
             if context.is_main:
                 shared.evaluation.atomic_write_json(args.output_dir / "run.json", {
                     "config": config, "approval": approval, "requested_stop": limit,
+                    "stage_source": str(getattr(args, 'stage_source', None)),
                     "resume": str(args.resume), "parameter_count": sum(p.numel() for p in params)})
         rank_stage(context, write_run)
         def audit():
@@ -200,6 +212,7 @@ def run(args):
                 "status": "complete" if step == args.epochs * steps_per_epoch else "bounded_stop",
                 "step": step, "completed_epochs": step // steps_per_epoch,
                 "samples_seen": step * global_batch, "best_boundary": best,
+                "optimizer_updates_including_parent": step + config.get('optimizer_step_offset', 0),
                 "note": "No RealSense-driven selection; see separate validation records"})
     finally:
         monitor.close()
@@ -207,4 +220,10 @@ def run(args):
 
 
 if __name__ == "__main__":
-    run(infrastructure.parse_args())
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--stage-source', type=Path)
+    stage_args, remaining = parser.parse_known_args()
+    args = infrastructure.parse_args(remaining)
+    args.stage_source = stage_args.stage_source
+    run(args)
