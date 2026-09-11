@@ -274,18 +274,30 @@
 ## 24. 文档移出仓库与服务器 Git 交付流程（2026-09-11）
 
 - 按用户要求将全部docs实际移到同级 `/home/zhengyuxi/projects/docs`；迁移前备份原目录、暂存区binary patch与index，并用tar compare逐项核对原目录。仓库内只留被忽略的本地兼容软链；仅撤销docs的暂存，不删除数据或取消其他代码暂存。
-- 新增 `DOCS_LOCATION.md`、`GIT_WORKFLOW.md`：记录Linux/Windows同级布局、历史相对源码链接限制，以及用户授权的验证→更新CHANGELOG→commit/push流程。不添加Co-authored-by、不强推、不自动合并主分支、不上传数据/权重/凭据。
+- 新增 `DOCS_LOCATION.md`：记录Linux/Windows同级布局和历史相对源码链接限制。交付遵循验证→更新CHANGELOG→commit/push；不添加Co-authored-by、不强推、不自动合并主分支、不上传数据/权重/凭据。个人账号运维说明随后移出仓库。
 - 打包器支持显式 `--docs-root` 与同级目录默认发现，只允许既定旧docs直达新目录的兼容别名，不放开一般软链；仅在新阅读副本中映射旧链接，保持历史MD/JSON/哈希不变。晨间发布器透传并检查外置docs与输出不嵌套；Windows同步默认目的地改为paper_review下同级docs，仍以新版本目录交付。
-- 新增7项迁移/路径安全测试，打包与发布定向40项通过。仓库Git身份设置为 `zyx-thu <yx-zheneg22@mails.tsinghua.edu.cn>`；账号认证和远端写权限另行验证，不能把作者配置完成等同已登录或已push。
+- 新增7项迁移/路径安全测试，打包与发布定向40项通过。Git作者身份仅作仓库局部配置；账号认证和远端写权限另行验证，不能把作者配置完成等同已登录或已push。
 - 迁移后的完整CPU回归533项：532通过、1项既有依赖跳过；所有训练数据、权重与参考源未修改。新增同级docs阅读包实际构建验证，包含上午输出残差说明和图，旧封存包不覆盖。GitHub登录尚待用户浏览器首次授权，提交与推送状态分别报告。
 
 ## 25. GitHub 配置限定在本用户目录（2026-09-11）
 
-- 按用户补充要求，将 Git 作者与后续认证 helper 限定为本仓库配置；GitHub CLI 与独立认证目录均位于 `/home/zhengyuxi`，不写 system/global Git 配置，不影响其他用户，也不写 shell 启动文件。
-- `GIT_WORKFLOW.md` 记录显式 `GH_CONFIG_DIR`、目录/凭据最小权限及禁止全局 helper 的约定。认证与远端推送仍需单独完成并核验；这不代表 GitHub 账号访问权限被自动缩减为单仓库。
-- 官方 GitHub CLI 下载包 SHA256 与发行元数据一致，安装仅写本用户 `.local/bin/gh`。强制明文登录方案被安全检查拦截，未执行；随后只读确认本用户 Secret Service 可用且 login keyring 已解锁，采用默认加密凭据库方案，不自动配置全局 helper。
-- 用户完成浏览器授权，实际登录账号 `zyx-thu`，认证状态确认令牌存于 `keyring`；目标 `YellowOrz/sam3` 的 `push` 权限通过。作者与显式 `GH_CONFIG_DIR` 的 HTTPS helper 均核验为 `local .git/config`；全局配置仍不存在，独立 gh 配置目录/文件权限为700/600。
+- Git作者与认证helper限定为仓库局部配置，工具及凭据限定为用户目录，不写system/global Git配置或shell启动文件，不影响其他用户。
+- 认证、远端写权限与实际推送分别核验；个人账号、凭据位置及操作说明在仓库外单独管理，不随项目发布。
 - 远端 `31cdd00` 与本地已有祖先 `f8260eb` 的完整 tree 均为 `f7010834d80653781f97a99e0134dbc33383ee87`，不存在额外远端代码差异。保留两条历史进行非强推合并，不回退服务器后续改动；合并仅补充本日志，代码与已完成533项CPU回归（532通过、1跳过）的本地版本相同，推送后再核对远端SHA。
+
+## 26. 大 batch 输出残差 DDP、TensorBoard 与混合数据准备（2026-09-11）
+
+- 用户选择 DexYCB 一半＋nakehand 全部训练、RealSense 测试：具体按原 Dex train 固定分层取半，保留原 Dex val；合并 nakehand 六录像并沿用争议 frame0 排除。新派生版本不覆盖原 split，nakehand 旧 val/holdout 此后不再作为独立验证。RealSense 不参与训练、学习率或阈值选择。
+- 新增独立 `train_residual_ddp.py` 及 runtime/data/objective/checkpoint/validation 组件：torchrun 单机三/四卡、真正多图 batch、spawn workers、递归 pinned memory、严格图像/侧别身份校验，原 SAM3 与旧实验入口保持不变。
+- DDP 使用标准 backward，仅更新 FP32 `delta[2,4,256]`，原主干仍 eval/frozen；六项原任务 loss 保持权重1。明确大 batch mask/box 按全局目标数归一化，先 clamp 总数再除卡数；CE/presence 按等量查询平均，不冒充旧逐图更新预算。
+- 新版恢复点区分 optimizer steps、samples_seen、epoch 与 world size，保存各 rank RNG/实际图序、optimizer与冻结缓存，拒绝数据/代码/卡数/batch等配置悄悄改变；仅 rank0 原子写恢复点，失败不保存可能半更新的参数。
+- 新增 rank0 TensorBoard＋原始JSONL，记录分项loss、学习率、左右梯度、数据等待/H2D/计算耗时、吞吐和峰值显存；验证记录loss、左右Dice/漏检/误报及分离RGB/GT/预测。训练loss下降不能代替验证效果。
+- `prepare_residual_mixed_training.py` 提供新ID、保留源dataset/split/image/frame、批准源RGB软链及逐文件SHA、源READY/annotations绑定、末尾READY发布；不重画参考mask。派生版本已发布：Dex train 分层取11,632张＋nakehand18,497张＝train30,129张（45,299标注），val2,909张（2,876标注）。保留争议nakehand源frame0排除；train/val标注SHA分别为`6ed07c5010fe04b52c6d35f2c28288afd638b783d813112f6e9859199e8da866`、`dd6ed2af7448dc4541ea1901446fc0d6dd84a4828fa4b4eb41c75b7fa56c5ddd`。
+- 完整CPU回归606项：605通过、1项因环境缺OpenCV跳过，无失败。覆盖三/四rank Gloo等价性、真实多图collator/原六项loss、跨rank缓存SHA审计、断点恢复、rank0 TensorBoard事件、仓库外launcher模块导入与数据准备契约。
+- 101真实三卡NCCL默认初始化出现SIGSEGV；极小标量对照复现于NET/IB路径，仅在本进程设置`NCCL_IB_DISABLE=1`后通信通过。未改系统或为其他机器默认关闭IB。随后真实SAM3三卡（每卡batch1、BF16、lr0.001）两步短训练完成：loss有限，左右梯度非零，仅2048个残差参数可训练，冻结参数版本不变、三个rank缓存SHA一致，恢复点与TensorBoard事件均落盘。此为工程冒烟，不是两轮训练或分割精度提升证据；四卡GPU、大batch性能、正式训练及RealSense测试仍待验收。
+- 真实三卡恢复进一步通过：保持原epochs2/每卡batch1/lr0.001配置，从step2完整恢复到step4（累计12张图）；三个rank完整缓存SHA均为`d0e5097ff312b142c93a4adc235b585418476e1c24dca52578976344890e2f3b`，左右delta L2分别约0.11198/0.08653。该项证明实际恢复与同步链路可执行；尚未声称GPU逐位等同不间断训练轨迹，也未运行正式精度验收。
+- 三卡每卡batch2的受限显存短测在首步前触发allocator上限（25%），未执行优化更新。保留失败记录；不提高共享卡上限挤占其他进程，不把未通过的大batch配置作为正式训练配置。
+- 任务指导清单和个人服务器/SSH/账号操作文档在仓库外独立维护，项目不保留副本；日志移除本轮个人认证信息。训练说明与指标阅读文档仍位于项目同级外置docs，不重写已有Git历史。
 
 ## 下一步
 
