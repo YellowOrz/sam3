@@ -75,6 +75,29 @@ class ReviewDocsPackageTest(unittest.TestCase):
         manifest = json.loads((self.out / "review/manifest.json").read_text())
         self.assertFalse(any("unselected" in entry["path"] for entry in manifest["files"]))
 
+    def test_prioritized_report_assets_and_training_category(self):
+        training = self.docs / 'distributed-training' / 'README.md'
+        training.parent.mkdir()
+        training.write_text('# Training\n![old](old.png)')
+        (training.parent / 'old.png').write_bytes(b'old')
+        report = self.results / 'README.md'
+        report.write_text('# Current experiment\n![new](new.png)')
+        (self.results / 'new.png').write_bytes(b'new')
+        self.run_package(reports=[report], start_with=[report], max_assets=1)
+        index = (self.out / 'review/START_HERE.md').read_text()
+        self.assertIn('## 本次先读', index)
+        self.assertIn('06-training', index)
+        manifest = json.loads((self.out / 'review/manifest.json').read_text())
+        self.assertIn(str(self.results / 'new.png'), [item['source'] for item in manifest['files']])
+        self.assertNotIn(str(training.parent / 'old.png'), [item['source'] for item in manifest['files']])
+        self.assertTrue(any(item['path'].startswith('03-results/') for item in manifest['files']))
+
+    def test_priority_does_not_expand_report_whitelist(self):
+        private = self.results / 'unselected.md'
+        private.write_text('# Not selected')
+        with self.assertRaisesRegex(ValueError, 'already included'):
+            self.run_package(start_with=[private])
+
     def test_start_index_has_one_source_grounded_description_per_markdown(self):
         (self.docs / "plan.md").write_text("# **边界对照：尚未训练**\n计划，不是结果。\n")
         (self.docs / "simple.md").write_text("本文件说明冻结参考的限制。\n下一行。\n")
@@ -340,8 +363,12 @@ class ReviewDocsPackageTest(unittest.TestCase):
 
     def test_windows_script_has_only_download_not_remote_execution(self):
         script = (Path(__file__).resolve().parents[1] / "scripts/sync_review_docs_windows.ps1").read_text()
-        self.assertIn("$ServerAlias = 'iipl_101'", script)
-        self.assertIn("$DestinationRoot = 'C:\\Users\\jixiegeming\\Desktop\\paper_review\\docs\\", script)
+        self.assertIn("[string] $RemoteRoot", script)
+        self.assertIn("[string] $DestinationRoot", script)
+        self.assertNotIn('zhengyuxi', script)
+        self.assertNotIn('jixiegeming', script)
+        self.assertIn('StrictHostKeyChecking=yes', script)
+        self.assertIn('BatchMode=yes', script)
         self.assertIn("$ExpectedSha256", script)
         self.assertIn("Assert-ArchivePath", script)
         self.assertIn("[System.IO.Directory]::Move", script)

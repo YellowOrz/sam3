@@ -5,13 +5,22 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $RemoteZip,
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[a-fA-F0-9]{64}$')]
+    [ValidatePattern('\A[a-fA-F0-9]{64}\z')]
     [string] $ExpectedSha256,
-    [ValidatePattern('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')]
-    [string] $ServerAlias = 'iipl_101',
-    [string] $DestinationRoot = 'C:\Users\jixiegeming\Desktop\paper_review\docs\overnight-review-2026-09-11',
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')]
-    [string] $Version = (Get-Date -Format 'yyyyMMdd-HHmmss')
+    [ValidatePattern('\A(?:[a-fA-F0-9]{64})?\z')]
+    [string] $ExpectedManifestSha256 = '',
+    [ValidateRange(0, 209715200)]
+    [long] $ExpectedArchiveBytes = 0,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('\A[A-Za-z0-9_][A-Za-z0-9_.-]*\z')]
+    [string] $ServerAlias,
+    [Parameter(Mandatory = $true)]
+    [string] $RemoteRoot,
+    [Parameter(Mandatory = $true)]
+    [string] $DestinationRoot,
+    [ValidatePattern('\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\z')]
+    [string] $Version = (Get-Date -Format 'yyyyMMdd-HHmmss'),
+    [switch] $BatchMode
 )
 
 Set-StrictMode -Version Latest
@@ -44,14 +53,19 @@ function Assert-NoReparseAncestor([string] $CandidatePath) {
 }
 
 if ($env:OS -ne 'Windows_NT') { throw 'Run this script in Windows PowerShell / PowerShell on Windows.' }
-if ($RemoteZip -notmatch '^/home/zhengyuxi/(datasets|projects)/[A-Za-z0-9_./-]+\.zip$' -or
-    $RemoteZip.Split('/') -contains '..' -or $RemoteZip.Contains('//')) {
-    throw 'RemoteZip must be a safe absolute .zip path under the approved server datasets/projects directories.'
+foreach ($PathArgument in @($RemoteRoot, $RemoteZip, $DestinationRoot)) {
+    if ($PathArgument -match '[\x00-\x1f\x7f]') { throw 'Control characters in paths are refused.' }
+}
+if ($RemoteRoot -notmatch '^/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$' -or
+    $RemoteZip -notmatch '^/[A-Za-z0-9_./-]+\.zip$' -or
+    -not $RemoteZip.StartsWith($RemoteRoot + '/', [System.StringComparison]::Ordinal) -or
+    $RemoteZip.Split('/') -contains '..' -or $RemoteZip.Split('/') -contains '.' -or $RemoteZip.Contains('//')) {
+    throw 'RemoteZip must be a safe absolute .zip path inside the explicitly approved RemoteRoot.'
 }
 Assert-ArchivePath $Version
 $ScpExecutable = (Get-Command scp -CommandType Application -ErrorAction Stop).Source
 $DestinationPath = [System.IO.Path]::GetFullPath($DestinationRoot)
-if (-not [System.IO.Path]::IsPathRooted($DestinationRoot) -or $DestinationPath.StartsWith('\\')) {
+if ($DestinationRoot -notmatch '^[A-Za-z]:[\\/]' -or $DestinationPath.StartsWith('\\')) {
     throw 'DestinationRoot must be an absolute local Windows directory, not a network share.'
 }
 Assert-NoReparseAncestor $DestinationPath
@@ -67,8 +81,14 @@ $ExtractionPath = Join-Path $TransferPath 'verified-content'
 try {
     # No remote shell command, installation, SSH configuration change or credential
     # collection. The existing local SSH alias handles authentication normally.
-    & $ScpExecutable -- ($ServerAlias + ':' + $RemoteZip) $DownloadPath
+    $ScpOptions = @('-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=2')
+    if ($BatchMode) { $ScpOptions += @('-o', 'BatchMode=yes') }
+    & $ScpExecutable @ScpOptions -- ($ServerAlias + ':' + $RemoteZip) $DownloadPath
     if ($LASTEXITCODE -ne 0) { throw "scp failed with exit code $LASTEXITCODE" }
+    $DownloadedBytes = (Get-Item -LiteralPath $DownloadPath).Length
+    if ($DownloadedBytes -gt 200MB -or ($ExpectedArchiveBytes -gt 0 -and $DownloadedBytes -ne $ExpectedArchiveBytes)) {
+        throw 'Downloaded ZIP size exceeds the limit or does not match the declared size.'
+    }
     $DownloadedSha = (Get-FileHash -LiteralPath $DownloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($DownloadedSha -ne $ExpectedSha256.ToLowerInvariant()) { throw 'Downloaded ZIP SHA256 does not match the independently supplied expected value.' }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -112,6 +132,10 @@ try {
     }
     finally { $ArchiveHandle.Dispose() }
     $ManifestPath = Join-Path $ExtractionPath 'manifest.json'
+    $ExtractedManifestSha = (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($ExpectedManifestSha256 -and $ExtractedManifestSha -ne $ExpectedManifestSha256.ToLowerInvariant()) {
+        throw 'Extracted manifest SHA256 does not match the published feed.'
+    }
     $ManifestData = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($ManifestData.format -ne 'sam3-portable-review-documents-v1' -or $ManifestData.source_files_verified_unchanged -ne $true) {
         throw 'Unknown or incomplete document manifest.'
@@ -141,6 +165,7 @@ try {
         source_alias = $ServerAlias
         source_archive = $RemoteZip
         archive_sha256 = $DownloadedSha
+        archive_bytes = $DownloadedBytes
         manifest_sha256 = (Get-FileHash -LiteralPath (Join-Path $PublishedPath 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
         destination = $PublishedPath
         verified_file_count = $ManifestData.files.Count

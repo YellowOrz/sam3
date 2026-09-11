@@ -32,6 +32,7 @@ CATEGORIES = {
     "03-results": "实测结果与对照实验",
     "04-mano-memory": "MANO、geometry 与 memory",
     "05-meeting": "导师／学长讨论与研究依据",
+    "06-training": "多卡训练、TensorBoard 与工程验证",
 }
 
 
@@ -111,6 +112,8 @@ def documentation_link_target(raw: str, source: Path, *, repo: Path,
 
 def category(path: Path) -> str:
     name = path.name.lower()
+    if "distributed-training" in path.parts:
+        return "06-training"
     if "data-audits" in path.parts:
         return "02-data"
     if "meeting" in name or "research-notes" in name or name == "sam3-loss-reference.md":
@@ -181,7 +184,7 @@ def document_description(data: bytes) -> str:
 def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
             results_roots: list[Path], max_assets: int = 96,
             max_total_bytes: int = 100 * 1024**2, max_file_bytes: int = 8 * 1024**2,
-            docs_root: Path | None = None) -> dict:
+            docs_root: Path | None = None, start_with: list[Path] | None = None) -> dict:
     repo = clean_path(repo_root)
     docs = resolve_docs_root(repo, docs_root)
     roots = [clean_path(root) for root in results_roots]
@@ -214,6 +217,9 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
         if path.suffix.lower() != ".md" or not within(path, roots) or not path.is_file():
             raise ValueError(f"report must be an explicit Markdown file in approved roots: {path}")
         selected_reports.append(path)
+    priority_docs = list(dict.fromkeys(clean_path(path) for path in (start_with or [])))
+    if any(path not in document_paths + selected_reports for path in priority_docs):
+        raise ValueError("start-with must name an already included documentation/report file")
     sources: dict[Path, bytes] = {}
     destinations: dict[Path, str] = {}
     occupied: set[str] = set()
@@ -253,7 +259,7 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
         prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", path.parent.name)[:28]
         identity = sha256(str(path).encode())[:8]
         bucket = ("00-start" if path.name == "OVERNIGHT_REVIEW.md" else
-                  "02-data" if ("preparation" in path.name.lower() or path.name.lower() == "readme.md") else "03-results")
+                  "02-data" if "preparation" in path.name.lower() else "03-results")
         add(path, f"{bucket}/{compact_name(f'{prefix}-{identity}-{path.name}')}")
 
     # Explicit, small provenance/architecture assets are useful even when a
@@ -268,8 +274,10 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
     forced_assets.append(docs / "data-audits/dexycb-conversion-20260910/pixel-sample-audit.json")
     forced_assets.append(docs / "data-audits/dexycb-conversion-20260910/supplementary-audit.json")
     forced_assets.append(docs / "dex-mask-resize-cpu-audit-20260910.json")
-    asset_candidates = list(forced_assets)
-    for path, data in list(sources.items()):
+    asset_candidates = []
+    ordered_documents = priority_docs + [path for path in sources if path not in priority_docs]
+    for path in ordered_documents:
+        data = sources[path]
         for is_code, segment in non_code_segments(data.decode("utf-8")):
             if is_code:
                 continue
@@ -279,6 +287,9 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
                         match.group("angle") or match.group("plain"), path, repo=repo, docs=docs)
                     if target and target.suffix.lower() in ASSET_EXTENSIONS:
                         asset_candidates.append(target)
+    # Current explicitly prioritized results retain their pictures even when
+    # historical documents exhaust the bounded asset budget.
+    asset_candidates.extend(forced_assets)
     asset_count = 0
     for path in dict.fromkeys(asset_candidates):
         if path in sources:
@@ -349,7 +360,12 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
              "本包是独立阅读副本；不覆盖 Windows 仓库代码，也不包含 checkpoint、原始视频或完整数据集。",
              "未打包路径明确保留为服务器路径，不能直接在 Windows 打开。", "",
              "源文档与输出文件的 SHA256 均记录在 manifest.json；ZIP 的外部 SHA256 用于传输核验。",
-             "以下每份 Markdown 的一行简介摘自其原标题（无标题则取首条正文），不是重新推断的完成状态；当前状态先看夜间快照。", ""]
+             "以下每份 Markdown 的一行简介摘自其原标题（无标题则取首条正文），不是重新推断的完成状态；请注意每份报告的记录时间。", ""]
+    if priority_docs:
+        index.extend(["## 本次先读", ""])
+        for number, path in enumerate(priority_docs, 1):
+            index.append(f"{number}. [{path.name}]({quote(destinations[path], safe='/._-~')}) — {document_description(sources[path])}")
+        index.append("")
     for bucket, title in CATEGORIES.items():
         index.extend([f"## {bucket} — {title}", ""])
         for source, destination in sorted(destinations.items(), key=lambda item: item[1]):
@@ -370,6 +386,7 @@ def package(*, repo_root: Path, output_dir: Path, reports: list[Path],
                 "source_repo": str(repo), "source_docs_root": str(docs),
                 "approved_results_roots": [str(path) for path in roots],
                 "explicit_reports": [str(path) for path in selected_reports], "files": entries,
+                "priority_documents": [str(path) for path in priority_docs],
                 "source_files_verified_unchanged": True, "server_only_links": server_only,
                 "omitted_assets": omitted, "asset_count": asset_count,
                 "limits": {"max_assets": max_assets, "max_total_bytes": max_total_bytes,
@@ -427,6 +444,7 @@ def parse_args(argv=None):
                         help="physical docs directory; default: repo/docs if physical, otherwise sibling docs")
     parser.add_argument("--output-dir", type=Path, required=True, help="new version directory, outside input roots")
     parser.add_argument("--report", type=Path, action="append", default=[], help="one explicitly selected .md report; repeatable")
+    parser.add_argument("--start-with", type=Path, action="append", default=[], help="prioritize an included document in the index and asset budget; repeatable")
     parser.add_argument("--results-root", type=Path, action="append", help="approved derived-results root; repeatable; never enumerated")
     parser.add_argument("--max-assets", type=int, default=96)
     parser.add_argument("--max-total-mib", type=int, default=100)
@@ -437,7 +455,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     receipt = package(repo_root=args.repo_root, output_dir=args.output_dir, reports=args.report,
-                      docs_root=args.docs_root,
+                      docs_root=args.docs_root, start_with=args.start_with,
                       results_roots=args.results_root or [Path(path) for path in DEFAULT_RESULTS_ROOTS],
                       max_assets=args.max_assets, max_total_bytes=args.max_total_mib * 1024**2,
                       max_file_bytes=args.max_file_mib * 1024**2)
