@@ -127,6 +127,40 @@ python scripts/process_learned_prompt_videos.py \
 
 省略 `--target-id` 时从特征文件读取；传入的 ID 必须与文件一致。`--direction both` 的独立正反向输出与 `process_dataset_videos.py` 相同。
 
+用 `--rgb-name` 选择递归查找的 RGB 文件名，默认 `color.mp4`；例如另一类数据使用 `--rgb-name rgb.mkv`。文件名与 GT 目录名参数只接受单个名称，不接受路径或通配符。建议先加 `--list-only` 核对输入。
+
+启用 GT 对比：
+
+```bash
+python scripts/process_learned_prompt_videos.py \
+    --input-root DATA \
+    --output-root OUT \
+    --rgb-name color.mp4 \
+    --learned-prompt outputs/learned_left_hand/best.pt \
+    --checkpoint /models/sam3.pt \
+    --device cuda:0 \
+    --compare-gt \
+    --gt-dir-name masks_sam3 \
+    --compare-skip-frames 2
+```
+
+每个 RGB 视频同级的 `masks_sam3/` 是默认 GT 目录，可通过 `--gt-dir-name` 修改。默认读取 `<target_id>.mkv`，例如 `left_hand.mkv`；用 `--gt-mask-name right_hand.mkv` 可显式指定文件名。GT 是与 RGB 从第 0 帧开始对齐的无损 uint8 灰度标签视频；0 为背景，所有非零实例取并集。预测也取前景并集，不匹配实例 ID。
+
+`--compare-skip-frames 2` 表示每取一帧跳过两帧，视频和指标均选择原始第 0、3、6…帧；默认 0，即全部比较。模型仍逐帧推理。CSV 保留原始帧号及时间，对比视频帧率为 RGB 帧率除以 3，维持采样帧间的原始播放速度（末帧可能因采样间隔多显示不足一个间隔）。`--max-frames N` 仅评测前 N 帧范围，GT 本身仍须与完整 RGB 的声明帧数一致。
+
+每个预测输出目录新增：
+
+- `comparison.mp4`：原图、预测叠加、GT 叠加三联视频，显示原始帧号及该帧 IoU、Dice。
+- `gt_metrics.csv`：逐采样帧的 IoU、Dice、交集和双方前景像素数。
+- `gt_metrics.json`：该视频的逐帧均值 `mean_iou` / `mean_dice`、累计像素指标 `pixel_iou` / `pixel_dice`、采样设置及来源。
+
+输出根目录的 `gt_summary.json` 汇总本次选中序列，正反向分别统计；逐帧均值按所有成功序列的采样帧平均，累计像素指标先汇总交集和前景像素再计算。双方均为空时两项指标均为 1，仅一方为空时均为 0；没有成功评测帧的汇总指标为 `null`。`--direction both` 将对比产物分别放在 `forward/`、`backward/`，视频均按原始时间顺序播放。
+
+已有符合当前目标、方向及帧数设置的完整预测时，直接读取 `masks.mkv` 补做对比，无需加载模型或使用 CUDA；仍需提供有效的特征文件和基础 checkpoint 路径。对比每次重新生成；`--overwrite` 会同时重新执行预测。更换同一目标的训练特征或基础 checkpoint 后，应使用新的输出目录或 `--overwrite`，已有预测完成检查不会校验权重内容。
+
+GT 缺失、无法解码，或尺寸、帧率、帧数不匹配时，不缩放或截断对齐：记录该序列失败，删除过期对比视频和 CSV，保留预测结果，继续处理其他序列，最终返回非零退出码。批次汇总只将成功序列纳入指标，并列出失败原因。
+
+
 一个模型实例只加载一个目标文件；目标 ID 不匹配会报错。内部通过目标 ID 标记原有视频 query 和缓存，标识不经过 tokenizer/text encoder。不要在活跃会话中手工替换参数；切换目标请新建对应 predictor。已有会话的检测、关联、memory 和传播流程继续复用。
 
 普通模式仍使用 `set_text_prompt` 或 `add_prompt` 的 `text` 字段。新模式显式使用 `set_learned_prompt` / `add_learned_prompt`，不会静默把自然语言当成另一个目标。
