@@ -284,6 +284,8 @@
 - 按用户补充要求，将 Git 作者与后续认证 helper 限定为本仓库配置；GitHub CLI 与独立认证目录均位于 `/home/zhengyuxi`，不写 system/global Git 配置，不影响其他用户，也不写 shell 启动文件。
 - `GIT_WORKFLOW.md` 记录显式 `GH_CONFIG_DIR`、目录/凭据最小权限及禁止全局 helper 的约定。认证与远端推送仍需单独完成并核验；这不代表 GitHub 账号访问权限被自动缩减为单仓库。
 - 官方 GitHub CLI 下载包 SHA256 与发行元数据一致，安装仅写本用户 `.local/bin/gh`。强制明文登录方案被安全检查拦截，未执行；随后只读确认本用户 Secret Service 可用且 login keyring 已解锁，采用默认加密凭据库方案，不自动配置全局 helper。
+- 用户完成浏览器授权，实际登录账号 `zyx-thu`，认证状态确认令牌存于 `keyring`；目标 `YellowOrz/sam3` 的 `push` 权限通过。作者与显式 `GH_CONFIG_DIR` 的 HTTPS helper 均核验为 `local .git/config`；全局配置仍不存在，独立 gh 配置目录/文件权限为700/600。
+- 远端 `31cdd00` 与本地已有祖先 `f8260eb` 的完整 tree 均为 `f7010834d80653781f97a99e0134dbc33383ee87`，不存在额外远端代码差异。保留两条历史进行非强推合并，不回退服务器后续改动；合并仅补充本日志，代码与已完成533项CPU回归（532通过、1跳过）的本地版本相同，推送后再核对远端SHA。
 
 ## 下一步
 
