@@ -95,6 +95,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.venv.zip
 
 # Spyder project settings
 .spyderproject
@@ -155,4 +156,3 @@ Thumbs.db
 outputs
 *orig
 *tmp*
-uv.lock
