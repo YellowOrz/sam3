@@ -35,7 +35,7 @@ def selected_sides(mode):
         return (SIDES[0],)
     if mode == "ve-right":
         return (SIDES[1],)
-    if mode in ("residual", "ve-both"):
+    if mode in ("residual", "ve-both", "spatial"):
         return SIDES
     raise ValueError("Unknown evaluation mode")
 

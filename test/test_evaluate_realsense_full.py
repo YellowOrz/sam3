@@ -61,6 +61,9 @@ def metric_row(reference, other, *, flags=(), pair_flags=(), score=.8):
 
 
 class FullRealSenseTest(unittest.TestCase):
+    def test_spatial_mode_retains_both_sides(self):
+        self.assertEqual(full.selected_sides('spatial'), full.SIDES)
+
     def test_shards_are_disjoint_complete_and_seed_free(self):
         images = [{"id": i} for i in range(1, 6205)]
         shards = [full.shard_indices(images, rank, 4) for rank in range(4)]
