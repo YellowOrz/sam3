@@ -11,7 +11,7 @@ from sam3.model.spatial_mask_adapter import SpatialMaskAdapter
 from scripts.spatial_training_state import validate_state
 
 
-def extend_budget(state, epochs, template, source_sha256):
+def extend_budget(state, epochs, template, source_sha256, reason='Explicit completed-budget continuation; only epoch budget changes'):
     config = state['config']
     validate_state(state, config, template)
     if type(epochs) is not int or epochs <= config['epochs']:
@@ -20,11 +20,13 @@ def extend_budget(state, epochs, template, source_sha256):
         raise ValueError('Only completed budgets may be extended')
     if state['last_validation_step'] != state['step']:
         raise ValueError('Completed checkpoint must be validated')
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('A nonempty extension reason is required')
     result = dict(state)
     result['config'] = dict(config, epochs=epochs)
     result['budget_extension'] = dict(source_sha256=source_sha256,
         old_epochs=config['epochs'], new_epochs=epochs,
-        reason='User requested ten total epochs; only budget changes')
+        reason=reason)
     validate_state(result, result['config'], template)
     return result
 
@@ -34,11 +36,12 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--epochs', type=int, required=True)
+    parser.add_argument('--reason', default='Explicit completed-budget continuation; only epoch budget changes')
     args = parser.parse_args()
     raw = args.source.read_bytes()
     state = torch.load(args.source, map_location='cpu', weights_only=True)
     template = SpatialMaskAdapter(bottleneck=state['config']['bottleneck']).state_dict()
-    result = extend_budget(state, args.epochs, template, hashlib.sha256(raw).hexdigest())
+    result = extend_budget(state, args.epochs, template, hashlib.sha256(raw).hexdigest(), reason=args.reason)
     with args.output.open('xb') as handle:
         torch.save(result, handle)
     loaded = torch.load(args.output, map_location='cpu', weights_only=True)
