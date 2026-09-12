@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from scripts.hand_evaluation_metrics import summarize_outputs, temporal_diagnostics, validate_reference_role
 from scripts.video_hand_routes import VideoResidualTextEncoder, union_video_outputs, select_video_indices
+from scripts.audit_hand_route_outputs import actual_metrics
 
 
 def row(frame=0, ref=5, pred=5, side='left_hand', provided=True, flags=None):
@@ -16,6 +17,13 @@ def row(frame=0, ref=5, pred=5, side='left_hand', provided=True, flags=None):
 
 
 class HandEvaluationLayersTest(unittest.TestCase):
+    def test_independent_mask_metrics(self):
+        a=np.zeros((12,12),bool);a[2:10,2:10]=True
+        self.assertEqual(actual_metrics(a,a),(1.,1.))
+        self.assertEqual(actual_metrics(np.zeros_like(a),a),(0.,0.))
+        self.assertEqual(actual_metrics(a,None),(None,None))
+        self.assertEqual(actual_metrics(a,np.zeros_like(a)),(None,None))
+
     def test_actual_output_separates_empty_reference_and_misses(self):
         rows=[row(),row(1,pred=0),row(2,ref=0,pred=0),row(3,ref=0),
               row(4,provided=False),row(5,flags=['uncertain'])]
