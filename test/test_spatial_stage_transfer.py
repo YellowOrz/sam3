@@ -1,6 +1,7 @@
 from copy import deepcopy
 from test_spatial_training_state import SpatialStateTests
 from scripts.spatial_training_state import transfer_stage, validate_state
+from scripts.residual_ddp_runtime import torchrun_ranks
 
 
 class StageTransferTests(SpatialStateTests):
@@ -38,3 +39,15 @@ class StageTransferTests(SpatialStateTests):
         source['last_validation_step'] = 0
         with self.assertRaises(ValueError):
             transfer_stage(source, config, self.adapter.state_dict(), 'hash')
+
+    def test_cpu_preflight_must_plan_same_world_as_parent(self):
+        source, config = self.source_and_config()
+        source['config']['world_size'] = 2
+        source['rank_rng'] = source['rank_rng'] * 2
+        config['world_size'] = torchrun_ranks({})[2]
+        with self.assertRaisesRegex(ValueError, 'world_size'):
+            transfer_stage(source, config, self.adapter.state_dict(), 'hash')
+        config['world_size'] = torchrun_ranks(
+            {'RANK': '0', 'LOCAL_RANK': '0', 'WORLD_SIZE': '2'})[2]
+        result = transfer_stage(source, config, self.adapter.state_dict(), 'hash')
+        self.assertEqual(len(result['rank_rng']), 2)
