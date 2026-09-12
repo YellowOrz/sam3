@@ -271,6 +271,14 @@ def export_plots(log_dir, output_dir, *, source="auto", validation_scope="dexycb
     def panel(title, curves, **kwargs):
         return {"title": title, "curves": curves, **kwargs}
     figures = []
+    spatial = curve("loss/mask_objective", "Spatial mask focal + Dice", COLORS[0])
+    if spatial[1]:
+        figures.append(("spatial_mask_objective.png", "Spatial objective only (not residual total loss)", [
+            panel("Sampled batch focal + Dice / stage optimizer step", [spatial], smooth=True)], 1))
+        spatial_components = [panel(key, [curve("loss/" + key, key, COLORS[index])], smooth=True)
+                              for index, key in enumerate(LOSS_KEYS)]
+        figures.append(("spatial_loss_components.png",
+            "Spatial: mask/Dice optimized; box/class/presence diagnostic only", spatial_components, 2))
     total = curve("train/total_loss", "Total loss", COLORS[0])
     if total[1]:
         wall = series.get("progress/wall_seconds", {})
@@ -331,6 +339,7 @@ def export_plots(log_dir, output_dir, *, source="auto", validation_scope="dexycb
         "schema": "sam3-residual-training-plots-v1", "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": log["source"], "warnings": log["warnings"], "validation_scope": validation_scope,
         "loss_interpretation": "Logged current batch loss sampled at logging steps; NOT epoch averages.",
+        "spatial_interpretation": "loss/mask_objective is focal + Dice only; not comparable to residual total loss. Other spatial loss terms are diagnostics.",
         "smoothing": {"window_records": ROLLING_WINDOW, "min_periods": 1, "alignment": "trailing",
                       "short_series": "Uses only available records, even when fewer than 20.",
                       "raw_line": "faint", "mean_line": "solid"},
