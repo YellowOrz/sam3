@@ -359,7 +359,10 @@ def validate_publication(output_dir: Path, *, verify_rgb: bool = True, require_r
     return manifest
 
 
-def prepare_mixed_training(dex_root: Path, nake_root: Path, output_dir: Path, seed: int = 123) -> dict:
+def prepare_mixed_training(dex_root: Path, nake_root: Path, output_dir: Path, seed: int = 123,
+                           dex_selection: str = 'half') -> dict:
+    if dex_selection not in ('half', 'all'):
+        raise ValueError('dex_selection must be half or all')
     if Path(output_dir).is_symlink():
         raise FileExistsError(f"Output must not already be a symlink: {output_dir}")
     dex_root, nake_root, output = (Path(path).resolve() for path in (dex_root, nake_root, output_dir))
@@ -370,7 +373,9 @@ def prepare_mixed_training(dex_root: Path, nake_root: Path, output_dir: Path, se
         raise ValueError("Output must be separate from both immutable source roots")
     sources, documents, ready_verification = _read_sources(dex_root, nake_root)
     dex_train = sources[("dexycb", "train")]["coco"]
-    selected, strata = stratified_half(dex_train["images"], dex_train["annotations"], seed)
+    selected, strata = (stratified_half(dex_train["images"], dex_train["annotations"], seed)
+                        if dex_selection == 'half' else
+                        (sorted(row['id'] for row in dex_train['images']), []))
     selected_ids = set(selected)
     train = [("dexycb", "train", image) for image in sorted(dex_train["images"], key=lambda row: row["id"])
              if image["id"] in selected_ids]
@@ -392,11 +397,21 @@ def prepare_mixed_training(dex_root: Path, nake_root: Path, output_dir: Path, se
         sources[("dexycb", "val")]["coco"]["images"], key=lambda row: row["id"])]
     output.mkdir(parents=True, exist_ok=False)
     atomic_json(output / "IN_PROGRESS.json", {"status": "in_progress", "format": FORMAT})
-    train_receipt, next_annotation = _export_split(output, "train", train, sources, 1, 1)
-    val_receipt, _ = _export_split(output, "val", val, sources, len(train) + 1, next_annotation)
+    if dex_selection == 'all':
+        # Keep the existing half-mixture validation byte-identical. Put the
+        # expanded train in a disjoint ID namespace, never renumber validation.
+        half_ids = set(stratified_half(dex_train['images'], dex_train['annotations'], seed)[0])
+        legacy_train = [entry for entry in train if entry[0] != 'dexycb' or entry[2]['id'] in half_ids]
+        val_image_start = len(legacy_train) + 1
+        val_annotation_start = 1 + sum(len(sources[(d, s)]['grouped'][im['id']]) for d, s, im in legacy_train)
+        train_receipt, _ = _export_split(output, 'train', train, sources, 1000000, 1000000)
+    else:
+        train_receipt, val_annotation_start = _export_split(output, 'train', train, sources, 1, 1)
+        val_image_start = len(train) + 1
+    val_receipt, _ = _export_split(output, "val", val, sources, val_image_start, val_annotation_start)
     receipts = {"train": train_receipt, "val": val_receipt}
     approval = {"format": APPROVAL_FORMAT, "approved_by": "user",
-                "request": "DexYCB train half + all nakehand except excluded frame; RealSense test",
+                "request": f"DexYCB train {dex_selection} + all nakehand except excluded frame; RealSense test",
                 "label_limitations": LABEL_LIMITATIONS, "test_policy": TEST_POLICY}
     for split, source_roots in (("train", [dex_root, nake_root]), ("val", [dex_root])):
         approval[split] = {"root": str(output / split),
@@ -408,8 +423,8 @@ def prepare_mixed_training(dex_root: Path, nake_root: Path, output_dir: Path, se
         "dexycb": str(dex_root), "nakehand": str(nake_root)},
         "source_documents": [documents[key] for key in sorted(documents)],
         "source_READY_verification": ready_verification, "splits": receipts,
-        "selection": {"seed": seed, "method": "side+subject Hamilton largest remainder, private seeded shuffle",
-                      "fraction": {"numerator": 1, "denominator": 2, "rounding": "floor"},
+        "selection": {"seed": seed, "method": ("all existing Dex train" if dex_selection == 'all' else "side+subject Hamilton largest remainder, private seeded shuffle"),
+                      "fraction": {"numerator": 1, "denominator": 1 if dex_selection == 'all' else 2, "rounding": "floor"},
                       "strata": strata, "dex_selected_source_image_ids": selected,
                       "uses_model_performance": False},
         "selection_counts": {"dex_train_available": len(dex_train["images"]), "dex_train_selected": len(selected),
@@ -436,8 +451,9 @@ def main(argv=None):
     parser.add_argument("--nake-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, choices=(123,), default=123)
+    parser.add_argument('--dex-selection', choices=('half', 'all'), default='half')
     args = parser.parse_args(argv)
-    manifest = prepare_mixed_training(args.dex_root, args.nake_root, args.output_dir, args.seed)
+    manifest = prepare_mixed_training(args.dex_root, args.nake_root, args.output_dir, args.seed, args.dex_selection)
     print(json.dumps({"output": str(args.output_dir.resolve()), "selection_counts": manifest["selection_counts"]}, indent=2))
 
 

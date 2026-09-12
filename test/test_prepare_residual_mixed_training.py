@@ -80,6 +80,17 @@ def source_fixture(directory):
 
 
 class MixedPreparationTests(unittest.TestCase):
+    def test_full_train_preserves_validation_and_exclusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dex, nake = source_fixture(root)
+            half = prepare.prepare_mixed_training(dex, nake, root / 'half')
+            full = prepare.prepare_mixed_training(dex, nake, root / 'full', dex_selection='all')
+            self.assertEqual(full['selection_counts']['dex_train_selected'], 11)
+            self.assertEqual(full['selection_counts']['nake_selected'], 5)
+            self.assertEqual(full['splits']['val']['annotations_sha256'], half['splits']['val']['annotations_sha256'])
+            prepare.validate_publication(root / 'full')
+
     def test_stratified_exact_half_order_independent_and_private_rng(self):
         images = [{"id": index, "sequence": f"subject-{index % 3 + 1:02d}_seq"} for index in range(37)]
         annotations = [{"image_id": index, "category_id": 1 + index % 2} for index in range(37) if index % 4]

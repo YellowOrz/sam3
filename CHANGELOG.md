@@ -1,5 +1,11 @@
 # 改动日志：SAM3 手物分割适配
 
+## 全量Dex train＋nakehand共享训练集（2026-09-12）
+
+- 数据准备新增显式`--dex-selection all`，默认half行为保留；仅扩展原Dex train，保留nake争议帧排除和原始标注，不混入Dex val/test或RealSense。
+- 全量训练采用独立ID空间，使固定Dex验证annotations与既有half版本逐字节一致；沿用源文件哈希、图像唯一性、跨划分检查及READY验证。
+- 新增全量选择、排除帧和验证哈希不变测试；两个模型实验独立使用相同全量数据，不叠加模块。
+
 ## 修复混合阶段启动预检查（2026-09-12）
 
 - 运行脚本的CPU preflight显式规划与正式双卡一致的rank/world size；不修改训练器的严格恢复检查。
