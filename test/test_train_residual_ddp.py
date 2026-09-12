@@ -461,7 +461,7 @@ class MainEntryTests(unittest.TestCase):
             directory = Path(temporary)
             args = _fixture(directory)
             _, approval_hash, contracts = training.approval_contracts(args)
-            initial = {"delta": torch.zeros(2, 4, 256)}
+            initial = torch.load(args.initial_cache, weights_only=True)
             fingerprints = {"base": "a" * 64, "tokenizer": "b" * 64, "cache": "c" * 64,
                             "implementation": {"scripts/example.py": "d" * 64}}
             expected = training.training_configuration(args, contracts["train"], approval_hash, 3, initial, fingerprints,

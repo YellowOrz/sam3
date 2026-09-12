@@ -15,24 +15,24 @@ from scripts import residual_ddp_objective as objective
 from scripts import train_ve_initialized_tokens as legacy
 
 
-def make_encoder():
+def make_encoder(mode="zero_delta"):
     padding = torch.ones(2, 32, dtype=torch.bool)
     padding[:, :4] = False
     return cached.CachedVETextEncoder(padding, torch.ones(32, 2, 256), torch.ones(32, 2, 1024),
-        mode="zero_delta", metadata={"base_checkpoint_sha256": "a" * 64,
+        mode=mode, metadata={"base_checkpoint_sha256": "a" * 64,
                                       "tokenizer_sha256": "b" * 64})
 
 
 class SyntheticSAM3(nn.Module):
     """Tiny differentiable predictions with the actual cached output residual."""
 
-    def __init__(self):
+    def __init__(self, mode="zero_delta"):
         super().__init__()
         self.frozen_scale = nn.Parameter(torch.tensor(.8), requires_grad=False)
         self.dropout = nn.Dropout(.9)
         self.backbone = nn.Module()
         self.backbone.language_backbone = nn.Identity()
-        cached.install_cached_ve_text_encoder(self, make_encoder())
+        cached.install_cached_ve_text_encoder(self, make_encoder(mode))
 
     @staticmethod
     def back_convert(target):
@@ -152,6 +152,39 @@ class GlobalNormalizationTest(CPUReferenceLossCase):
 
 
 class FrozenObjectiveTest(CPUReferenceLossCase):
+    def test_content_backward_has_1024_parameters_and_unchanged_anchor_denominator(self):
+        model = SyntheticSAM3("content_delta")
+        with torch.no_grad():
+            model.backbone.language_backbone.delta.fill_(.2)
+        wrapped = objective.ResidualObjective(model, anchor_weight=.3)
+        self.assertEqual(sum(p.numel() for p in wrapped.parameters() if p.requires_grad), 1024)
+        frozen = objective.frozen_versions(model, wrapped.encoder.delta)
+        total, terms, anchor = wrapped(make_batch(((1, 1), (0, 0))))
+        # 512 learned values / 1024 valid frozen values per side, all F0=1.
+        self.assertAlmostEqual(float(anchor), .2 ** 2 / 2, places=7)
+        total.backward()
+        self.assertEqual(tuple(wrapped.encoder.delta.grad.shape), (2, 2, 256))
+        self.assertTrue(bool(torch.isfinite(wrapped.encoder.delta.grad).all()))
+        self.assertTrue(bool((wrapped.encoder.delta.grad.flatten(1).norm(dim=1) > 0).all()))
+        torch.testing.assert_close(total.detach(), terms.sum() + .3 * anchor)
+        objective.assert_frozen_versions(frozen)
+
+    def test_content_gradient_average_matches_full_batch_with_three_rank_sparse_targets(self):
+        counts = [(1, 0), (0, 0), (0, 0)]
+        model = SyntheticSAM3("content_delta")
+        functions = legacy.build_loss_functions()
+        total, _, _ = objective.loss_components(model, make_batch(counts), functions, torch.tensor(1.))
+        total.backward()
+        expected = model.backbone.language_backbone.delta.grad
+        gradients = []
+        for rank in range(3):
+            local = SyntheticSAM3("content_delta")
+            loss, _, _ = objective.loss_components(local, make_batch(counts[rank:rank+1], [rank]),
+                                                   functions, torch.tensor(1. / 3))
+            loss.backward()
+            gradients.append(local.backbone.language_backbone.delta.grad)
+        torch.testing.assert_close(torch.stack(gradients).mean(0), expected, rtol=3e-6, atol=2e-9)
+
     def test_standard_backward_updates_only_delta_and_total_is_six_terms_plus_anchor(self):
         model = SyntheticSAM3()
         with torch.no_grad():

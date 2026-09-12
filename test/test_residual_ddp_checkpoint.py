@@ -17,11 +17,11 @@ from scripts.residual_ddp_runtime import (
 from scripts.residual_selection import new_selection_state, update_selection
 
 
-def make_encoder():
+def make_encoder(mode="zero_delta"):
     padding = torch.ones(2, 32, dtype=torch.bool)
     padding[:, :4] = False
     return cached.CachedVETextEncoder(padding, torch.ones(32, 2, 256), torch.ones(32, 2, 1024),
-        mode="zero_delta", metadata={"base_checkpoint_sha256": "a" * 64,
+        mode=mode, metadata={"base_checkpoint_sha256": "a" * 64,
                                       "tokenizer_sha256": "b" * 64})
 
 
@@ -42,13 +42,16 @@ def advance(encoder, optimizer):
     optimizer.step()
 
 
-def make_fixture(step=3):
+def make_fixture(step=3, *, mode="zero_delta"):
     random.seed(841)
     np.random.seed(841)
     torch.manual_seed(841)
     config = configuration()
+    if mode == "content_delta":
+        config.update(residual_positions="content", residual_mode=mode,
+                      delta_shape=[2, 2, 256], trainable_parameter_count=1024)
     image_ids = [200 + 7 * index for index in range(config["dataset_size"])]
-    encoder = make_encoder()
+    encoder = make_encoder(mode)
     initial = deepcopy(encoder.state_dict())
     optimizer = torch.optim.AdamW([encoder.delta], lr=config["learning_rate"], weight_decay=0.)
     for _ in range(step):
@@ -171,6 +174,79 @@ class CheckpointContractTest(unittest.TestCase):
             state, config, ids, initial, _, _ = make_fixture(step)
             self.assertEqual(checkpoint.validate_resume(state, config, ids, initial), step)
             self.assertEqual(state["progress"]["training_complete"], step == 6)
+
+
+class ContentCheckpointContractTest(unittest.TestCase):
+    def test_content_shape_parameter_count_rank_audit_and_optimizer_roundtrip(self):
+        for step in (0, 3, 6):
+            with self.subTest(step=step):
+                state, config, ids, initial, encoder, _ = make_fixture(step, mode="content_delta")
+                self.assertEqual(checkpoint.validate_resume(state, config, ids, initial), step)
+                self.assertEqual(state["trainable_parameter_count"], 1024)
+                self.assertEqual(tuple(state["cache_state_dict"]["delta"].shape), (2, 2, 256))
+                audit = checkpoint.validate_rank_cache_consistency(
+                    [deepcopy(encoder.state_dict()) for _ in range(3)], world_size=3)
+                self.assertTrue(audit["all_ranks_identical"])
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "content.pt"
+                    checkpoint.atomic_checkpoint(path, state)
+                    loaded = torch.load(path, weights_only=True)
+                    self.assertEqual(checkpoint.validate_resume(loaded, config, ids, initial), step)
+
+    def test_content_requires_explicit_config_and_rejects_cross_mode_and_old_moments(self):
+        original, config, ids, initial, _, _ = make_fixture(3, mode="content_delta")
+        for field in ("residual_positions", "residual_mode", "delta_shape", "trainable_parameter_count"):
+            altered = deepcopy(config)
+            altered.pop(field)
+            changed = deepcopy(original)
+            changed["training_config"] = altered
+            changed["config_sha256"] = checkpoint.canonical_hash(altered)
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                checkpoint.validate_resume(changed, altered, ids, initial)
+        for mutation in ("initial_mode", "saved_mode", "saved_shape", "moment_shape", "count", "count_missing"):
+            changed, initializer = deepcopy(original), deepcopy(initial)
+            if mutation == "initial_mode":
+                initializer["_extra_state"]["mode"] = "zero_delta"
+            elif mutation == "saved_mode":
+                changed["cache_state_dict"]["_extra_state"]["mode"] = "zero_delta"
+            elif mutation == "saved_shape":
+                changed["cache_state_dict"]["delta"] = torch.zeros(2, 4, 256)
+            elif mutation == "moment_shape":
+                changed["optimizer"]["state"][0]["exp_avg"] = torch.zeros(2, 4, 256)
+            elif mutation == "count":
+                changed["trainable_parameter_count"] = 2048
+            else:
+                changed.pop("trainable_parameter_count")
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                checkpoint.validate_resume(changed, config, ids, initializer)
+
+    def test_legacy_config_does_not_silently_accept_any_small_delta(self):
+        self.assertEqual(checkpoint.configured_delta_shape(configuration()), (2, 4, 256))
+        for shape in ([2, 2, 256], [2, 3, 256], [1024]):
+            with self.subTest(shape=shape), self.assertRaises(ValueError):
+                checkpoint.configured_delta_shape({**configuration(), "delta_shape": shape})
+        states = [deepcopy(make_encoder(mode).state_dict()) for mode in ("zero_delta", "content_delta")]
+        with self.assertRaisesRegex(ValueError, "differs from rank 0"):
+            checkpoint.validate_rank_cache_consistency(states, world_size=2)
+
+    def test_content_exact_resume_preserves_next_updates_and_random_state(self):
+        state, config, ids, initial, encoder, optimizer = make_fixture(3, mode="content_delta")
+        self.assertEqual(checkpoint.validate_resume(state, config, ids, initial), 3)
+        for _ in range(2):
+            advance(encoder, optimizer)
+        expected = encoder.delta.detach().clone()
+        expected_moments = deepcopy(optimizer.state_dict())
+        resumed = make_encoder("content_delta")
+        restored_optimizer = torch.optim.AdamW([resumed.delta], lr=config["learning_rate"], weight_decay=0.)
+        resumed.load_state_dict(state["cache_state_dict"])
+        restored_optimizer.load_state_dict(state["optimizer"])
+        restore_rng_state(state["rank_states"][0]["rng"], "cpu")
+        for _ in range(2):
+            advance(resumed, restored_optimizer)
+        self.assertTrue(torch.equal(resumed.delta, expected))
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            self.assertTrue(torch.equal(restored_optimizer.state_dict()["state"][0][key],
+                                        expected_moments["state"][0][key]))
 
 
 class ValidationRecoveryContractTest(unittest.TestCase):

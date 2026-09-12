@@ -215,9 +215,14 @@ def verify_selected_rgb(data_root, image, output):
 
 
 def anchor_penalty(encoder, epsilon=ANCHOR_EPSILON):
-    """Equal-side mean relative squared L2 drift over the four valid positions."""
-    if encoder.delta is None or tuple(encoder.delta.shape) != (2, 4, 256):
-        raise ValueError("Anchor requires the semantic delta[2,4,256]")
+    """Relative drift of learned positions; keep the same full-valid-F0 denominator.
+
+    Content-only residuals have two updated positions, but the frozen four-token
+    semantic context and normalization remain unchanged for the comparison.
+    """
+    shape = cached.expected_delta_shape(encoder.mode)
+    if encoder.delta is None or tuple(encoder.delta.shape) != shape:
+        raise ValueError(f"Anchor requires the declared semantic delta{shape}")
     valid = (~encoder.padding_cache).transpose(0, 1).unsqueeze(-1)
     energy = (encoder.resized_cache.float().square() * valid).sum(dim=(0, 2)).detach()
     delta_energy = encoder.delta.float().square().sum(dim=(1, 2))

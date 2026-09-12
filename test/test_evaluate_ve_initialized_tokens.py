@@ -73,6 +73,48 @@ class SemanticDeltaEvaluationTest(unittest.TestCase):
         self.assertEqual(tuple(baseline.resized_cache.shape), (32, 2, 256))
         self.assertEqual(tuple(baseline.raw_cache.shape), (32, 2, 1024))
 
+    def test_content_cache_loads_two_positions_without_changing_boundaries_or_padding(self):
+        original = state()["initial_cache_state_dict"]
+        encoder = CachedVETextEncoder(original["padding_cache"], original["resized_cache"],
+            original["raw_cache"], metadata=original["_extra_state"]["metadata"], mode="content_delta")
+        with torch.no_grad():
+            encoder.delta.add_(.25)
+        loaded = cache_from_state(encoder.state_dict())
+        padding, resized, raw = loaded(["left_hand", "right_hand"])
+        self.assertEqual(tuple(loaded.delta.shape), (2, 2, 256))
+        self.assertTrue(torch.equal(loaded.delta, encoder.delta))
+        self.assertTrue(torch.equal(padding, original["padding_cache"]))
+        self.assertTrue(torch.equal(raw, original["raw_cache"]))
+        self.assertTrue(torch.equal(resized[[0, 3]], original["resized_cache"][[0, 3]]))
+        self.assertTrue(torch.equal(resized[4:], original["resized_cache"][4:]))
+        self.assertTrue(torch.equal(resized[1:3], original["resized_cache"][1:3] + .25))
+        baseline = cache_from_state(encoder.state_dict(), frozen=True)
+        self.assertIsNone(baseline.delta)
+        self.assertTrue(torch.equal(baseline.resized_cache, original["resized_cache"]))
+
+    def test_content_shape_or_mode_corruption_and_legacy_relabelling_are_rejected(self):
+        original = state()["initial_cache_state_dict"]
+        encoder = CachedVETextEncoder(original["padding_cache"], original["resized_cache"],
+            original["raw_cache"], metadata=original["_extra_state"]["metadata"], mode="content_delta")
+        content = copy.deepcopy(encoder.state_dict())
+        for mutation in ("shape", "mode", "dtype", "nan"):
+            malformed = copy.deepcopy(content)
+            if mutation == "shape":
+                malformed["delta"] = torch.zeros(2, 4, 256)
+            elif mutation == "mode":
+                malformed["_extra_state"]["mode"] = "zero_delta"
+            elif mutation == "dtype":
+                malformed["delta"] = malformed["delta"].double()
+            else:
+                malformed["delta"][0, 0, 0] = float("nan")
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                cache_from_state(malformed)
+        legacy = state()
+        legacy["cache_state_dict"] = copy.deepcopy(content)
+        legacy["initial_cache_state_dict"] = copy.deepcopy(content)
+        with self.assertRaisesRegex(ValueError, "Legacy semantic pilot"):
+            self.validate(legacy)
+
     def test_dataset_rejects_fallback_missing_side_and_reference_prompts(self):
         def query(side, image_id=7):
             return SimpleNamespace(query_text=side, image_id=0, input_bbox=None, input_points=None,

@@ -55,6 +55,32 @@ def canonical_hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def configured_delta_shape(config):
+    """Bind the opt-in content layout; old configs without fields mean all only."""
+    positions = config.get("residual_positions", "all")
+    if positions not in ("all", "content"):
+        raise ValueError("Invalid configured residual positions")
+    mode = "zero_delta" if positions == "all" else "content_delta"
+    shape = shared.cached.expected_delta_shape(mode)
+    if (config.get("residual_mode", mode) != mode
+            or config.get("delta_shape", list(shape)) != list(shape)
+            or config.get("trainable_parameter_count", math.prod(shape)) != math.prod(shape)):
+        raise ValueError("Residual mode, delta_shape and parameter count disagree")
+    if positions == "content" and any(name not in config for name in
+            ("residual_mode", "delta_shape", "trainable_parameter_count")):
+        raise ValueError("Content residual configuration must explicitly bind mode, shape and count")
+    return shape
+
+
+def _validate_configured_delta(state, config):
+    shape = configured_delta_shape(config)
+    expected_mode = "content_delta" if config.get("residual_positions", "all") == "content" else "zero_delta"
+    if (shared.cached.validate_delta_state(state) != shape
+            or state["_extra_state"]["mode"] != expected_mode):
+        raise ValueError("Output residual state does not match configured mode and shape")
+    return shape
+
+
 def validate_rank_cache_consistency(rank_states_or_fingerprints, *, world_size=None):
     """Check actual rank-ordered encoder states/hashes collected at a save boundary.
 
@@ -74,10 +100,10 @@ def validate_rank_cache_consistency(rank_states_or_fingerprints, *, world_size=N
     fingerprints = []
     for rank, value in enumerate(rank_states_or_fingerprints):
         if isinstance(value, Mapping):
-            delta = value.get("delta")
-            if (not isinstance(delta, torch.Tensor) or delta.dtype != torch.float32
-                    or tuple(delta.shape) != (2, 4, 256) or not bool(torch.isfinite(delta).all())):
-                raise ValueError(f"Rank {rank} cache audit has an invalid output residual")
+            try:
+                shared.cached.validate_delta_state(value)
+            except (ValueError, TypeError, KeyError, RuntimeError) as error:
+                raise ValueError(f"Rank {rank} cache audit has an invalid output residual") from error
             value = shared.cache_fingerprint(value)
         if (not isinstance(value, str) or len(value) != 64
                 or any(character not in "0123456789abcdef" for character in value)):
@@ -197,6 +223,14 @@ def validate_resume(state, config, image_ids, initial_state):
         raise ValueError("Checkpoint/config mismatch: data, code, batch, ranks and optimization must stay fixed")
     if state.get("config_sha256") != canonical_hash(config):
         raise ValueError("Checkpoint configuration fingerprint mismatch")
+    delta_shape = _validate_configured_delta(initial_state, config)
+    if not bool((initial_state["delta"] == 0).all()):
+        raise ValueError("Initial semantic cache must have exactly zero delta")
+    if ("trainable_parameter_count" in state
+            and state["trainable_parameter_count"] != math.prod(delta_shape)):
+        raise ValueError("Checkpoint trainable parameter count disagrees with residual layout")
+    if config.get("residual_positions") == "content" and "trainable_parameter_count" not in state:
+        raise ValueError("Content checkpoint must record its trainable parameter count")
     step = state.get("progress", {}).get("global_step")
     if state.get("progress") != progress_at(step, config):
         raise ValueError("Checkpoint progress is inconsistent")
@@ -208,6 +242,7 @@ def validate_resume(state, config, image_ids, initial_state):
     if shared.cache_fingerprint(state.get("initial_cache_state_dict", {})) != shared.cache_fingerprint(initial_state):
         raise ValueError("Saved initial semantic cache differs from the declared initializer")
     cached_state = state.get("cache_state_dict", {})
+    _validate_configured_delta(cached_state, config)
     if set(cached_state) != set(initial_state):
         raise ValueError("Cache schema changed")
     for name, original in initial_state.items():
@@ -248,7 +283,7 @@ def validate_resume(state, config, image_ids, initial_state):
             raise ValueError("Optimizer step does not match completed updates")
         for name in ("exp_avg", "exp_avg_sq"):
             value = moments[0].get(name)
-            if (not isinstance(value, torch.Tensor) or value.dtype != torch.float32 or tuple(value.shape) != (2, 4, 256)
+            if (not isinstance(value, torch.Tensor) or value.dtype != torch.float32 or tuple(value.shape) != delta_shape
                     or not bool(torch.isfinite(value).all())):
                 raise ValueError("Invalid optimizer moments")
     return step
@@ -256,12 +291,13 @@ def validate_resume(state, config, image_ids, initial_state):
 
 def make_checkpoint(encoder, optimizer, config, step, initial_state, rank_states, *, rank_cache_audit=None,
                     validation_state=None):
+    _validate_configured_delta(encoder.state_dict(), config)
     result = {"format": FORMAT, "training_config": deepcopy(config), "config_sha256": canonical_hash(config),
             "progress": progress_at(step, config), "cache_state_dict": shared.cpu_state(encoder.state_dict()),
             "initial_cache_state_dict": shared.cpu_state(initial_state),
             "initial_cache_sha256": shared.cache_fingerprint(initial_state),
             "optimizer": deepcopy(optimizer.state_dict()), "rank_states": deepcopy(rank_states),
-            "trainable_parameter_count": 2048, "accuracy_evaluated": False}
+            "trainable_parameter_count": encoder.delta.numel(), "accuracy_evaluated": False}
     validated = validate_validation_state(validation_state, config, step)
     if "validation" in config:
         result["validation_state"] = validated

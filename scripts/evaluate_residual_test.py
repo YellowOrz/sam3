@@ -130,7 +130,14 @@ def load_residual(path, initial_cache, training_root, *, base_hash, tokenizer_ha
             or config.get("tokenizer_sha256") != tokenizer_hash
             or config.get("initial_cache_file_sha256") != shared.sha256(initial_cache)):
         raise ValueError("Expected DDP output-delta checkpoint with matching original weights/cache/tokenizer")
-    initial = initializer.load_initial_cache(initial_cache, base_hash=base_hash, tokenizer_hash=tokenizer_hash)
+    positions = config.get("residual_positions", "all")
+    # Share the trainer's strict layout contract: historical v1 files default
+    # to all positions; content files must explicitly bind mode/shape/count.
+    shape = checkpoint.configured_delta_shape(config)
+    mode = "content_delta" if positions == "content" else "zero_delta"
+    parameter_count = int(np.prod(shape))
+    initial = initializer.load_initial_cache(initial_cache, base_hash=base_hash, tokenizer_hash=tokenizer_hash,
+                                             residual_positions=positions)
     annotation_path = Path(training_root) / "annotations.json"
     if shared.sha256(annotation_path) != config.get("annotations_sha256"):
         raise ValueError("Training annotations do not match checkpoint provenance")
@@ -140,11 +147,17 @@ def load_residual(path, initial_cache, training_root, *, base_hash, tokenizer_ha
             or checkpoint.canonical_hash(image_ids) != config.get("image_order_sha256")):
         raise ValueError("Training image identities changed")
     step = checkpoint.validate_resume(state, config, image_ids, initial.state_dict())
-    if step < 1 or state.get("trainable_parameter_count") != 2048:
+    if step < 1 or state.get("trainable_parameter_count") != parameter_count:
         raise ValueError("Require actual completed residual updates")
     encoder = semantic.cache_from_state(state["cache_state_dict"])
+    if encoder.mode != mode or tuple(encoder.delta.shape) != tuple(shape):
+        raise ValueError("Evaluated cache differs from trained residual positions")
+    encoder.eval().requires_grad_(False)
     return encoder, {"checkpoint_sha256": shared.sha256(path), "progress": state["progress"],
         "training_config": config, "initial_cache_verified": True,
+        "residual_positions": positions, "residual_mode": mode,
+        "delta_shape": list(shape), "trained_parameter_count": parameter_count,
+        "evaluation_encoder_frozen": True,
         "actual_training_identities_verified": True,
         "rank_cache_consistency_audit_present_and_verified": "rank_cache_audit" in state,
         "delta_l2_per_side": encoder.delta.detach().norm(dim=(1, 2)).tolist()}

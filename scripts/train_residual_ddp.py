@@ -51,6 +51,8 @@ def parse_args(argv=None):
     parser.add_argument("--val-root", type=Path, help="Relocated copy of the approved validation split")
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--initial-cache", type=Path, required=True)
+    parser.add_argument("--residual-positions", choices=("all", "content"), default="all",
+                        help="Update all four valid positions, or only the two body-token positions")
     parser.add_argument("--tokenizer-path", type=Path,
                         default=Path(__file__).resolve().parents[1] / "sam3/assets/bpe_simple_vocab_16e6.txt.gz")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -160,7 +162,16 @@ def training_configuration(args, contract, approval_hash, world_size, initial_st
             "selection_policy": {"patience": args.early_stopping_patience,
                                  "min_delta": args.early_stopping_min_delta},
         }
-    return {"method": "original_natural_VE_plus_zero_initialized_output_delta",
+    positions = getattr(args, "residual_positions", "all")
+    mode = "zero_delta" if positions == "all" else "content_delta"
+    if positions not in ("all", "content"):
+        raise ValueError("Unknown residual position policy")
+    delta_shape = cached.expected_delta_shape(mode)
+    if (cached.validate_delta_state(initial_state) != delta_shape
+            or initial_state["_extra_state"]["mode"] != mode
+            or not bool((initial_state["delta"] == 0).all())):
+        raise ValueError("Initial cache must match the residual policy and contain exactly zero delta")
+    config = {"method": "original_natural_VE_plus_zero_initialized_output_delta",
             "dataset_size": len(contract.images), "annotations_sha256": contract.annotations_sha256,
             "image_order_sha256": canonical_hash([row["id"] for row in contract.images]),
             "approval_sha256": approval_hash, "world_size": world_size,
@@ -169,13 +180,19 @@ def training_configuration(args, contract, approval_hash, world_size, initial_st
             "seed": args.seed, "learning_rate": args.learning_rate, "optimizer": "AdamW", "weight_decay": 0.,
             "anchor_weight": args.anchor_weight, "loss_weights": {name: 1. for name in COMPONENTS},
             "loss_normalization": NORMALIZATION, "drop_last": True,
-            "amp_dtype": "bfloat16", "delta_dtype": "float32", "delta_shape": [2, 4, 256],
+            "amp_dtype": "bfloat16", "delta_dtype": "float32", "delta_shape": list(delta_shape),
             "network_mode": "frozen_eval_with_delta_autograd", "torch_version": str(torch.__version__),
             "initial_state_sha256": shared.cache_fingerprint(initial_state),
             "base_sha256": fingerprints["base"], "tokenizer_sha256": fingerprints["tokenizer"],
             "initial_cache_file_sha256": fingerprints["cache"],
             "validation": validation_config,
             "implementation_sha256": canonical_hash(fingerprints["implementation"])}
+    # Leave the legacy all-position configuration byte-for-byte unchanged.
+    # The opt-in layout is bound explicitly, not inferred from a small tensor.
+    if positions == "content":
+        config.update(residual_positions=positions, residual_mode=mode,
+                      trainable_parameter_count=math.prod(delta_shape))
+    return config
 
 
 def require_rank_validation_consistency(states):
@@ -274,7 +291,8 @@ def run(args):
                     "cache": shared.evaluation.sha256(args.initial_cache),
                     "implementation": implementation_hashes()}
     encoder = shared.load_initial_cache(args.initial_cache, base_hash=fingerprints["base"],
-                                        tokenizer_hash=fingerprints["tokenizer"])
+                                        tokenizer_hash=fingerprints["tokenizer"],
+                                        residual_positions=args.residual_positions)
     initial_state = shared.cpu_state(encoder.state_dict())
     config = training_configuration(args, contracts["train"], approval_hash, world, initial_state, fingerprints,
                                     contracts.get("val"))
@@ -521,7 +539,8 @@ def run(args):
                 "selection": validation_state["selection"] if validation_state is not None else None,
                 "best_checkpoint": str(args.output_dir / "best.pt") if validation_state is not None
                     and validation_state["selection"]["best_step"] is not None else None,
-                "wall_seconds": time.monotonic()-started, "trainable_parameter_count": 2048,
+                "wall_seconds": time.monotonic()-started,
+                "trainable_parameter_count": objective.encoder.delta.numel(),
                 "frozen_parameter_versions_unchanged": True,
                 "all_rank_encoder_states_identical_at_checkpoint": True,
                 "note": "Large global batch changes the optimization budget. This is not proof of accuracy gains."})

@@ -1,13 +1,16 @@
 """Opt-in fixed-hand VE feature cache, optionally with a zero-initialized delta.
 
 This is not a general text encoder and is not enabled by any existing builder.
-The complete original VE triple is retained; four positions are *updated*, not
-pooled into four tokens. CPU feature equality alone is not full SAM3 validation.
+The complete original VE triple is retained. Four valid positions are updated
+in ``zero_delta``; ``content_delta`` updates only the middle two (body text),
+without deleting or masking the start/end features. CPU feature equality alone
+is not full SAM3 validation.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
 from typing import Sequence
@@ -23,6 +26,15 @@ CACHE_FORMAT = "sam3-cached-natural-ve-hand-features-v1"
 
 def _valid_sha(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def expected_delta_shape(mode: str) -> tuple[int, int, int]:
+    """Trainable output-delta layout; a frozen cache has no delta layout."""
+    if mode == "zero_delta":
+        return (2, 4, 256)
+    if mode == "content_delta":
+        return (2, 2, 256)
+    raise ValueError("Delta mode must be 'zero_delta' or 'content_delta'")
 
 
 def _validate_tensors(padding: torch.Tensor, resized: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
@@ -68,12 +80,45 @@ def _metadata(value: dict, *, resized, raw, positions) -> dict:
     return result
 
 
+def validate_delta_state(state: Mapping) -> tuple[int, int, int]:
+    """Validate a complete trainable cache state, without mutation or RNG use.
+
+    Returns the expected FP32 delta shape. Frozen/unknown modes are rejected;
+    callers loading a frozen initializer must explicitly construct their chosen
+    zero-initialized delta mode first. Content positions are the second and
+    third entries of each class's four ordered non-padding positions, not two
+    replacement tokens or a different padding mask.
+    """
+    fields = {"delta", "padding_cache", "resized_cache", "raw_cache", "valid_positions", "_extra_state"}
+    if not isinstance(state, Mapping) or set(state) != fields:
+        raise ValueError("A complete trainable CachedVETextEncoder state is required")
+    extra = state["_extra_state"]
+    if not isinstance(extra, dict) or set(extra) != {"mode", "metadata"}:
+        raise ValueError("Delta state mode/metadata is malformed")
+    shape = expected_delta_shape(extra["mode"])
+    positions = _validate_tensors(state["padding_cache"], state["resized_cache"], state["raw_cache"])
+    saved_positions = state["valid_positions"]
+    if (not isinstance(saved_positions, torch.Tensor) or saved_positions.dtype != torch.int64
+            or saved_positions.device != positions.device or tuple(saved_positions.shape) != (2, 4)
+            or not torch.equal(saved_positions, positions)):
+        raise ValueError("Delta state valid positions disagree with the padding mask")
+    delta = state["delta"]
+    if (not isinstance(delta, torch.Tensor) or tuple(delta.shape) != shape
+            or delta.dtype != torch.float32 or delta.device != positions.device
+            or not bool(torch.isfinite(delta).all())):
+        raise ValueError("Delta state must have the mode-specific finite FP32 shape/device")
+    _metadata(extra["metadata"], resized=state["resized_cache"], raw=state["raw_cache"], positions=positions)
+    return shape
+
+
 class CachedVETextEncoder(nn.Module):
     """Return fixed natural-prompt VE features for internal left/right class keys.
 
     ``frozen`` has no parameters. ``zero_delta`` has exactly 2*4*256 FP32
-    parameters added only to valid resized-feature positions. The 32-position
-    padding mask and raw 1024-dimensional embeddings are never learned.
+    parameters added only to valid resized-feature positions. ``content_delta``
+    has 2*2*256 FP32 parameters, added only at the middle two valid positions;
+    start/end output features stay frozen but continue participating downstream.
+    The 32-position padding mask and raw 1024-dimensional embeddings never change.
 
     Move explicitly with ``encoder.to(device=...)``. Changing feature dtype is
     rejected at forward time because it invalidates cached-VE equivalence.
@@ -84,8 +129,8 @@ class CachedVETextEncoder(nn.Module):
     def __init__(self, padding_mask: torch.Tensor, resized_features: torch.Tensor,
                  raw_features: torch.Tensor, *, metadata: dict, mode: str = "frozen"):
         super().__init__()
-        if mode not in ("frozen", "zero_delta"):
-            raise ValueError("mode must be 'frozen' or 'zero_delta'")
+        if mode not in ("frozen", "zero_delta", "content_delta"):
+            raise ValueError("mode must be 'frozen', 'zero_delta' or 'content_delta'")
         positions = _validate_tensors(padding_mask, resized_features, raw_features)
         self.mode = mode
         self.context_length = 32
@@ -99,8 +144,9 @@ class CachedVETextEncoder(nn.Module):
             self.register_buffer("resized_cache", resized_features.detach().clone())
             self.register_buffer("raw_cache", raw_features.detach().clone())
             self.register_buffer("valid_positions", positions.detach().clone())
-            if mode == "zero_delta":
-                self.delta = nn.Parameter(torch.zeros(2, 4, 256, dtype=torch.float32, device=resized_features.device))
+            if mode != "frozen":
+                self.delta = nn.Parameter(torch.zeros(expected_delta_shape(mode), dtype=torch.float32,
+                                                     device=resized_features.device))
             else:
                 self.register_parameter("delta", None)
 
@@ -117,6 +163,10 @@ class CachedVETextEncoder(nn.Module):
         positions = _validate_tensors(self.padding_cache, self.resized_cache, self.raw_cache)
         if not torch.equal(positions, self.valid_positions):
             raise ValueError("Loaded delta positions disagree with the cached padding mask")
+        if self.delta is not None:
+            validate_delta_state({"delta": self.delta, "padding_cache": self.padding_cache,
+                "resized_cache": self.resized_cache, "raw_cache": self.raw_cache,
+                "valid_positions": self.valid_positions, "_extra_state": state})
         self._cache_metadata = _metadata(state.get("metadata"), resized=self.resized_cache,
                                          raw=self.raw_cache, positions=positions)
 
@@ -142,6 +192,8 @@ class CachedVETextEncoder(nn.Module):
             raise ValueError("Cache dtype changed; exact original VE dtypes must be preserved")
         if self.delta is not None and self.delta.dtype != torch.float32:
             raise ValueError("Delta parameters must stay FP32; use autocast rather than module dtype conversion")
+        if self.delta is not None and tuple(self.delta.shape) != expected_delta_shape(self.mode):
+            raise ValueError("Delta parameter shape disagrees with its declared mode")
         indices = torch.tensor([self.class_to_index[caption] for caption in captions],
                                dtype=torch.long, device=self.resized_cache.device)
         padding = self.padding_cache.index_select(0, indices)
@@ -149,7 +201,9 @@ class CachedVETextEncoder(nn.Module):
         raw = self.raw_cache.index_select(1, indices)
         if self.delta is not None:
             positions = self.valid_positions.index_select(0, indices)
-            rows = torch.arange(len(captions), device=indices.device)[:, None].expand(-1, 4)
+            if self.mode == "content_delta":
+                positions = positions[:, 1:3]
+            rows = torch.arange(len(captions), device=indices.device)[:, None].expand(-1, positions.shape[1])
             delta = self.delta.index_select(0, indices).to(dtype=resized.dtype)
             # Do not shortcut delta==0: it must have gradients at initialization.
             # Only these valid positions are written, leaving padded bytes untouched.

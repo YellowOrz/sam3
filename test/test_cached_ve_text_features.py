@@ -8,7 +8,7 @@ from torch import nn
 from scripts.cached_ve_text_features import (
     CachedVETextEncoder, CLASS_NAMES, NATURAL_PROMPTS, capture_ve_text_cache,
     install_cached_ve_text_encoder, restore_original_ve_text_encoder,
-    set_cached_ve_training_mode,
+    set_cached_ve_training_mode, expected_delta_shape, validate_delta_state,
 )
 
 
@@ -57,6 +57,135 @@ class FakeModel(nn.Module):
 
 
 class CachedVEFeaturesTest(unittest.TestCase):
+    def test_content_zero_delta_preserves_complete_triple_and_both_side_gradients(self):
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                frozen = make_cache(dtype=dtype)
+                all_positions = make_cache("zero_delta", dtype)
+                content = make_cache("content_delta", dtype)
+                names = ["right_hand", "left_hand", "right_hand"]
+                actual = content(names)
+                for reference in (frozen(names), all_positions(names)):
+                    for value, expected in zip(actual, reference):
+                        self.assertTrue(torch.equal(value, expected))
+                        self.assertEqual(value.dtype, expected.dtype)
+                self.assertEqual(tuple(content.delta.shape), (2, 2, 256))
+                self.assertEqual(sum(value.numel() for value in content.parameters()), 1024)
+                self.assertEqual(content.delta.dtype, torch.float32)
+                actual[1].float().sum().backward()
+                self.assertTrue(torch.equal(content.delta.grad[0], torch.ones(2, 256)))
+                self.assertTrue(torch.equal(content.delta.grad[1], torch.full((2, 256), 2.)))
+                self.assertTrue(all(not value.requires_grad and value.grad is None for value in content.buffers()))
+
+    def test_content_delta_only_updates_middle_valid_positions_not_start_end_or_padding(self):
+        content = make_cache("content_delta")
+        before = content(list(CLASS_NAMES))
+        buffers = {name: value.clone() for name, value in content.named_buffers()}
+        with torch.no_grad():
+            content.delta[0].fill_(.25)
+            content.delta[1].fill_(.5)
+        after = content(list(CLASS_NAMES))
+        self.assertTrue(torch.equal(before[0], after[0]))
+        self.assertTrue(torch.equal(before[2], after[2]))
+        for side, delta in enumerate((.25, .5)):
+            positions = content.valid_positions[side]
+            selected = positions[1:3]
+            untouched = torch.ones(32, dtype=torch.bool)
+            untouched[selected] = False
+            self.assertTrue(torch.equal(after[1][selected, side], before[1][selected, side] + delta))
+            self.assertTrue(torch.equal(after[1][untouched, side], before[1][untouched, side]))
+            self.assertTrue(torch.equal(after[1][positions[[0, 3]], side], before[1][positions[[0, 3]], side]))
+            self.assertEqual(int((~after[0][side]).sum()), 4)
+        for name, value in content.named_buffers():
+            self.assertTrue(torch.equal(value, buffers[name]))
+
+    def test_delta_shape_and_complete_state_validator_preserve_legacy_contract(self):
+        for mode, shape in (("zero_delta", (2, 4, 256)), ("content_delta", (2, 2, 256))):
+            with self.subTest(mode=mode):
+                cache = make_cache(mode)
+                state = cache.state_dict()
+                self.assertEqual(expected_delta_shape(mode), shape)
+                self.assertEqual(validate_delta_state(state), shape)
+                self.assertEqual(set(state), {"delta", "padding_cache", "resized_cache", "raw_cache",
+                                             "valid_positions", "_extra_state"})
+                self.assertEqual(state["_extra_state"], {"mode": mode, "metadata": cache.cache_metadata})
+        for invalid in ("frozen", "unknown", "", None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                expected_delta_shape(invalid)
+        with self.assertRaises(ValueError):
+            validate_delta_state(make_cache().state_dict())
+
+    def test_content_state_validator_rejects_mode_shape_dtype_finiteness_and_position_corruption(self):
+        source = make_cache("content_delta").state_dict()
+        for variant in ("mode", "shape", "dtype", "nan", "positions", "position_dtype", "padding",
+                        "metadata", "missing", "extra", "raw_nan"):
+            state = copy.deepcopy(source)
+            if variant == "mode":
+                state["_extra_state"]["mode"] = "zero_delta"
+            elif variant == "shape":
+                state["delta"] = torch.zeros(2, 4, 256)
+            elif variant == "dtype":
+                state["delta"] = state["delta"].half()
+            elif variant == "nan":
+                state["delta"][0, 0, 0] = float("nan")
+            elif variant == "positions":
+                state["valid_positions"][0, 1] = 2
+            elif variant == "position_dtype":
+                state["valid_positions"] = state["valid_positions"].int()
+            elif variant == "padding":
+                state["padding_cache"][0, 0] = True
+            elif variant == "metadata":
+                state["_extra_state"]["metadata"]["prompt_texts"][0] = "left_hand"
+            elif variant == "missing":
+                del state["raw_cache"]
+            elif variant == "extra":
+                state["other"] = None
+            else:
+                state["raw_cache"][31, 1, 0] = float("nan")
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                validate_delta_state(state)
+        self.assertEqual(validate_delta_state(source), (2, 2, 256))
+
+    def test_content_state_roundtrip_and_cross_mode_loading_is_rejected(self):
+        content = make_cache("content_delta", torch.bfloat16)
+        with torch.no_grad():
+            content.delta.copy_(torch.linspace(-.25, .25, content.delta.numel()).reshape_as(content.delta))
+        stream = io.BytesIO()
+        torch.save(content.state_dict(), stream)
+        stream.seek(0)
+        state = torch.load(stream, weights_only=True)
+        self.assertEqual(validate_delta_state(state), (2, 2, 256))
+        restored = make_cache("content_delta", torch.bfloat16)
+        restored.load_state_dict(state)
+        self.assertEqual(restored.get_extra_state(), content.get_extra_state())
+        for actual, expected in zip(restored(list(CLASS_NAMES)), content(list(CLASS_NAMES))):
+            self.assertTrue(torch.equal(actual, expected))
+        for source, target in (("content_delta", "zero_delta"), ("zero_delta", "content_delta"),
+                               ("content_delta", "frozen"), ("frozen", "content_delta")):
+            with self.subTest(source=source, target=target), self.assertRaises((ValueError, RuntimeError)):
+                make_cache(target).load_state_dict(make_cache(source).state_dict())
+        malformed = copy.deepcopy(state)
+        malformed["delta"][0, 0, 0] = float("inf")
+        with self.assertRaises(ValueError):
+            make_cache("content_delta", torch.bfloat16).load_state_dict(malformed)
+
+    def test_content_capture_and_install_only_train_1024_parameters(self):
+        original = FakeVE().eval()
+        with torch.inference_mode():
+            content = capture_ve_text_cache(original, base_checkpoint_sha256="a" * 64,
+                tokenizer_sha256="b" * 64, mode="content_delta", device="cpu")
+        self.assertFalse(torch.is_inference(content.delta))
+        self.assertEqual(validate_delta_state(content.state_dict()), (2, 2, 256))
+        model = FakeModel()
+        base_state = {name: value.clone() for name, value in model.state_dict().items()
+                      if not name.startswith("backbone.language_backbone.")}
+        install_cached_ve_text_encoder(model, content)
+        self.assertEqual(sum(value.numel() for value in model.parameters() if value.requires_grad), 1024)
+        model(list(CLASS_NAMES))[1].float().sum().backward()
+        self.assertTrue(torch.equal(content.delta.grad, torch.ones_like(content.delta)))
+        for name, value in base_state.items():
+            self.assertTrue(torch.equal(model.state_dict()[name], value))
+
     def test_full_triple_order_repetition_and_mixed_dtypes_preserved(self):
         padding, resized, raw, metadata = cache_inputs(torch.bfloat16)
         cache = CachedVETextEncoder(padding, resized, raw, metadata=metadata)

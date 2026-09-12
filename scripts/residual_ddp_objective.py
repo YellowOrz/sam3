@@ -69,8 +69,9 @@ class ResidualObjective(nn.Module):
 
     def check_frozen_contract(self):
         delta = self.encoder.delta
-        if delta is None or tuple(delta.shape) != (2, 4, 256) or delta.dtype != torch.float32:
-            raise RuntimeError("Expected one FP32 output residual with 2048 parameters")
+        shape = shared.cached.expected_delta_shape(self.encoder.mode)
+        if delta is None or tuple(delta.shape) != shape or delta.dtype != torch.float32:
+            raise RuntimeError(f"Expected one FP32 output residual with declared shape {shape}")
         if [id(p) for p in self.model.parameters() if p.requires_grad] != [id(delta)]:
             raise RuntimeError("Only the output residual may be trainable")
         if any(module.training for module in self.model.modules()):

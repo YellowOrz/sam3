@@ -36,15 +36,11 @@ IMMUTABLE_CACHE_KEYS = ("padding_cache", "resized_cache", "raw_cache", "valid_po
 
 
 def cache_from_state(state, *, frozen=False):
-    if not isinstance(state, dict) or state.get("_extra_state", {}).get("mode") != "zero_delta":
-        raise ValueError("Training checkpoint must contain a complete zero_delta cache state")
-    delta = state.get("delta")
-    if (not isinstance(delta, torch.Tensor) or tuple(delta.shape) != (2, 4, 256)
-            or delta.dtype != torch.float32 or not bool(torch.isfinite(delta).all())):
-        raise ValueError("Delta must be finite FP32 with shape [2,4,256]")
+    cached.validate_delta_state(state)
+    mode = state["_extra_state"]["mode"]
     encoder = cached.CachedVETextEncoder(
         state["padding_cache"], state["resized_cache"], state["raw_cache"],
-        metadata=state["_extra_state"]["metadata"], mode="zero_delta")
+        metadata=state["_extra_state"]["metadata"], mode=mode)
     encoder.load_state_dict(state, strict=True)
     if not torch.isfinite(encoder.delta).all():
         raise ValueError("Trained delta must be finite")
@@ -68,6 +64,11 @@ def validate_checkpoint(state, *, minimum_samples, base_hash, tokenizer_hash):
         raise ValueError("Expected the fixed batch1 BF16 pilot configuration")
     current = state.get("cache_state_dict")
     initial = state.get("initial_cache_state_dict")
+    # The reusable cache loader also serves newer DDP experiments. That must
+    # not silently broaden this historical four-position pilot's protocol.
+    if any(not isinstance(value, dict) or value.get("_extra_state", {}).get("mode") != "zero_delta"
+           for value in (current, initial)):
+        raise ValueError("Legacy semantic pilot requires the original zero_delta mode")
     current_encoder, initial_encoder = cache_from_state(current), cache_from_state(initial)
     if not torch.equal(initial_encoder.delta, torch.zeros_like(initial_encoder.delta)):
         raise ValueError("Initial semantic delta must be exactly zero")
