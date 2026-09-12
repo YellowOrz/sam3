@@ -7,6 +7,8 @@ import argparse
 import json
 import math
 from pathlib import Path
+import numpy as np
+from scipy.ndimage import binary_erosion
 from scripts import visualize_residual_validation as validation
 
 SIDES = validation.SIDES
@@ -14,6 +16,21 @@ SIDES = validation.SIDES
 
 def mean(values):
     return sum(values) / len(values) if values else None
+
+
+def validate_comparison_steps(before, after, *, allow_trained_baseline=False):
+    if (type(before) is not int or type(after) is not int or before < 0
+            or after <= before or (before != 0 and not allow_trained_baseline)):
+        raise ValueError('Require increasing nonnegative steps; trained baseline needs explicit opt-in')
+
+
+def boundary_iou(mask, reference):
+    if not reference.any():
+        return None
+    boundary = lambda m: m & ~binary_erosion(
+        m, structure=np.ones((3, 3), bool), iterations=4, border_value=0)
+    a, b = boundary(mask), boundary(reference)
+    return int((a & b).sum()) / int((a | b).sum())
 
 
 def paired_metrics(pairs):
@@ -32,9 +49,11 @@ def paired_metrics(pairs):
                     or r['detected'] != (s >= .5)):
                 raise ValueError('Invalid class/presence/product/detection relationship')
             if r['reference_present']:
+                for key in ('candidate_dice', 'candidate_boundary_iou_4px'):
+                    d = r[key]
+                    if d is None or not math.isfinite(d) or not 0 <= d <= 1:
+                        raise ValueError('Invalid positive candidate metric')
                 d = r['candidate_dice']
-                if d is None or not math.isfinite(d) or not 0 <= d <= 1:
-                    raise ValueError('Invalid positive candidate Dice')
                 if not math.isclose(r['miss_zero_dice'], d if r['detected'] else 0., abs_tol=1e-10):
                     raise ValueError('Stored actual Dice inconsistent with gate')
     groups = {}
@@ -44,24 +63,42 @@ def paired_metrics(pairs):
         groups[name] = dict(count=len(selected), image_ids=[a['image_id'] for a, _ in selected],
             candidate_dice_ge_0_7_after=sum(b['candidate_dice'] >= .7 for _, b in selected),
             before={k: mean([a[k] for a, _ in selected]) for k in
-                ('candidate_dice', 'top_class_probability', 'presence_probability', 'top_confidence')},
+                ('candidate_dice', 'candidate_boundary_iou_4px', 'top_class_probability', 'presence_probability', 'top_confidence')},
             after={k: mean([b[k] for _, b in selected]) for k in
-                ('candidate_dice', 'top_class_probability', 'presence_probability', 'top_confidence')})
+                ('candidate_dice', 'candidate_boundary_iou_4px', 'top_class_probability', 'presence_probability', 'top_confidence')})
     gate = mean([(int(b['detected'])-int(a['detected']))*a['candidate_dice'] for a, b in positive])
     shape = mean([int(b['detected'])*(b['candidate_dice']-a['candidate_dice']) for a, b in positive])
     delta = mean([b['miss_zero_dice']-a['miss_zero_dice'] for a, b in positive])
     if positive and not math.isclose(gate+shape, delta, abs_tol=1e-10):
         raise ValueError('Additive decomposition failed')
+    bk = 'candidate_boundary_iou_4px'
+    boundary_gate = mean([(int(b['detected'])-int(a['detected']))*a[bk] for a, b in positive])
+    boundary_shape = mean([int(b['detected'])*(b[bk]-a[bk]) for a, b in positive])
+    boundary_delta = mean([int(b['detected'])*b[bk]-int(a['detected'])*a[bk] for a, b in positive])
+    if positive and not math.isclose(boundary_gate+boundary_shape, boundary_delta, abs_tol=1e-10):
+        raise ValueError('Boundary additive decomposition failed')
     return dict(positive_queries=len(positive), absent_queries=len(negative), transitions=groups,
         mean_actual_dice_before=mean([a['miss_zero_dice'] for a, _ in positive]),
         mean_actual_dice_after=mean([b['miss_zero_dice'] for _, b in positive]),
         dice_delta=delta, gate_contribution_with_old_candidate=gate,
         candidate_contribution_under_new_gate=shape,
+        mean_actual_boundary_before=mean([int(a['detected'])*a[bk] for a, _ in positive]),
+        mean_actual_boundary_after=mean([int(b['detected'])*b[bk] for _, b in positive]),
+        boundary_delta=boundary_delta, boundary_gate_contribution_with_old_candidate=boundary_gate,
+        boundary_candidate_contribution_under_new_gate=boundary_shape,
+        false_negative_before=sum(not a['detected'] for a, _ in positive),
+        false_negative_after=sum(not b['detected'] for _, b in positive),
         false_positive_before=sum(a['detected'] for a, _ in negative),
-        false_positive_after=sum(b['detected'] for _, b in negative))
+        false_positive_after=sum(b['detected'] for _, b in negative),
+        negative_transitions={name: sum(a['detected'] == old and b['detected'] == new for a, b in negative)
+            for name, old, new in [('new_false_positive', False, True), ('removed_false_positive', True, False),
+                                   ('persistent_false_positive', True, True), ('kept_empty', False, False)]},
+        negative_probabilities={label: {k: mean([pair[index][k] for pair in negative]) for k in
+            ('top_class_probability', 'presence_probability', 'top_confidence')}
+            for index, label in enumerate(('before', 'after'))})
 
 
-def diagnose(data_root, baseline, comparison, output):
+def diagnose(data_root, baseline, comparison, output, *, allow_trained_baseline=False):
     data_root = data_root.resolve()
     if output.exists():
         raise ValueError('Require new output directory')
@@ -75,6 +112,8 @@ def diagnose(data_root, baseline, comparison, output):
             or doc['categories'] != [{'id': 1, 'name': 'left_hand'}, {'id': 2, 'name': 'right_hand'}]):
         raise ValueError('Require fixed Dex validation data, never external benchmark')
     fingerprints = {str(annotation_path): digest}
+    for source in (Path(__file__).resolve(), Path(validation.__file__).resolve()):
+        fingerprints[str(source)] = validation.sha256(source.read_bytes())
     records, summaries = [], []
     for directory in (baseline, comparison):
         path = directory/'summary.json'
@@ -89,8 +128,8 @@ def diagnose(data_root, baseline, comparison, output):
             raise ValueError('Validation protocol/coverage mismatch')
         records.append(validation.load_records(directory, summary, images, set(images), digest, fingerprints))
         summaries.append(summary)
-    if summaries[0]['global_step'] != 0 or summaries[1]['global_step'] <= 0:
-        raise ValueError('Require original step0 and a later validated step')
+    validate_comparison_steps(summaries[0]['global_step'], summaries[1]['global_step'],
+                              allow_trained_baseline=allow_trained_baseline)
     annotations = {}
     for r in doc['annotations']:
         key = r['image_id'], r['category_id']
@@ -114,6 +153,9 @@ def diagnose(data_root, baseline, comparison, output):
                     d = 2*int((mask & reference).sum())/(int(mask.sum())+int(reference.sum()))
                     if not math.isclose(d, r['candidate_dice'], abs_tol=1e-10):
                         raise ValueError('Candidate RLE Dice mismatch')
+                    if not math.isclose(boundary_iou(mask, reference),
+                                        r['candidate_boundary_iou_4px'], abs_tol=1e-10):
+                        raise ValueError('Candidate RLE boundary mismatch')
                 if r['detected'] and not mask.any():
                     empty_candidate[j][side] += 1
                 other = refs[SIDES[1-SIDES.index(side)]]
@@ -128,7 +170,9 @@ def diagnose(data_root, baseline, comparison, output):
             expected = {'positive_count': sum(r['reference_present'] for r in rows),
                 'false_negative_count': sum(r['reference_present'] and not r['detected'] for r in rows),
                 'false_positive_count': sum(not r['reference_present'] and r['detected'] for r in rows),
-                'miss_zero_dice': mean([r['miss_zero_dice'] for r in rows if r['reference_present']])}
+                'miss_zero_dice': mean([r['miss_zero_dice'] for r in rows if r['reference_present']]),
+                'candidate_boundary_iou_4px': mean([r['candidate_boundary_iou_4px'] for r in rows if r['reference_present']]),
+                'miss_zero_boundary_iou_4px': mean([int(r['detected'])*r['candidate_boundary_iou_4px'] for r in rows if r['reference_present']])}
             for key, value in expected.items():
                 if not math.isclose(summary['metrics'][f'{side}/{key}'], value, abs_tol=1e-9):
                     raise ValueError('Records and summary disagree')
@@ -147,6 +191,7 @@ def diagnose(data_root, baseline, comparison, output):
             raise ValueError('Input changed during diagnosis')
     output.mkdir(parents=True, exist_ok=False)
     result = dict(status='complete', scope='dexycb_validation_diagnostic', steps=[s['global_step'] for s in summaries],
+        trained_baseline_explicitly_allowed=allow_trained_baseline,
         verified_queries_per_model=len(images)*2, metrics=sides, by_sequence=grouped, input_sha256=fingerprints,
         absent_prompt_outputs_mostly_overlapping_other_hand=absent_overlaps,
         detected_but_empty_candidate_counts=empty_candidate,
@@ -163,7 +208,13 @@ def diagnose(data_root, baseline, comparison, output):
         lines.append(f"|{side}|{m['mean_actual_dice_before']:.5f}|{m['mean_actual_dice_after']:.5f}|"
             f"{m['gate_contribution_with_old_candidate']:+.5f}|{m['candidate_contribution_under_new_gate']:+.5f}|"
             f"{t['new_miss']['count']}|{t['recovered']['count']}|{t['new_miss']['candidate_dice_ge_0_7_after']}|")
-    lines.extend(['', '固定0.5分数门槛；全量RLE Dice重算和摘要核验通过。门控贡献＋候选贡献严格等于实际Dice变化；不是因果消融。',
+    lines.extend(['', '|侧别|原实际边界IoU|新实际边界IoU|边界门控贡献|边界候选贡献|原漏检→新漏检|原误报→新误报|',
+        '|---|---:|---:|---:|---:|---|---|'])
+    for side, m in sides.items():
+        lines.append(f"|{side}|{m['mean_actual_boundary_before']:.5f}|{m['mean_actual_boundary_after']:.5f}|"
+            f"{m['boundary_gate_contribution_with_old_candidate']:+.5f}|{m['boundary_candidate_contribution_under_new_gate']:+.5f}|"
+            f"{m['false_negative_before']}→{m['false_negative_after']}|{m['false_positive_before']}→{m['false_positive_after']}|")
+    lines.extend(['', '固定0.5分数门槛；全量RLE Dice及4px边界重算和摘要核验通过。门控贡献＋候选贡献严格等于对应实际指标变化；不是因果消融。',
         '', '候选Dice≥0.7仅用于诊断，不调阈值；空侧与另一手重叠仅为错手嫌疑。完整逐序列统计与输入SHA见 [metrics.json](metrics.json)。'])
     (output/'README.md').write_text('\n'.join(lines)+'\n')
 
@@ -174,5 +225,8 @@ if __name__ == '__main__':
     p.add_argument('--baseline', type=Path, required=True)
     p.add_argument('--comparison', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--allow-trained-baseline', action='store_true',
+                   help='Explicitly compare an earlier trained checkpoint against a later step')
     args = p.parse_args()
-    diagnose(args.data_root, args.baseline, args.comparison, args.output)
+    diagnose(args.data_root, args.baseline, args.comparison, args.output,
+             allow_trained_baseline=args.allow_trained_baseline)
