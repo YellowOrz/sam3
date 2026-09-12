@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from scripts.hand_evaluation_metrics import summarize_outputs, temporal_diagnostics, validate_reference_role
 from scripts.video_hand_routes import VideoResidualTextEncoder, union_video_outputs, select_video_indices
-from scripts.audit_hand_route_outputs import actual_metrics
+from scripts.audit_hand_route_outputs import actual_metrics, thresholded_output
 
 
 def row(frame=0, ref=5, pred=5, side='left_hand', provided=True, flags=None):
@@ -17,6 +17,19 @@ def row(frame=0, ref=5, pred=5, side='left_hand', provided=True, flags=None):
 
 
 class HandEvaluationLayersTest(unittest.TestCase):
+    def test_audit_preserves_video_outputs_below_raw_score_gate(self):
+        a=np.ones((2,2),bool)
+        self.assertTrue(thresholded_output(a,.4,True,'video_system').all())
+        self.assertFalse(thresholded_output(a,.4,False,'image_ablation').any())
+        self.assertTrue(thresholded_output(a,.5,True,'image_ablation').all())
+
+    def test_audit_rejects_invalid_score_and_inconsistent_detection(self):
+        a=np.ones((2,2),bool)
+        for score in (float('nan'),float('inf'),-.1,1.1,True):
+            with self.assertRaises(ValueError): thresholded_output(a,score,True,'image_ablation')
+        with self.assertRaises(ValueError): thresholded_output(a,.4,True,'image_ablation')
+        with self.assertRaises(ValueError): thresholded_output(a,.4,False,'video_system')
+
     def test_independent_mask_metrics(self):
         a=np.zeros((12,12),bool);a[2:10,2:10]=True
         self.assertEqual(actual_metrics(a,a),(1.,1.))

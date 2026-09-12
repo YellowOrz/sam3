@@ -22,16 +22,34 @@ def actual_metrics(mask, reference):
     return dice, int((a&b).sum()) / int((a|b).sum())
 
 
+def thresholded_output(mask, score, detected, layer):
+    if (type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1
+            or type(detected) is not bool):
+        raise ValueError('Invalid output confidence/detection flag')
+    if layer == 'image_ablation':
+        if detected != (score >= .5):
+            raise ValueError('Threshold mismatch')
+        return mask if detected else np.zeros_like(mask)
+    if layer != 'video_system' or detected != bool(mask.any()):
+        raise ValueError('Invalid video actual-output presence or evaluation layer')
+    return mask  # Video predictor already filtered; never apply a second threshold.
+
+
 def audit(data_root, run, output):
     if output.exists():
         raise ValueError('New audit output required')
+    auditor_hash = publication.shared.sha256(Path(__file__))
     root = data_root.resolve()
     images, annotations, outputs, _, hashes = publication.load_publication(root)
     by_id = {r['id']:i for i,r in enumerate(images)}
-    summary = json.loads((run/'summary.json').read_text())
+    summary_path = run/'summary.json'
+    summary_hash = publication.shared.sha256(summary_path)
+    summary = json.loads(summary_path.read_text())
     spec = summary['protocol']
     records_path = run/'records.jsonl'
-    if (summary['status']!='complete' or spec['format']!='sam3-hand-routes-v2'
+    if (summary['status']!='complete' or not summary.get('actual_complete_query_coverage_verified')
+            or spec['format']!='sam3-hand-routes-v2' or spec['threshold'] != .5
+            or spec['mask_threshold'] != .5 or spec['boundary_pixels'] != 4
             or summary['records_sha256'] != publication.shared.sha256(records_path)
             or spec['annotations_sha256'] != publication.shared.sha256(root/'annotations.json')):
         raise ValueError('Incomplete, changed, or non-v2 evaluation')
@@ -47,13 +65,7 @@ def audit(data_root, run, output):
             raise ValueError('Reference identity/quality mismatch')
         refs=publication.batch_references(root,images,[index],annotations,outputs,hashes)[im['id']]
         mask=decode_rle(r['prediction_rle'],(im['height'],im['width']))
-        if spec['evaluation_layer']=='image_ablation':
-            detected=r['top_confidence']>=.5
-            if detected!=r['detected']:
-                raise ValueError('Threshold mismatch')
-            if not detected: mask=np.zeros_like(mask)
-        elif spec['evaluation_layer']!='video_system':
-            raise ValueError('Unknown evaluation layer')
+        mask = thresholded_output(mask, r['top_confidence'], r['detected'], spec['evaluation_layer'])
         if int(mask.sum())!=r['detected_mask_pixels']:
             raise ValueError('Actual-output pixel count mismatch')
         if refs[side] is not None and int(refs[side].sum())!=r['reference_pixels']:
@@ -69,8 +81,13 @@ def audit(data_root, run, output):
     for path,digest in hashes.items():
         if publication.shared.sha256(Path(path))!=digest:
             raise ValueError('Publication changed during audit')
+    if (publication.shared.sha256(summary_path) != summary_hash
+            or publication.shared.sha256(records_path) != summary['records_sha256']
+            or publication.shared.sha256(Path(__file__)) != auditor_hash):
+        raise ValueError('Evaluation output changed during audit')
     publication.shared.atomic_write_json(output,dict(status='complete',checked_queries=checked,
         evaluation_layer=spec['evaluation_layer'],records_sha256=summary['records_sha256'],
+        auditor_sha256=auditor_hash,
         reference_role=spec['reference_role'],note='CPU RLE/PNG Dice/boundary recomputation; not independent annotation certification'))
 
 
