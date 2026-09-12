@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from PIL import Image, ImageDraw
 from scripts import evaluate_realsense_full as full
+from scripts.hand_evaluation_metrics import summarize_outputs
 
 
 def load_runs(paths):
@@ -15,7 +16,7 @@ def load_runs(paths):
         summary = json.loads((path / 'summary.json').read_text())
         if summary.get('status') != 'complete' or not summary.get('actual_complete_query_coverage_verified'):
             raise ValueError('Incomplete evaluation')
-        if summary.get('protocol', {}).get('format') != 'sam3-hand-routes-v1':
+        if summary.get('protocol', {}).get('format') not in ('sam3-hand-routes-v1', 'sam3-hand-routes-v2'):
             raise ValueError('Unified protocol required; legacy summaries cannot be mixed')
         records_path = path / 'records.jsonl'
         if full.shared.sha256(records_path) != summary['records_sha256']:
@@ -27,6 +28,8 @@ def load_runs(paths):
             raise ValueError('Query coverage mismatch')
         if full.summarize(records) != summary['metrics']:
             raise ValueError('Metrics differ from records')
+        if summary['protocol']['format'] == 'sam3-hand-routes-v2' and summarize_outputs(records) != summary.get('output_metrics'):
+            raise ValueError('Actual-output metrics differ from records')
         if runs and summary['protocol'] != runs[0][1]['protocol']:
             raise ValueError('Different evaluation protocols')
         runs.append((path, summary))
@@ -47,7 +50,24 @@ def export(paths, output):
              '参考为 SAM3 辅助标签，不是独立精标。固定样本不按模型效果挑选；不据此选择 checkpoint。', '',
              '|方法／阶段轮次|候选 Dice|漏检计零 Dice|边界 IoU（4px）|漏检／有手查询|误报／无手查询|',
              '|---|---:|---:|---:|---:|---:|']
+    modern = runs[0][1]['protocol'].get('format') == 'sam3-hand-routes-v2'
+    if modern:
+        lines = ['# 实际输出：同口径手分割对照', '',
+            '外部开发评估，SAM3辅助参考，不是独立盲测。实际输出指标优先，候选形状仅作诊断。', '',
+            f"评估层：{runs[0][1]['protocol']['evaluation_layer']}；不同评估层禁止混表。", '',
+            '|方法／阶段轮次／侧别|有手帧实际Dice|实际边界IoU4px|漏检空输出／有手|误报非空输出／无手|含空帧Dice（辅助）|',
+            '|---|---:|---:|---:|---:|---:|']
     for path, summary in runs:
+        if modern:
+            primary = summary['output_metrics']['primary']
+            for side, m in [('overall', primary['overall']), *primary['per_side'].items()]:
+                fmt = lambda v: 'N/A' if v is None else f'{v:.5f}'
+                lines.append(f"|{summary['method']} / {summary['epoch']} / {side}|"
+                    + f"{fmt(m['actual_positive_dice'])}|{fmt(m['actual_positive_boundary_iou_4px'])}|"
+                    + f"{m['false_negative_empty_output']}/{m['positive_queries']}|"
+                    + f"{m['false_positive_nonempty_output']}/{m['negative_queries']}|"
+                    + f"{fmt(m['all_provided_dice_empty_empty_one'])}|")
+            continue
         metrics = summary['metrics']['primary_provided_nonflagged']['overall']
         values = [metrics[k] for k in ('present_mean_candidate_dice', 'present_mean_miss_zero_dice',
                                       'candidate_boundary_iou_4px')]
@@ -65,6 +85,8 @@ def export(paths, output):
                 raise ValueError('Visualization RGB/reference differ')
             reference_bytes = current
             names = ('rgb', 'reference', 'candidate', 'detected') if index == 0 else ('candidate', 'detected')
+            if modern:
+                names = ('rgb', 'reference', 'detected') if index == 0 else ('detected',)
             for name in names:
                 with Image.open(directory / f'{name}.png') as image:
                     panel = image.convert('RGB')

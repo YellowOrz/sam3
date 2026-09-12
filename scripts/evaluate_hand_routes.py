@@ -13,6 +13,7 @@ import torch
 from scripts import evaluate_realsense_full as full
 from scripts.spatial_training_state import validate_state
 from sam3.model.spatial_mask_adapter import SpatialMaskAdapter, attach_spatial_mask_adapter
+from scripts.hand_evaluation_metrics import summarize_outputs
 
 
 def selected_checkpoint(path, epoch, base_hash, tokenizer_hash):
@@ -36,7 +37,10 @@ def require_residual_epoch(state, epoch):
 
 
 def protocol(images, indices, base_hash, tokenizer_hash, annotation_hash, batch_size):
-    return dict(format='sam3-hand-routes-v1', image_ids=[images[i]['id'] for i in indices],
+    return dict(format='sam3-hand-routes-v2', evaluation_layer='image_ablation',
+        reference_role='external_development', label_provenance='sam3_assisted',
+        independent_ground_truth=False, previously_inspected=True,
+        image_ids=[images[i]['id'] for i in indices],
         base_sha256=base_hash, tokenizer_sha256=tokenizer_hash,
         annotations_sha256=annotation_hash, batch_size=batch_size, precision='bf16',
         confidence='sigmoid(class) * sigmoid(presence)', threshold=.5, mask_threshold=.5,
@@ -135,7 +139,7 @@ def main():
         for path, digest in {**hashes, **implementation}.items():
             if full.shared.sha256(Path(path)) != digest: raise RuntimeError('Input/code changed')
         summary.update(status='complete', elapsed_seconds=time.monotonic()-started,
-            metrics=full.summarize(records), visuals=visuals,
+            metrics=full.summarize(records), output_metrics=summarize_outputs(records), visuals=visuals,
             records_sha256=full.shared.sha256(args.output_dir / 'records.jsonl'),
             actual_complete_query_coverage_verified=True)
         full.shared.atomic_write_json(args.output_dir / 'summary.json', summary)

@@ -36,10 +36,11 @@ class HandRoutesTest(unittest.TestCase):
                 (path / 'records.jsonl').write_text('\n'.join(json.dumps(dict(image_id=8, prompt_key=s))
                     for s in ('left_hand', 'right_hand')))
                 summary = dict(status='complete', actual_complete_query_coverage_verified=True,
-                    protocol=p, records_sha256='hash', metrics={})
+                    protocol=p, records_sha256='hash', metrics={}, output_metrics={})
                 (path / 'summary.json').write_text(json.dumps(summary))
             with patch('scripts.compare_hand_routes.full.shared.sha256', return_value='hash'), \
-                 patch('scripts.compare_hand_routes.full.summarize', return_value={}):
+                 patch('scripts.compare_hand_routes.full.summarize', return_value={}), \
+                 patch('scripts.compare_hand_routes.summarize_outputs', return_value={}):
                 self.assertEqual(len(load_runs(paths)), 2)
                 for change in ({'status': 'running'}, {'protocol': {}}, {'records_sha256': 'bad'},
                                {'protocol': {**p, 'batch_size': 2}}):
