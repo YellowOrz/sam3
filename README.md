@@ -162,14 +162,18 @@ output = response["outputs"]
 
 ## Examples
 
+### Shared batch video arguments
+
+`process_dataset_videos.py`, `process_mano_prompt_videos.py`, and `process_learned_prompt_videos.py` share argument definitions in `scripts/common/video_cli.py`. Their help groups data input/output, batch execution, model loading, and GT evaluation. All three recursively find `--rgb-name` (default `color.mp4`) in the input root and its subdirectories, and preserve relative directories in the output. Input and output roots must differ, including when using `--list-only`. Output defaults remain `~/sam3_outputs` for dataset/MANO and `~/sam3_learned_outputs` for learned prompts. MANO's `--list-only` additionally validates MANO files, projections, and missing frames; model and prompt-specific validation stays with each processor.
+
 ### MANO-guided video segmentation (SAM3)
 
-[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using a required text prompt plus MANO detector geometry. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-name` when that directory contains multiple files. Check inputs first:
+[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-name` when that directory contains multiple files. Check inputs first:
 
 ```bash
 python scripts/process_mano_prompt_videos.py \
     --input-root DATA --output-root OUT \
-    --prompt "left hand" --hand-side left --prompt-mode both \
+    --text-prompt "left hand" --hand-side left --prompt-mode both \
     --checkpoint /path/to/sam3.pt --device cuda:0 --list-only
 ```
 
@@ -212,7 +216,7 @@ single final decoder, without training or changing model weights:
 
 ```bash
 python scripts/process_bidirectional_videos.py \
-  --input-root DATA --output-root OUT_MEMORY --prompt "left hand" \
+  --input-root DATA --output-root OUT_MEMORY --text-prompt "left hand" \
   --checkpoint /path/to/sam3.pt --device cuda:0 \
   --chunk-frames 120 --context-frames 30
 ```

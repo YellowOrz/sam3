@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 import torch
 
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
@@ -103,9 +104,13 @@ def test_cuda_amp_falls_back_to_float16_without_bf16(monkeypatch) -> None:
 
 
 def test_parser_has_no_interactive_switch() -> None:
-    args = qualitative.build_parser().parse_args(
-        ["--video", "input.mp4", "--output-dir", "output"]
-    )
+    parser = qualitative.build_parser()
+    argv = ["--video", "input.mp4", "--output-dir", "output"]
+    args = parser.parse_args([*argv, "--text-prompt", "hand"])
+    assert args.text_prompt == "hand"
+    for old_option in ("--prompt", "--text_prompt"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*argv, old_option, "hand"])
 
     assert not hasattr(args, "interactive")
     assert not hasattr(args, "propagation_direction")

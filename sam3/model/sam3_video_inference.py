@@ -999,7 +999,7 @@ class Sam3VideoInference(Sam3VideoBase):
 
         @param text_str 全视频共享的语义文本；``visual`` 表示只使用视觉框提示。
         @param boxes_xywh 归一化 ``xywh`` 框，可作为视觉提示或几何细化提示。
-        @param geometry_prompts 可选逐帧正点/正框字典，与文本共同进入 detector；一次写入整段视频，随后传播不再重置 memory。
+        @param geometry_prompts 可选逐帧正点/正框字典，文本可为空以仅使用几何提示；一次写入整段视频，随后传播不再重置 memory。
         @return ``(frame_idx, outputs)``，其中 ``outputs`` 是提示帧的即时结果。
 
         每次添加语义提示都会重置旧状态：文本语义定义的是一次新的开放词汇检索；
@@ -1009,20 +1009,18 @@ class Sam3VideoInference(Sam3VideoBase):
 
         num_frames = inference_state["num_frames"]
         assert (
-            text_str is not None or boxes_xywh is not None
-        ), "at least one type of prompt (text, boxes) must be provided"
+            text_str is not None or boxes_xywh is not None or geometry_prompts is not None
+        ), "at least one type of prompt (text, boxes, geometry) must be provided"
         assert (
             0 <= frame_idx < num_frames
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
         prepared_geometry = None
         if geometry_prompts is not None:
-            if (
-                not isinstance(text_str, str)
-                or not text_str.strip()
-                or text_str == "visual"
-            ):
-                raise ValueError("detector geometry requires a nonempty text prompt")
+            if text_str is not None:
+                if not isinstance(text_str, str) or text_str.strip() == "visual":
+                    raise ValueError("geometry text must be a string other than 'visual'")
+                text_str = text_str.strip() or None
             if boxes_xywh is not None or box_labels is not None:
                 raise ValueError("put detector boxes inside geometry_prompts")
             prepared_geometry = self._prepare_geometry_prompts(

@@ -19,14 +19,18 @@ from scripts.common import compare_gt_masks as evaluation
 @pytest.mark.parametrize(
     "processor,required",
     [
-        (dataset, ["--prompt", "hand"]),
+        (dataset, ["--text-prompt", "hand"]),
         (learned, []),
-        (mano, ["--prompt", "hand", "--hand-side", "left"]),
+        (mano, ["--text-prompt", "hand", "--hand-side", "left"]),
     ],
 )
 def test_shared_gt_arguments(processor, required, capsys):
     parser = processor.build_parser()
     defaults = parser.parse_args(required)
+    if processor in (dataset, mano):
+        assert defaults.prompt == "hand"
+        with pytest.raises(SystemExit):
+            parser.parse_args([*required, "--prompt", "hand"])
     assert (
         defaults.compare_gt,
         defaults.gt_dir_name,
@@ -133,7 +137,7 @@ def test_inference_cached_comparison_and_failure(
         str(output),
         "--checkpoint",
         str(checkpoint),
-        "--prompt",
+        "--text-prompt",
         "hand",
         "--version",
         version,
@@ -213,3 +217,76 @@ def test_inference_cached_comparison_and_failure(
         summary = json.loads((output / "gt_summary.json").read_text())
         assert all(row["status"] == "failed" for row in summary["sequences"])
         assert not (output / "backward" / "comparison.mp4").exists()
+
+
+@pytest.mark.parametrize(
+    "processor,required",
+    [
+        (dataset, ["--text-prompt", "hand"]),
+        (learned, []),
+        (mano, ["--text-prompt", "", "--hand-side", "left"]),
+    ],
+)
+def test_shared_io_discovery_and_validation(
+    processor, required, tmp_path, monkeypatch, capsys
+):
+    root = tmp_path / "input"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    for directory in (root, nested):
+        (directory / "rgb.mkv").touch()
+        (directory / "color.mp4").touch()
+    output = tmp_path / "output"
+    argv = [
+        *required,
+        "--input-root",
+        str(root),
+        "--output-root",
+        str(output),
+        "--rgb-name",
+        "rgb.mkv",
+        "--list-only",
+    ]
+    checked = []
+
+    def find_mano(video, side, name):
+        checked.append(video)
+        return video.with_suffix(".npz")
+
+    monkeypatch.setattr(mano, "find_mano", find_mano)
+    monkeypatch.setattr(dataset, "probe_video", lambda path: {})
+    monkeypatch.setattr(
+        mano,
+        "load_geometry",
+        lambda *args: ({}, {"missing_frames": [], "unusable_prompt_frames": []}),
+    )
+    assert processor.main(argv) == 0
+    listing = capsys.readouterr().out
+    assert "nested/rgb.mkv" in listing and "color.mp4" not in listing
+    assert len(listing.splitlines()) == 2
+    assert not output.exists()
+    if processor is mano:
+        assert checked == [nested / "rgb.mkv", root / "rgb.mkv"]
+    assert processor.main([*argv, "--max-sequences", "1"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 1
+    for same_root in (root, tmp_path / "alias"):
+        if same_root != root:
+            same_root.symlink_to(root, target_is_directory=True)
+        assert processor.main([*argv, "--output-root", str(same_root)]) == 2
+    parser = processor.build_parser()
+    for invalid in ("../rgb.mkv", "*.mp4"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*argv, "--rgb-name", invalid])
+    help_text = parser.format_help()
+    for group in (
+        "Data input/output",
+        "Batch execution",
+        "Model loading",
+        "GT evaluation",
+    ):
+        assert group in help_text
+    assert parser.parse_args(required).output_root == (
+        "~/sam3_learned_outputs" if processor is learned else "~/sam3_outputs"
+    )
+    if processor is mano:
+        assert "Also validate MANO files" in help_text

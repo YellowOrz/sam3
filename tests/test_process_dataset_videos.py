@@ -43,14 +43,14 @@ def test_both_directions_get_independent_output_directories(tmp_path: Path) -> N
 
 def test_direction_choices_and_expansion() -> None:
     parser = processor.build_parser()
-    args = parser.parse_args(["--prompt", "hand", "--direction", "both"])
+    args = parser.parse_args(["--text-prompt", "hand", "--direction", "both"])
 
     assert processor.processing_directions(args.direction) == (
         "forward",
         "backward",
     )
     with pytest.raises(SystemExit):
-        parser.parse_args(["--prompt", "hand", "--direction", "sideways"])
+        parser.parse_args(["--text-prompt", "hand", "--direction", "sideways"])
 
 
 def test_add_prompt_request_switches_text_and_learned() -> None:
@@ -134,7 +134,7 @@ def test_list_only_accepts_single_sequence_directory(tmp_path: Path, capsys) -> 
                 str(input_root),
                 "--output-root",
                 str(tmp_path / "out"),
-                "--prompt",
+                "--text-prompt",
                 "hand",
                 "--list-only",
             ]

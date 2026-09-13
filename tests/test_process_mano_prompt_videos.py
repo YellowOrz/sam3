@@ -46,7 +46,7 @@ def sample_npz(path, **overrides):
 def arguments(*extra):
     return mano.build_parser().parse_args(
         [
-            "--prompt",
+            "--text-prompt",
             "left hand",
             "--hand-side",
             "left",
@@ -137,7 +137,8 @@ def test_cli_invalid_options_and_ambiguous_files(tmp_path):
     assert mano.find_mano(video, "left", first.name) == first
 
 
-def test_api_preloads_geometry_once_and_preserves_tracker_dispatch():
+@pytest.mark.parametrize("text", ["left hand", "", "   ", None])
+def test_api_preloads_geometry_once_and_preserves_tracker_dispatch(text):
     host = SimpleNamespace(device=torch.device("cpu"))
     host._prepare_geometry_prompts = MethodType(
         Sam3VideoInference._prepare_geometry_prompts, host
@@ -176,7 +177,14 @@ def test_api_preloads_geometry_once_and_preserves_tracker_dispatch():
     host.reset_state = reset
 
     def infer(current, frame_idx, reverse):
-        assert current["text_prompt"] == "left hand"
+        assert current["text_prompt"] == (text.strip() or None if text else None)
+        expected_id = (
+            host.TEXT_ID_FOR_TEXT if text and text.strip() else host.TEXT_ID_FOR_VISUAL
+        )
+        assert all(
+            stage.text_ids.item() == expected_id
+            for stage in current["input_batch"].find_inputs
+        )
         assert set(current["feature_cache"]) == {"per_frame_geometric_prompts"}
         current["tracker_inference_states"].append("new memory")
         return {"ok": True}
@@ -196,7 +204,7 @@ def test_api_preloads_geometry_once_and_preserves_tracker_dispatch():
             "type": "add_geometry_prompts",
             "session_id": "s",
             "frame_index": 0,
-            "text": "left hand",
+            "text": text,
             "geometry_prompts": {
                 0: {"points": [[0.2, 0.3]], "boxes": [[0.1, 0.2, 0.4, 0.6]]},
                 2: {"points": [[0.8, 0.7]]},
@@ -297,7 +305,7 @@ def test_list_only_and_missing_file_batch_failure(tmp_path, capsys):
         str(tmp_path),
         "--output-root",
         str(output),
-        "--prompt",
+        "--text-prompt",
         "left hand",
         "--hand-side",
         "left",
@@ -310,7 +318,8 @@ def test_list_only_and_missing_file_batch_failure(tmp_path, capsys):
     assert not output.exists()
 
 
-def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch):
+@pytest.mark.parametrize("text", ["left hand", "", "   "])
+def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch, text):
     import sam3
 
     root = tmp_path / "data"
@@ -332,6 +341,7 @@ def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch):
 
     def process(*args, **kwargs):
         calls.append(args[1])
+        assert args[4] == text.strip()
         assert set(kwargs["geometry_prompts"]) == {0, 2}
         return "success"
 
@@ -345,8 +355,8 @@ def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch):
                 str(output),
                 "--checkpoint",
                 str(checkpoint),
-                "--prompt",
-                "left hand",
+                "--text-prompt",
+                text,
                 "--hand-side",
                 "left",
             ]
@@ -359,7 +369,8 @@ def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("direction", ["forward", "backward"])
-def test_output_videos_overlay_and_configuration_skip(tmp_path, direction):
+@pytest.mark.parametrize("text", ["left hand", ""])
+def test_output_videos_overlay_and_configuration_skip(tmp_path, direction, text):
     video = tmp_path / "color.mp4"
     make_video(video)
     output = tmp_path / "out"
@@ -386,7 +397,7 @@ def test_output_videos_overlay_and_configuration_skip(tmp_path, direction):
             video,
             output,
             tmp_path,
-            "left hand",
+            text,
             "sam3",
             None,
             False,
@@ -397,6 +408,7 @@ def test_output_videos_overlay_and_configuration_skip(tmp_path, direction):
 
     assert run(metadata) == "success"
     request = next(r for r in predictor.requests if r["type"] == "add_geometry_prompts")
+    assert request["text"] == text
     assert request["geometry_prompts"] == geometry
     assert request["frame_index"] == (0 if direction == "forward" else 2)
     assert dataset.probe_video(output / "masks.mkv")["frame_count"] == 3

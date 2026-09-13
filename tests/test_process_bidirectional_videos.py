@@ -409,10 +409,13 @@ def test_parser_and_list_only_do_not_load_sam3(tmp_path):
         str(root),
         "--output-root",
         str(tmp_path / "out"),
-        "--prompt",
+        "--text-prompt",
         "left hand",
     ]
     args = processor.build_parser().parse_args(argv)
+    assert args.prompt == "left hand"
+    with pytest.raises(SystemExit):
+        processor.build_parser().parse_args(argv + ["--prompt", "left hand"])
     assert args.backward_mode == "physical" and args.chunk_frames == 0
     assert processor.main(argv + ["--list-only"]) == 0
     with pytest.raises(SystemExit):

@@ -335,7 +335,7 @@ SAM3.1 multiplex 有不同的多对象共享记忆路径，不能直接复用标
 ```bash
 python scripts/process_bidirectional_videos.py \
   --input-root DATA --output-root OUT_MEMORY \
-  --prompt "left hand" --version sam3 --device cuda:0 \
+  --text-prompt "left hand" --version sam3 --device cuda:0 \
   --checkpoint /path/to/sam3.pt --backward-mode physical
 ```
 

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-r"""说明：递归处理 color.mp4，保留输入目录结构；使用文本和指定侧 MANO 信息执行 SAM3
+r"""说明：递归处理 RGB 视频（默认 color.mp4），保留输入目录结构；使用文本和指定侧 MANO 信息执行 SAM3
 视频分割。点、框直接进入 detector geometry encoder，保留视频检测、跟踪与 memory。
 MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
 默认每帧使用提示；间隔 N 对应原视频第 0、N、2N…帧，与传播方向无关。
 点使用有效、在画面内的全部关节，均为正点；NPZ 没有可见性，遮挡关节也可能被使用。
 框由投影 mesh（默认）或 joints 包围框生成，每侧默认扩张原宽高的 5%，再裁到画面内。
-缺失帧退回文本和已有 memory；整段缺少 NPZ 或匹配多个文件时记录失败并继续批次。
+缺失帧退回文本和已有 memory（禁用文本时仅跟踪已有对象）；整段缺少 NPZ 或匹配多个文件时记录失败并继续批次。
 输出：masks.mkv（全部实例、FFV1）、result.mp4（黄点/青框）、metadata.json；
 批次汇总写入 batch_summary.json。双向模式分别写 forward/、backward/，均正序播放。
 
 命令行参数：
   --input-root：单视频目录或数据集根目录，默认 ~/Datasets。
+  --rgb-name：递归查找的 RGB 文件名，默认 color.mp4，包含根目录和所有子目录。
   --output-root：输出根目录，默认 ~/sam3_outputs；不得与输入根目录相同。
-  --prompt：必填文本提示，例如 "left hand"；--hand-side：必填 left 或 right。
+  --text-prompt：必填文本提示，例如 "left hand"；传 "" 禁用文本；--hand-side：必填 left 或 right。
   --prompt-mode：points / box / both，默认 both。
   --box-source：mesh / joints，默认 mesh；--box-padding：每侧扩张比例，默认 0.05。
   --prompt-interval：提示帧间隔，正整数，默认 1。
@@ -25,7 +26,8 @@ MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
       snapshots/master/sam3.pt。
   --direction：forward / backward / both，默认 forward。
   --max-sequences、--max-frames：可选的序列数和帧数上限。
-  --list-only：核对视频、NPZ、投影及缺失统计，不加载模型或写输出。
+  --list-only：仅列出发现的输入视频，不加载模型、不执行分割或 GT 评测、不写结果文件。
+      本脚本额外校验对应 MANO 文件、投影及缺失统计，并列出视频与 MANO 文件的对应关系。
   --overwrite：重新处理已有结果；--help：显示参数帮助。
   --compare-gt：启用 GT 评测；--gt-mask-name：启用评测时必填，不从手侧推导。
   --gt-dir-name：RGB 同级 GT 目录名，默认 masks_sam3。
@@ -34,7 +36,7 @@ MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
       完整预测可免 GPU 补评测，仍校验 MANO 和缓存配置；GT 失败保留预测并继续批次。
 
 示例：python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT \
-  --prompt "left hand" --hand-side left --prompt-mode both --device cuda:0 --list-only
+  --text-prompt "left hand" --hand-side left --prompt-mode both --device cuda:0 --list-only
 
 TODO：
   1. 支持 SAM3.1，并验证其 detector geometry 和预计算路径。
@@ -52,8 +54,18 @@ import numpy as np
 
 if __package__:
     from scripts import process_dataset_videos as dataset
+    from scripts.common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
+    )
 else:
     import process_dataset_videos as dataset
+    from common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
+    )
 
 
 LOGGER = logging.getLogger("sam3_mano_processor")
@@ -134,12 +146,12 @@ def load_geometry(
                 f"missing NPZ fields: {sorted(required - set(data.files))}"
             )
         if int(data["width"]) != width or int(data["height"]) != height:
-            raise ValueError("MANO dimensions differ from color.mp4")
+            raise ValueError("MANO dimensions differ from RGB video")
         if str(data["hand"].item()) != f"{args.hand_side}_hand":
             raise ValueError("MANO hand differs from --hand-side")
         if "fps" in data and not np.isclose(float(data["fps"]), info["fps"], atol=0.01):
             raise ValueError(
-                "MANO FPS differs from color.mp4; frame alignment is unsafe"
+                "MANO FPS differs from RGB video; frame alignment is unsafe"
             )
         indices = data["frame_indices"]
         if indices.ndim != 1 or indices.dtype.kind not in "iu":
@@ -149,7 +161,7 @@ def load_geometry(
             or (indices < 0).any()
             or (indices >= int(info["frame_count"])).any()
         ):
-            raise ValueError("frame_indices must be unique and inside color.mp4")
+            raise ValueError("frame_indices must be unique and inside RGB video")
         count = len(indices)
         present = data["has_hand"]
         translations = np.asarray(data["camera_translation"], dtype=np.float64)
@@ -228,10 +240,24 @@ def load_geometry(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        parents=[dataset.build_parser()],
-        add_help=False,
-        conflict_handler="resolve",
-        description="Batch SAM3 video segmentation with text and MANO detector geometry.",
+        description=(
+            "Batch SAM3 video segmentation with text and MANO detector geometry. "
+            "With --list-only, also validate MANO files, projections and missing "
+            "frames, and list the video-to-MANO file mappings."
+        ),
+    )
+    add_video_arguments(
+        parser,
+        list_only_extra=(
+            "Also validate MANO files, projections and missing frames, "
+            "and list video-to-MANO file mappings."
+        ),
+    )
+    parser.add_argument(
+        "--text-prompt",
+        dest="prompt",
+        required=True,
+        help='Shared text prompt; use "" to disable text',
     )
     parser.add_argument("--version", choices=["sam3"], default="sam3")
     parser.add_argument("--hand-side", choices=["left", "right"], required=True)
@@ -250,21 +276,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     dataset.validate_gt_arguments(parser, args)
-    if not args.prompt.strip() or args.prompt == "visual":
-        parser.error("--prompt must be nonempty text, not the reserved value 'visual'")
+    args.prompt = args.prompt.strip()
+    if args.prompt == "visual":
+        parser.error(
+            "--text-prompt cannot be 'visual'; use an empty string for no text"
+        )
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     input_root = dataset.expand_path(args.input_root)
     output_root = dataset.expand_path(args.output_root)
-    if not input_root.is_dir() or input_root.resolve() == output_root.resolve():
-        LOGGER.error("Input root must exist and differ from output root")
+    try:
+        validate_input_output(input_root, output_root)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
         return 2
-    videos = dataset.discover_color_videos(input_root)
+    videos = discover_rgb_videos(input_root, args.rgb_name)
     if args.max_sequences is not None:
         videos = videos[: args.max_sequences]
     if not videos:
-        LOGGER.error("No color.mp4 found below %s", input_root)
+        LOGGER.error("No files named %s found below %s", args.rgb_name, input_root)
         return 2
     checkpoint = dataset.expand_path(args.checkpoint) if args.checkpoint else None
     if not args.list_only and checkpoint is not None and not checkpoint.is_file():

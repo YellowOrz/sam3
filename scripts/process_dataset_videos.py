@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run SAM 3/3.1 text-prompted video segmentation over color.mp4 sequences.
+"""Run SAM 3/3.1 text-prompted video segmentation over RGB video sequences.
 
-If the input directory directly contains ``color.mp4``, it is treated as one
-sequence. Otherwise, the input tree is searched recursively for files named exactly
-``color.mp4``. Each video is decoded to a temporary lossless PNG directory because
+The input root and all subdirectories are searched for ``--rgb-name``
+(default: ``color.mp4``). Input and output roots must differ.
+Each video is decoded to a temporary lossless PNG directory because
 the SAM 3 image-directory loader is substantially more memory efficient than its
 direct OpenCV video loader.
 
@@ -11,12 +11,15 @@ GT evaluation: append --compare-gt --gt-mask-name left_hand.mkv.
 GT directory defaults to masks_sam3; --compare-skip-frames defaults to 0.
 The GT filename must be explicit. Complete predictions can be evaluated on CPU.
 
+--list-only lists discovered input videos without loading the model, running
+segmentation or GT evaluation, or writing output files.
+
 Example:
     uv run python scripts/process_dataset_videos.py \
         --input-root ~/Datasets \
         --output-root ~/sam3_outputs \
         --version sam3.1 \
-        --prompt hand \
+        --text-prompt hand \
         --device cuda:2
 """
 
@@ -35,10 +38,11 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.common.compare_gt_masks import (
-        add_gt_arguments,
-        GTComparison,
-        validate_gt_arguments,
+    from scripts.common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from scripts.common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
     )
     from scripts.common.video_utils import (
         color_for_label,
@@ -46,17 +50,17 @@ if __package__:
         extract_png_frames,
         lighter_color,
         normalize_output_arrays,
-        parse_device,
         positive_int,
         probe_video as _probe_video,
         utc_now,
         write_json,
     )
 else:
-    from common.compare_gt_masks import (
-        add_gt_arguments,
-        GTComparison,
-        validate_gt_arguments,
+    from common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
     )
     from common.video_utils import (  # type: ignore[no-redef]
         color_for_label,
@@ -64,7 +68,6 @@ else:
         extract_png_frames,
         lighter_color,
         normalize_output_arrays,
-        parse_device,
         positive_int,
         probe_video as _probe_video,
         utc_now,
@@ -85,10 +88,7 @@ def discover_color_videos(input_root: Path) -> List[Path]:
     direct_video = input_root / "color.mp4"
     if direct_video.is_file():
         return [direct_video]
-    return sorted(
-        (path for path in input_root.rglob("color.mp4") if path.is_file()),
-        key=lambda path: path.relative_to(input_root).as_posix(),
-    )
+    return discover_rgb_videos(input_root, "color.mp4")
 
 
 def output_dir_for(video_path: Path, input_root: Path, output_root: Path) -> Path:
@@ -731,46 +731,14 @@ def run_sequences(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively process only color.mp4 files with a shared SAM 3/3.1 "
-            "text prompt."
+            "Recursively process RGB videos with a shared SAM 3/3.1 " "text prompt."
         )
     )
-    parser.add_argument("--input-root", default="~/Datasets")
-    parser.add_argument("--output-root", default="~/sam3_outputs")
+    add_video_arguments(parser)
     parser.add_argument("--version", default="sam3", choices=["sam3", "sam3.1"])
     parser.add_argument(
-        "--checkpoint",
-        default="~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt",
-        help="Checkpoint path (auto-downloads from HuggingFace if omitted)",
+        "--text-prompt", dest="prompt", required=True, help="Shared text prompt"
     )
-    parser.add_argument("--prompt", required=True, help="Shared text prompt")
-    parser.add_argument(
-        "--direction",
-        choices=["forward", "backward", "both"],
-        default="forward",
-        help=(
-            "Propagation/playback direction. 'both' writes independent results "
-            "below forward/ and backward/ (default: forward)"
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        type=parse_device,
-        default=("cuda:0", 0),
-        metavar="cuda:N",
-        help="CUDA device to use (default: cuda:0)",
-    )
-    parser.add_argument("--max-sequences", type=positive_int)
-    parser.add_argument("--max-frames", type=positive_int)
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Reprocess completed sequences"
-    )
-    parser.add_argument(
-        "--list-only",
-        action="store_true",
-        help="List discovered color videos without loading the model",
-    )
-    add_gt_arguments(parser)
     return parser
 
 
@@ -786,14 +754,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     output_root = expand_path(args.output_root)
     checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
 
-    if not input_root.is_dir():
-        LOGGER.error("Input root does not exist or is not a directory: %s", input_root)
+    try:
+        validate_input_output(input_root, output_root)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
         return 2
-    videos = discover_color_videos(input_root)
+    videos = discover_rgb_videos(input_root, args.rgb_name)
     if args.max_sequences is not None:
         videos = videos[: args.max_sequences]
     if not videos:
-        LOGGER.error("No files named color.mp4 found below %s", input_root)
+        LOGGER.error("No files named %s found below %s", args.rgb_name, input_root)
         return 2
 
     LOGGER.info("Discovered %d color video(s)", len(videos))

@@ -7,9 +7,9 @@ original SAM3 decoder once. The source banks are never updated by fused masks.
 
 Examples:
     python scripts/process_bidirectional_videos.py --input-root DATA \
-        --output-root OUT --prompt "left hand" --backward-mode physical
+        --output-root OUT --text-prompt "left hand" --backward-mode physical
     python scripts/process_bidirectional_videos.py --input-root DATA \
-        --output-root OUT --prompt "left hand" --chunk-frames 120 --context-frames 30
+        --output-root OUT --text-prompt "left hand" --chunk-frames 120 --context-frames 30
 
 chunk-frames=0 processes the full sequence. Otherwise each independent window
 contains a unique output core and optional context on either side. Outputs are
@@ -1117,7 +1117,7 @@ def build_parser():
     )
     parser.add_argument("--input-root", required=True)
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--text-prompt", dest="prompt", required=True)
     parser.add_argument(
         "--version", choices=["sam3"], default="sam3", help="新融合路径仅支持基础 SAM3"
     )

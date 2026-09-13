@@ -221,7 +221,7 @@ def main():
         help="Path to checkpoint (auto-downloads from HuggingFace if not provided)",
     )
     parser.add_argument(
-        "--text_prompt", type=str, default="circle", help="Text prompt for detection"
+        "--text-prompt", type=str, default="circle", help="Text prompt for detection"
     )
     parser.add_argument(
         "--n_frames", type=int, default=30, help="Number of frames for synthetic video"

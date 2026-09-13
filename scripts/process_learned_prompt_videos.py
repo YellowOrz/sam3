@@ -31,7 +31,8 @@
         重新推理并覆盖已有预测；默认复用目标、方向及帧数匹配的完整预测。
         更换同一目标的特征或权重后，应使用此参数或更换输出目录。
     --list-only
-        仅列出发现的视频相对路径，不加载模型，不要求特征文件或权重存在。
+        仅列出发现的输入视频，不加载模型、不执行分割或 GT 评测、不写结果文件。
+        不要求特征文件或权重存在。
     --compare-gt
         启用 GT 对比；默认关闭。完整预测可直接补做对比，无需加载模型或
         使用 CUDA，但仍需提供有效的特征文件与 checkpoint 路径。
@@ -84,13 +85,13 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 if __package__:
-    from scripts.common.compare_gt_masks import (
-        add_gt_arguments,
-        file_name,
-        GTComparison,
-        validate_gt_arguments,
+    from scripts.common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from scripts.common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
     )
-    from scripts.common.video_utils import expand_path, parse_device, positive_int
+    from scripts.common.video_utils import expand_path
     from scripts.process_dataset_videos import (
         directional_output_dir,
         expected_frame_count,
@@ -102,13 +103,13 @@ if __package__:
         require_cuda,
     )
 else:
-    from common.compare_gt_masks import (
-        add_gt_arguments,
-        file_name,
-        GTComparison,
-        validate_gt_arguments,
+    from common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from common.video_cli import (
+        add_video_arguments,
+        discover_rgb_videos,
+        validate_input_output,
     )
-    from common.video_utils import expand_path, parse_device, positive_int
+    from common.video_utils import expand_path
     from process_dataset_videos import (  # type: ignore[no-redef]
         directional_output_dir,
         expected_frame_count,
@@ -141,14 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
             "target feature file (no text encoder)."
         )
     )
-    parser.add_argument("--input-root", default="~/Datasets")
-    parser.add_argument("--rgb-name", type=file_name, default="color.mp4")
-    add_gt_arguments(parser)
-    parser.add_argument("--output-root", default="~/sam3_learned_outputs")
-    parser.add_argument(
-        "--checkpoint",
-        default="~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt",
-        help="Base SAM 3 checkpoint; must match the feature file SHA-256",
+    add_video_arguments(
+        parser,
+        output_root="~/sam3_learned_outputs",
+        checkpoint_help="Base SAM 3 checkpoint; must match the feature file SHA-256",
     )
     parser.add_argument(
         "--learned-prompt",
@@ -157,32 +154,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-id",
         help="Must match the feature file; defaults to the ID stored in the file",
-    )
-    parser.add_argument(
-        "--direction",
-        choices=["forward", "backward", "both"],
-        default="forward",
-        help=(
-            "Propagation/playback direction. 'both' writes independent results "
-            "below forward/ and backward/ (default: forward)"
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        type=parse_device,
-        default=("cuda:0", 0),
-        metavar="cuda:N",
-        help="CUDA device to use (default: cuda:0)",
-    )
-    parser.add_argument("--max-sequences", type=positive_int)
-    parser.add_argument("--max-frames", type=positive_int)
-    parser.add_argument(
-        "--overwrite", action="store_true", help="Reprocess completed sequences"
-    )
-    parser.add_argument(
-        "--list-only",
-        action="store_true",
-        help="List discovered RGB videos without loading the model",
     )
     return parser
 
@@ -200,10 +171,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     checkpoint = expand_path(args.checkpoint)
     device_name, device_index = args.device
 
-    if not input_root.is_dir():
-        LOGGER.error("Input root does not exist or is not a directory: %s", input_root)
+    try:
+        validate_input_output(input_root, output_root)
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
         return 2
-    videos = sorted(path for path in input_root.rglob(args.rgb_name) if path.is_file())
+    videos = discover_rgb_videos(input_root, args.rgb_name)
     if args.max_sequences is not None:
         videos = videos[: args.max_sequences]
     if not videos:

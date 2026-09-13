@@ -10,7 +10,7 @@
         --version sam3 \
         --checkpoint ~/.cache/modelscope/models/facebook--sam3/snapshots/master/sam3.pt \
         --video /path/to/color.mp4 \
-        --text_prompt "human hand" \
+        --text-prompt "human hand" \
         --device cuda:0 \
         --checkpoint-interval 20 \
         --chunk-frames 500 \
@@ -2864,7 +2864,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", help="Checkpoint path (auto-downloads if omitted)"
     )
     parser.add_argument(
-        "--text_prompt", default="circle", help="Text prompt for detection"
+        "--text-prompt", default="circle", help="Text prompt for detection"
     )
     parser.add_argument(
         "--device",
