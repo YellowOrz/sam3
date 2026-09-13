@@ -46,7 +46,7 @@ python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.y
 
 这是独立训练入口，复用原有数据、变换、collator、实例匹配及 loss，不改变原 Trainer 和优化器的默认规则。`device` 写一张卡（如 `cuda:1`）时单进程训练；写成 `cuda:1,2,3` 时会在这些物理 GPU 上自动 DDP，每卡 `batch_size` 仍为配置值。图像缩放到基础 SAM3 的 1008 分辨率。损失包括 mask focal、Dice、框、分类和 presence；具体权重在 YAML 中可调。负样本通过原生 presence 损失监督目标不存在。
 
-优化器只有当前目标的特征参数。训练保留检测器的训练输出和匹配逻辑，视觉塔及显式 Dropout/BatchNorm 模块设为 eval。视觉塔在 `no_grad` 下前向：它没有可训练参数，且 ViT MLP 的融合核不可微；检测器与分割头仍走梯度，以便更新学习特征。验证使用 eval 模式和相同 GT 损失，记录的是验证损失，不是分割准确率或视频遮挡指标。
+优化器只有当前目标的特征参数。训练保留检测器的训练输出和匹配逻辑，视觉塔及显式 Dropout/BatchNorm 模块设为 eval。视觉塔在 `no_grad` 下前向：它没有可训练参数，且 ViT MLP 的融合核不可微；检测器与分割头仍走梯度，以便更新学习特征。验证使用 eval 模式和相同 GT 损失，同时记录分类 F1 和目标存在判断准确率；这些指标不代表像素级分割准确率或视频遮挡效果。
 
 输出：
 
@@ -56,7 +56,58 @@ python -m sam3.train.learned_prompt --config sam3/train/configs/learned_prompt.y
 - `config.yaml`、`metrics.jsonl`：运行配置和逐轮训练／验证损失。
 - `tensorboard/`：训练时每 `tensorboard_interval` 个 batch 写入 running train loss，每个 epoch 结束再写入全局聚合的 `train/*` 和 `val/*`。查看：`tensorboard --logdir outputs/learned_right_hand/tensorboard`。
 
-TensorBoard 的 Images 页签中，`val/images/*` 按从左到右展示原图、GT 掩码叠加、预测掩码叠加（绿色，多个目标实例取并集）。图像使用验证输入的 1008 × 1008 尺寸，仅主进程写入，step 与该轮 loss 使用同一累计训练步数。YAML 中 `val_visualization_interval: 1` 表示每轮可视化，设为 n 则在第 n、2n…轮写入；`val_visualization_max_images: 8` 固定记录验证集前 8 张，设为 0 关闭；`val_visualization_threshold: 0.5` 为预测置信度阈值，沿用推理中的分类概率乘 presence 概率，掩码缩放后按概率 > 0.5 二值化。空 GT 或无预测时，对应面板保留原图。没有验证集时不写图像，验证 loss 仍按原有频率记录。
+**TensorBoard：记录频率与横轴**
+
+在 Scalars 页签查看 `train/<名称>` 和 `val/<名称>`。横轴 step 是累计训练 batch 数（每次优化器更新加 1），不是 epoch 或图片数；验证不增加 step，恢复训练时沿用保存的 step。
+
+- 训练中每 `tensorboard_interval` 个 batch（默认 100）记录一次本轮开始至当前的样本数加权平均，不是最近 100 个 batch 的滑动平均。多卡时这些中途点只反映主进程的数据。
+- 每轮结束在同一组 `train/*` tag 写入整轮统计，并写入 `val/*`；各 batch 的返回值先乘该 batch 图片数，累计后除以总图片数，多卡会汇总所有进程。验证集当前在每个进程完整遍历，汇总包含重复验证样本。
+- `metrics.jsonl` 保存同一份逐轮统计。未配置验证集时没有 `val/*`；图像记录间隔不影响每轮验证标量的记录。
+
+**Loss：越低越好**
+
+下面名称均可加 `train/` 或 `val/` 前缀。各分项记录的是未乘 YAML 对应权重的值（`_o2m` 的额外缩放见后文），权重用于组成 `core_loss`。
+
+| 名称 | 含义 | YAML 权重（当前配置） |
+| --- | --- | --- |
+| `core_loss` | 实际反向传播的总损失，合并主输出及存在的辅助／一对多分支；`best.pt` 按 `val/core_loss` 最小值保存。 | 各项加权求和后，另乘当前 find batch 大小的平方根。 |
+| `loss_mask` | 匹配实例的像素级 sigmoid focal loss，监督前景／背景，当前使用 alpha=0.25、gamma=2。 | `loss.mask: 20.0` |
+| `loss_dice` | 匹配实例的 soft Dice loss，衡量预测概率掩码与 GT 的重叠；不是二值化后的 Dice 指标。 | `loss.dice: 1.0` |
+| `loss_bbox` | 匹配预测框与 GT 框的归一化中心坐标及宽高的 L1 误差。 | `loss.box: 5.0` |
+| `loss_giou` | 匹配框的 `1 − GIoU`，监督框的重叠和几何位置；不是掩码 IoU。 | `loss.giou: 2.0` |
+| `loss_ce` | 检测 query 的 IoU-aware 二分类损失：匹配正例使用由分类概率和框 IoU 构造的软标签，未匹配 query 为负例。无目标图片上的这项损失被屏蔽。 | `loss.classification: 20.0` |
+| `presence_loss` | 图片中是否存在有效目标的损失；当前 alpha=0.5、gamma=0，相当于缩放后的二元交叉熵。没有目标的负样本主要由此监督。 | `loss.presence: 20.0` |
+
+框和掩码损失按本 batch 的 GT 实例数归一化（分母至少为 1）。不同分项尺度和权重不同，不宜只凭曲线数值大小判断哪项更重要；`core_loss` 包含辅助分支和 batch 缩放，也不等于面板中六个主分项直接相加。训练与验证输出分支可能不同，应优先比较各自随训练的趋势。
+
+**指标：越高越好，但不等于分割质量**
+
+| 名称 | 含义与解读 |
+| --- | --- |
+| `ce_f1` | 将检测 query 分类概率按默认 0.5 阈值二值化，与实例匹配得到的正负标签比较，计算 `2TP / (2TP + FP + FN)`。使用分类概率本身，不乘 presence；不是像素 F1，也不是最终推理结果的实例评测。 |
+| `presence_dec_acc` | 将 presence 概率按 `> 0.5` 判为存在目标，与 GT 是否有有效目标比较，记录正确比例。负样本较多时，仅预测不存在也可能取得较高准确率，需结合图像检查。 |
+
+以上无后缀指标通常在 0–1 范围内，不参与 `core_loss` 加权。记录值是 batch 指标的样本数加权平均；尤其 `ce_f1` 并未先汇总全数据集 TP/FP/FN 再计算。当前入口不记录像素 IoU、像素 Dice、mAP、视频跟踪或遮挡恢复指标；视频 IoU/Dice 请使用第 4 节的 GT 对比流程。
+
+**名称后缀：同一项来自哪个输出分支**
+
+- 无后缀：最终主输出。
+- `_aux_0`、`_aux_1` 等：中间 decoder 层的辅助输出，编号从 0 开始；`_fs` 表示 first-stage 输出（模型提供时才有）。当前 mask loss 不对辅助输出计算，因此不一定有对应的 mask／Dice 曲线。
+- `_o2m`：一对多分支，允许一个 GT 匹配多个预测；可与前面的后缀组合，例如 `loss_ce_aux_0_o2m`。当前 wrapper 对该分支返回的所有值统一乘 `2.0`，包括 `ce_f1_o2m` 等诊断指标，因此这类 F1／准确率可能超过 1，不能直接当作比例或百分比。缺少 presence 输出的分支会记录为 0，不能据此判断 presence 学习失败。
+
+具体 tag 随训练／验证实际提供的输出分支而定，不保证两侧完全一致。
+
+**Images：原图、GT 与预测对照**
+
+Images 页签的 `val/images/000`、`val/images/001` 等对应固定的验证集前 N 张图。每张记录从左到右是原图、GT 掩码叠加、预测掩码叠加；每个面板为验证输入的 1008 × 1008，整张三联图为 3024 × 1008。GT 和预测均将当前目标的多个实例取并集，再用 50% 透明度的绿色叠加，因此无法区分实例 ID。空 GT 或无保留预测时，对应面板保留原图。
+
+| YAML 配置 | 作用 |
+| --- | --- |
+| `val_visualization_interval: 1` | 每轮写图；设为 n 则在第 n、2n…轮写入。 |
+| `val_visualization_max_images: 8` | 最多记录固定的验证集前 8 张；设为 0 关闭图像记录。 |
+| `val_visualization_threshold: 0.5` | 保留 `sigmoid(pred_logits) × sigmoid(presence_logit_dec) > 阈值` 的预测实例；仅影响可视化，不改变 loss 或上述指标。 |
+
+保留实例的 mask logits 先双线性缩放到面板大小，再 sigmoid，并按概率 `> 0.5` 二值化，最后取并集。图像仅主进程写入，step 与该轮标量相同；没有验证集时不写图像。看图时重点比较漏分、误分和边界偏差；固定少量样本只能用于定性检查，不能代表全验证集质量。
 
 恢复训练时，`epochs` 是希望达到的总轮数。恢复会沿用保存的优化器状态和学习率；如需新的学习率重新微调，可将 `initial_feature` 设为训练后的特征，使用新的输出目录，不传 `--resume`。
 

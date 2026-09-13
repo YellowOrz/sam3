@@ -73,6 +73,21 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
     @torch.inference_mode()
     def handle_request(self, request):
+        if request["type"] == "add_geometry_prompts":
+            if not isinstance(request["geometry_prompts"], dict):
+                raise ValueError("geometry_prompts must map frame indices to prompts")
+            if hasattr(self.model.detector.backbone, "learned_prompt"):
+                raise ValueError("detector geometry requires the text backbone")
+            session = self._get_session(request["session_id"])
+            self._extend_expiration_time(session)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                frame_idx, outputs = self.model.add_prompt(
+                    inference_state=session["state"],
+                    frame_idx=request["frame_index"],
+                    text_str=request["text"],
+                    geometry_prompts=request["geometry_prompts"],
+                )
+            return {"frame_index": frame_idx, "outputs": outputs}
         if request["type"] == "add_learned_prompt":
             prompt = getattr(self.model.detector.backbone, "learned_prompt", None)
             if prompt is None:

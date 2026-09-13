@@ -688,9 +688,9 @@ class Sam3Image(torch.nn.Module):
             inference_state["original_heights"],
             inference_state["original_widths"],
         )
-        assert batch_size == len(orig_heights) == len(orig_widths), (
-            f"Batch size mismatch in predict_inst_batch. Got {batch_size}, {len(orig_heights)}, {len(orig_widths)}"
-        )
+        assert (
+            batch_size == len(orig_heights) == len(orig_widths)
+        ), f"Batch size mismatch in predict_inst_batch. Got {batch_size}, {len(orig_heights)}, {len(orig_widths)}"
         feats = [
             feat.permute(1, 2, 0).view(batch_size, -1, *feat_size)
             for feat, feat_size in zip(
@@ -743,6 +743,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         run_nms: bool = False,
         nms_prob_thresh: Optional[float] = None,
         nms_iou_thresh: Optional[float] = None,
+        per_frame_geometric_prompts: Optional[List[Prompt]] = None,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
         """
@@ -760,6 +761,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                     backbone_out=backbone_out,
                     find_inputs=find_inputs,
                     geometric_prompt=geometric_prompt,
+                    per_frame_geometric_prompts=per_frame_geometric_prompts,
                     frame_idx_begin=frame_idx_curr_b,
                     frame_idx_end=frame_idx_curr_e,
                     num_frames=num_frames,
@@ -808,6 +810,7 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                     backbone_out=backbone_out,
                     find_inputs=find_inputs,
                     geometric_prompt=geometric_prompt,
+                    per_frame_geometric_prompts=per_frame_geometric_prompts,
                     frame_idx_begin=frame_idx_next_b,
                     frame_idx_end=frame_idx_next_e,
                     num_frames=num_frames,
@@ -831,10 +834,13 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         run_nms=False,
         nms_prob_thresh=None,
         nms_iou_thresh=None,
+        per_frame_geometric_prompts: Optional[List[Prompt]] = None,
     ):
         """Compute detection outputs on a chunk of frames and store their results in multigpu_buffer."""
         # each GPU computes detections on one frame in the chunk (in a round-robin manner)
         frame_idx_local_gpu = min(frame_idx_begin + self.rank, frame_idx_end - 1)
+        if per_frame_geometric_prompts is not None:
+            geometric_prompt = per_frame_geometric_prompts[frame_idx_local_gpu]
         # `forward_grounding` (from base class `Sam3ImageOnVideo`) runs the detector on a single frame
         with torch.profiler.record_function("forward_grounding"):
             out_local = self.forward_grounding(

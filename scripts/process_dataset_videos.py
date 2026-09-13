@@ -114,6 +114,7 @@ def is_complete(
     model_version: str,
     expected_frames: int,
     direction: str,
+    extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
@@ -131,6 +132,9 @@ def is_complete(
         and metadata.get("model_version") == model_version
         and metadata.get("propagation_direction", "forward") == direction
         and metadata.get("frames_processed") == expected_frames
+        and all(
+            metadata.get(key) == value for key, value in (extra_metadata or {}).items()
+        )
         and result_path.is_file()
         and masks_path.is_file()
     ):
@@ -280,6 +284,7 @@ def write_frame_outputs(
     outputs: Dict[str, Any],
     object_to_label: Dict[int, int],
     prompt: str,
+    geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> None:
     frame_path = frame_dir / f"{frame_index:06d}.png"
     frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
@@ -288,6 +293,23 @@ def write_frame_outputs(
     label_image, overlay = build_label_and_overlay(
         frame, outputs, object_to_label, frame_index, prompt
     )
+    geometry = (geometry_prompts or {}).get(frame_index, {})
+    height, width = frame.shape[:2]
+    for x, y in geometry.get("points", []):
+        center = (min(width - 1, round(x * width)), min(height - 1, round(y * height)))
+        cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
+    for x, y, w, h in geometry.get("boxes", []):
+        cv2.rectangle(
+            overlay,
+            (round(x * width), round(y * height)),
+            (
+                min(width - 1, round((x + w) * width)),
+                min(height - 1, round((y + h) * height)),
+            ),
+            (255, 255, 0),
+            2,
+        )
     mask_writer.write(label_image)
     result_writer.write(overlay)
 
@@ -304,6 +326,7 @@ def propagate_and_write(
     fps: float,
     prompt: str,
     direction: str,
+    geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[int, int]:
     result_fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     result_writer = cv2.VideoWriter(
@@ -370,6 +393,7 @@ def propagate_and_write(
                                 outputs,
                                 object_to_label,
                                 prompt,
+                                geometry_prompts,
                             )
                     else:
                         write_frame_outputs(
@@ -380,6 +404,7 @@ def propagate_and_write(
                             empty_outputs(),
                             object_to_label,
                             prompt,
+                            geometry_prompts,
                         )
         else:
             next_frame_index = 0
@@ -401,6 +426,7 @@ def propagate_and_write(
                         empty_outputs(),
                         object_to_label,
                         prompt,
+                        geometry_prompts,
                     )
                     next_frame_index += 1
                 write_frame_outputs(
@@ -411,6 +437,7 @@ def propagate_and_write(
                     response.get("outputs", empty_outputs()),
                     object_to_label,
                     prompt,
+                    geometry_prompts,
                 )
                 next_frame_index = frame_index + 1
 
@@ -423,6 +450,7 @@ def propagate_and_write(
                     empty_outputs(),
                     object_to_label,
                     prompt,
+                    geometry_prompts,
                 )
                 next_frame_index += 1
     finally:
@@ -466,6 +494,7 @@ def process_video(
     direction: str,
     prompt_request_type: str = "text",
     extra_metadata: Optional[Dict[str, Any]] = None,
+    geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> str:
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
@@ -476,6 +505,7 @@ def process_video(
         model_version,
         requested_frames,
         direction,
+        extra_metadata if geometry_prompts is not None else None,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -514,14 +544,17 @@ def process_video(
                 }
             )
             session_id = session_response["session_id"]
-            predictor.handle_request(
-                add_prompt_request(
-                    session_id,
-                    0 if direction == "forward" else frame_count - 1,
-                    prompt,
-                    prompt_request_type,
-                )
+            request = add_prompt_request(
+                session_id,
+                0 if direction == "forward" else frame_count - 1,
+                prompt,
+                prompt_request_type,
             )
+            if geometry_prompts is not None:
+                request.update(
+                    type="add_geometry_prompts", geometry_prompts=geometry_prompts
+                )
+            predictor.handle_request(request)
             object_to_label = propagate_and_write(
                 predictor=predictor,
                 session_id=session_id,
@@ -534,6 +567,7 @@ def process_video(
                 fps=float(video_info["fps"]),
                 prompt=prompt,
                 direction=direction,
+                geometry_prompts=geometry_prompts,
             )
 
         metadata.update(

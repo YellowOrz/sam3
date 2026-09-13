@@ -162,6 +162,34 @@ output = response["outputs"]
 
 ## Examples
 
+### MANO-guided video segmentation (SAM3)
+
+[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using a required text prompt plus MANO detector geometry. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-name` when that directory contains multiple files. Check inputs first:
+
+```bash
+python scripts/process_mano_prompt_videos.py \
+    --input-root DATA --output-root OUT \
+    --prompt "left hand" --hand-side left --prompt-mode both \
+    --checkpoint /path/to/sam3.pt --device cuda:0 --list-only
+```
+
+Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` displays the actual points and boxes, and `masks.mkv` stores lossless instance labels. The script's Chinese header documents every option and TODO, including SAM3.1, visibility filtering, and matching multiple MANO files.
+
+The SAM3 video predictor also accepts `add_geometry_prompts`, with required `text`, an anchor `frame_index`, and a `geometry_prompts` dictionary keyed by integer frame indices:
+
+```python
+video_predictor.handle_request(dict(
+    type="add_geometry_prompts", session_id=session_id, frame_index=0,
+    text="left hand",
+    geometry_prompts={
+        0: {"points": [[0.4, 0.5]], "boxes": [[0.2, 0.3, 0.4, 0.5]]},
+        2: {"points": [[0.45, 0.55]]},
+    },
+))
+```
+
+Points are normalized `(x, y)` and boxes are normalized `(x, y, width, height)`; all labels are positive. This request resets the session once, installs all frame prompts, and computes the anchor. Then use ordinary `propagate_in_video`. Geometry is selected by the destination frame even during detector prefetch. These are detector prompts; the existing `add_prompt` point interface retains its object-level tracker behavior.
+
 ### Zero-training bidirectional hand segmentation
 
 The research script uses independent forward/backward SAM3 memory banks and a

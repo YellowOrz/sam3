@@ -945,6 +945,46 @@ class Sam3VideoInference(Sam3VideoBase):
         self._warm_up_complete = True
         self.tracker.transformer.encoder.forward.set_logging(True)
 
+    def _prepare_geometry_prompts(self, prompts: dict, num_frames: int) -> dict:
+        """Validate normalized detector points/xywh boxes before resetting a session."""
+        if not isinstance(prompts, dict):
+            raise ValueError("geometry_prompts must map frame indices to prompts")
+        prepared = {}
+        for frame_idx, data in prompts.items():
+            if type(frame_idx) is not int or not 0 <= frame_idx < num_frames:
+                raise ValueError(f"invalid geometry frame index: {frame_idx!r}")
+            if not isinstance(data, dict) or set(data) - {"points", "boxes"}:
+                raise ValueError("geometry entries accept only points and boxes")
+            kwargs = {}
+            for key, size, embedding in (
+                ("points", 2, "point_embeddings"),
+                ("boxes", 4, "box_embeddings"),
+            ):
+                if key not in data:
+                    continue
+                values = torch.as_tensor(data[key], dtype=torch.float32)
+                if values.ndim != 2 or values.shape[1] != size or not len(values):
+                    raise ValueError(f"{key} must have nonempty shape (N, {size})")
+                if not torch.isfinite(values).all() or not (
+                    (values >= 0).all() and (values <= 1).all()
+                ):
+                    raise ValueError(f"{key} must be finite and normalized to [0, 1]")
+                if key == "boxes":
+                    if (
+                        not (values[:, 2:] > 0).all()
+                        or not (values[:, :2] + values[:, 2:] <= 1 + 1e-6).all()
+                    ):
+                        raise ValueError(
+                            "boxes must have positive area inside the image"
+                        )
+                    values = box_xywh_to_cxcywh(values)
+                kwargs[embedding] = values[:, None].to(self.device)
+            if not kwargs:
+                raise ValueError("each geometry entry needs points or boxes")
+            # Prompt defaults all labels to positive; no visual-exemplar conversion.
+            prepared[frame_idx] = Prompt(**kwargs)
+        return prepared
+
     @torch.inference_mode()
     def add_prompt(
         self,
@@ -953,11 +993,13 @@ class Sam3VideoInference(Sam3VideoBase):
         text_str=None,
         boxes_xywh=None,
         box_labels=None,
+        geometry_prompts=None,
     ):
         """! @brief 写入提示并只计算提示帧，作为后续时序传播的锚点。
 
         @param text_str 全视频共享的语义文本；``visual`` 表示只使用视觉框提示。
         @param boxes_xywh 归一化 ``xywh`` 框，可作为视觉提示或几何细化提示。
+        @param geometry_prompts 可选逐帧正点/正框字典，与文本共同进入 detector；一次写入整段视频，随后传播不再重置 memory。
         @return ``(frame_idx, outputs)``，其中 ``outputs`` 是提示帧的即时结果。
 
         每次添加语义提示都会重置旧状态：文本语义定义的是一次新的开放词汇检索；
@@ -972,6 +1014,20 @@ class Sam3VideoInference(Sam3VideoBase):
         assert (
             0 <= frame_idx < num_frames
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
+
+        prepared_geometry = None
+        if geometry_prompts is not None:
+            if (
+                not isinstance(text_str, str)
+                or not text_str.strip()
+                or text_str == "visual"
+            ):
+                raise ValueError("detector geometry requires a nonempty text prompt")
+            if boxes_xywh is not None or box_labels is not None:
+                raise ValueError("put detector boxes inside geometry_prompts")
+            prepared_geometry = self._prepare_geometry_prompts(
+                geometry_prompts, num_frames
+            )
 
         # SAM 3 的文本提示是全视频条件，替换它必须丢弃旧的检测和 mask memory。
         self.reset_state(inference_state)
@@ -1011,6 +1067,16 @@ class Sam3VideoInference(Sam3VideoBase):
             )
 
             inference_state["per_frame_geometric_prompt"][frame_idx] = geometric_prompt
+
+        if prepared_geometry is not None:
+            for t, geometry in prepared_geometry.items():
+                inference_state["per_frame_geometric_prompt"][t] = geometry
+            # Prefetch must use the geometry belonging to the frame being computed.
+            empty = inference_state["constants"]["empty_geometric_prompt"]
+            inference_state["feature_cache"]["per_frame_geometric_prompts"] = [
+                geometry if geometry is not None else empty
+                for geometry in inference_state["per_frame_geometric_prompt"]
+            ]
 
         out = self._run_single_frame_inference(
             inference_state, frame_idx, reverse=False
@@ -1507,6 +1573,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         point_labels=None,
         obj_id=None,
         rel_coordinates=True,
+        geometry_prompts=None,
     ):
         """! @brief 分派语义/框提示或对象级点提示。
 
@@ -1518,6 +1585,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         一个明确对象，后续可进行局部 tracker 传播。
         """
         if points is not None:
+            if geometry_prompts is not None:
+                raise ValueError(
+                    "tracker points cannot be mixed with detector geometry"
+                )
             # 点属于给定对象的条件信息，不能与会重置全局语义状态的文本/框混用。
             assert (
                 text_str is None and boxes_xywh is None
@@ -1542,6 +1613,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 text_str=text_str,
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
+                geometry_prompts=geometry_prompts,
             )
 
     @torch.inference_mode()
