@@ -51,7 +51,7 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.video_utils import (
+    from scripts.common.video_utils import (
         color_for_label,
         expand_path,
         extract_png_frames,
@@ -64,7 +64,7 @@ if __package__:
         write_json,
     )
 else:  # Direct execution adds scripts/, not the repo root.
-    from video_utils import (  # type: ignore[no-redef]
+    from common.video_utils import (  # type: ignore[no-redef]
         color_for_label,
         expand_path,
         extract_png_frames,

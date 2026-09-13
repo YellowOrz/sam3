@@ -175,6 +175,21 @@ python scripts/process_mano_prompt_videos.py \
 
 Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` displays the actual points and boxes, and `masks.mkv` stores lossless instance labels. The script's Chinese header documents every option and TODO, including SAM3.1, visibility filtering, and matching multiple MANO files.
 
+### GT evaluation for video scripts
+
+`process_learned_prompt_videos.py`, `process_mano_prompt_videos.py`, and `process_dataset_videos.py` share the same GT options. Append these to any of their normal commands:
+
+```bash
+--compare-gt --gt-dir-name masks_sam3 --gt-mask-name left_hand.mkv --compare-skip-frames 2
+```
+
+Evaluation is off by default. With `--compare-gt`, `--gt-mask-name` is required for all three scripts; it is never inferred from the text prompt, learned target ID, or hand side. GT is read from `<RGB video directory>/<gt-dir-name>/<gt-mask-name>`; the directory defaults to `masks_sam3`. Both names must be single names, not paths or globs. `--compare-skip-frames` defaults to 0; 2 evaluates frames 0, 3, 6, … without changing inference.
+
+GT must be an aligned uint8 grayscale label video matching the full RGB dimensions, FPS, and frame count. All nonzero labels form one foreground mask. Each prediction directory gains `comparison.mp4` (RGB / prediction / GT), `gt_metrics.csv`, and `gt_metrics.json`; the output root gains `gt_summary.json`, with separate forward/backward metrics. IoU and Dice include frame means and aggregate pixel scores. Both masks empty scores 1; no successful frames yields null metrics. MANO's existing `batch_summary.json` is also retained.
+
+Complete predictions can be evaluated again without loading a model or requiring CUDA. Existing input checks still apply: checkpoint paths must exist, learned prompts must be valid, and MANO inputs/configuration must match cached metadata. Comparisons are regenerated each run; `--overwrite` also reruns inference. Invalid or missing GT records a failure, clears stale comparison video/CSV, preserves predictions, and allows remaining sequences to run; the command exits nonzero. See [the evaluation details](docs/learned_prompt_training.md) for sampling and metric aggregation.
+
+
 The SAM3 video predictor also accepts `add_geometry_prompts`, with required `text`, an anchor `frame_index`, and a `geometry_prompts` dictionary keyed by integer frame indices:
 
 ```python

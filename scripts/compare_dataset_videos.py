@@ -26,9 +26,9 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.video_utils import expand_path
+    from scripts.common.video_utils import expand_path
 else:
-    from video_utils import expand_path  # type: ignore[no-redef]
+    from common.video_utils import expand_path  # type: ignore[no-redef]
 
 
 LOGGER = logging.getLogger("sam3_video_comparison")

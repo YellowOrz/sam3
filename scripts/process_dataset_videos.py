@@ -7,6 +7,10 @@ sequence. Otherwise, the input tree is searched recursively for files named exac
 the SAM 3 image-directory loader is substantially more memory efficient than its
 direct OpenCV video loader.
 
+GT evaluation: append --compare-gt --gt-mask-name left_hand.mkv.
+GT directory defaults to masks_sam3; --compare-skip-frames defaults to 0.
+The GT filename must be explicit. Complete predictions can be evaluated on CPU.
+
 Example:
     uv run python scripts/process_dataset_videos.py \
         --input-root ~/Datasets \
@@ -23,14 +27,20 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 if __package__:
-    from scripts.video_utils import (
+    from scripts.common.compare_gt_masks import (
+        add_gt_arguments,
+        GTComparison,
+        validate_gt_arguments,
+    )
+    from scripts.common.video_utils import (
         color_for_label,
         expand_path,
         extract_png_frames,
@@ -43,7 +53,12 @@ if __package__:
         write_json,
     )
 else:
-    from video_utils import (  # type: ignore[no-redef]
+    from common.compare_gt_masks import (
+        add_gt_arguments,
+        GTComparison,
+        validate_gt_arguments,
+    )
+    from common.video_utils import (  # type: ignore[no-redef]
         color_for_label,
         expand_path,
         extract_png_frames,
@@ -495,6 +510,7 @@ def process_video(
     prompt_request_type: str = "text",
     extra_metadata: Optional[Dict[str, Any]] = None,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    predictor_factory: Optional[Callable[[], Any]] = None,
 ) -> str:
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
@@ -509,6 +525,9 @@ def process_video(
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
+
+    if predictor_factory is not None:
+        predictor = predictor_factory()
 
     masks_path, result_path, metadata_path = prepare_output_dir(output_dir)
     relative_video = video_path.relative_to(input_root).as_posix()
@@ -631,6 +650,34 @@ def require_cuda(device_name: str, device_index: int) -> bool:
     return True
 
 
+@contextmanager
+def lazy_predictor(args: argparse.Namespace) -> Iterator[Callable[[], Any]]:
+    """Load once, only when an incomplete sequence needs inference."""
+    predictor = None
+
+    def get_predictor() -> Any:
+        nonlocal predictor
+        if predictor is None:
+            if not require_cuda(*args.device):
+                raise RuntimeError("CUDA is required for video inference")
+            from sam3 import build_sam3_predictor
+
+            kwargs = dict(
+                version=args.version, compile=False, async_loading_frames=True
+            )
+            if args.checkpoint:
+                kwargs["checkpoint_path"] = str(expand_path(args.checkpoint))
+            LOGGER.info("Loading %s on %s", args.version, args.device[0])
+            predictor = build_sam3_predictor(**kwargs)
+        return predictor
+
+    try:
+        yield get_predictor
+    finally:
+        if predictor is not None:
+            predictor.shutdown()
+
+
 def run_sequences(
     predictor: Any,
     videos: List[Path],
@@ -643,6 +690,8 @@ def run_sequences(
     requested_direction: str,
     prompt_request_type: str = "text",
     extra_metadata: Optional[Dict[str, Any]] = None,
+    comparison: Optional[GTComparison] = None,
+    predictor_factory: Optional[Callable[[], Any]] = None,
 ) -> Dict[str, int]:
     counts = {"success": 0, "skipped": 0, "failed": 0}
     directions = processing_directions(requested_direction)
@@ -666,11 +715,16 @@ def run_sequences(
                     direction=direction,
                     prompt_request_type=prompt_request_type,
                     extra_metadata=extra_metadata,
+                    predictor_factory=predictor_factory,
                 )
+                if comparison is not None:
+                    comparison.compare(video_path, output_dir, direction)
                 counts[status] += 1
-            except Exception:
+            except Exception as exc:
                 counts["failed"] += 1
                 LOGGER.exception("Sequence failed (%s): %s", direction, video_path)
+                if comparison is not None:
+                    comparison.record_failure(video_path, output_dir, direction, exc)
     return counts
 
 
@@ -716,11 +770,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List discovered color videos without loading the model",
     )
+    add_gt_arguments(parser)
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_gt_arguments(parser, args)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -728,7 +785,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     input_root = expand_path(args.input_root)
     output_root = expand_path(args.output_root)
     checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
-    device_name, device_index = args.device
 
     if not input_root.is_dir():
         LOGGER.error("Input root does not exist or is not a directory: %s", input_root)
@@ -749,25 +805,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.error("Checkpoint does not exist: %s", checkpoint)
         return 2
 
-    if not require_cuda(device_name, device_index):
-        return 2
-    checkpoint_description = str(checkpoint) if checkpoint else "HuggingFace"
-    LOGGER.info(
-        "Loading %s on %s from %s",
-        args.version,
-        device_name,
-        checkpoint_description,
-    )
-
-    from sam3 import build_sam3_predictor
-
-    build_kwargs = dict(version=args.version, compile=False, async_loading_frames=True)
-    if checkpoint is not None:
-        build_kwargs["checkpoint_path"] = str(checkpoint)
-    predictor = build_sam3_predictor(**build_kwargs)
-    try:
+    comparison = GTComparison(args, processing_directions(args.direction))
+    with lazy_predictor(args) as get_predictor:
         counts = run_sequences(
-            predictor=predictor,
+            predictor=None,
             videos=videos,
             input_root=input_root,
             output_root=output_root,
@@ -776,9 +817,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             max_frames=args.max_frames,
             overwrite=args.overwrite,
             requested_direction=args.direction,
+            comparison=comparison,
+            predictor_factory=get_predictor,
         )
-    finally:
-        predictor.shutdown()
+    comparison.write_summary(output_root)
 
     LOGGER.info(
         "Finished: %d succeeded, %d skipped, %d failed",

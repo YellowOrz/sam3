@@ -192,10 +192,11 @@ python scripts/process_learned_prompt_videos.py \
     --device cuda:0 \
     --compare-gt \
     --gt-dir-name masks_sam3 \
+    --gt-mask-name left_hand.mkv \
     --compare-skip-frames 2
 ```
 
-每个 RGB 视频同级的 `masks_sam3/` 是默认 GT 目录，可通过 `--gt-dir-name` 修改。默认读取 `<target_id>.mkv`，例如 `left_hand.mkv`；用 `--gt-mask-name right_hand.mkv` 可显式指定文件名。GT 是与 RGB 从第 0 帧开始对齐的无损 uint8 灰度标签视频；0 为背景，所有非零实例取并集。预测也取前景并集，不匹配实例 ID。
+每个 RGB 视频同级的 `masks_sam3/` 是默认 GT 目录，可通过 `--gt-dir-name` 修改。启用 `--compare-gt` 时必须显式提供 `--gt-mask-name`，例如 `--gt-mask-name left_hand.mkv`，不再根据目标 ID 推导。三个入口 `process_learned_prompt_videos.py`、`process_mano_prompt_videos.py`、`process_dataset_videos.py` 使用同一套 GT 参数和评测逻辑，具体命令见 [README](../README.md#gt-evaluation-for-video-scripts)。GT 是与 RGB 从第 0 帧开始对齐的无损 uint8 灰度标签视频；0 为背景，所有非零实例取并集。预测也取前景并集，不匹配实例 ID。
 
 `--compare-skip-frames 2` 表示每取一帧跳过两帧，视频和指标均选择原始第 0、3、6…帧；默认 0，即全部比较。模型仍逐帧推理。CSV 保留原始帧号及时间，对比视频帧率为 RGB 帧率除以 3，维持采样帧间的原始播放速度（末帧可能因采样间隔多显示不足一个间隔）。`--max-frames N` 仅评测前 N 帧范围，GT 本身仍须与完整 RGB 的声明帧数一致。
 

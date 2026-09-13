@@ -35,21 +35,20 @@ import cv2
 import numpy as np
 
 if __package__:
+    from scripts.common.video_utils import (
+        as_numpy,
+        expand_path,
+        extract_png_frames,
+        normalize_output_arrays,
+        parse_device,
+        positive_int,
+        probe_video,
+        utc_now,
+        write_json,
+    )
     from scripts.process_dataset_videos import discover_color_videos, output_dir_for
-    from scripts.video_utils import (
-        as_numpy,
-        expand_path,
-        extract_png_frames,
-        normalize_output_arrays,
-        parse_device,
-        positive_int,
-        probe_video,
-        utc_now,
-        write_json,
-    )
 else:
-    from process_dataset_videos import discover_color_videos, output_dir_for
-    from video_utils import (
+    from common.video_utils import (
         as_numpy,
         expand_path,
         extract_png_frames,
@@ -60,6 +59,7 @@ else:
         utc_now,
         write_json,
     )
+    from process_dataset_videos import discover_color_videos, output_dir_for
 
 LOGGER = logging.getLogger("sam3_bidirectional_processor")
 SCHEMA_VERSION = 2
@@ -1199,8 +1199,9 @@ def main(argv=None):
         )
     except ValueError as exc:
         parser.error(str(exc))
-    input_root, output_root = expand_path(args.input_root), expand_path(
-        args.output_root
+    input_root, output_root = (
+        expand_path(args.input_root),
+        expand_path(args.output_root),
     )
     if not input_root.is_dir():
         parser.error(f"Input root is not a directory: {input_root}")

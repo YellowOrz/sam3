@@ -122,7 +122,7 @@ import torch
 from tqdm.auto import tqdm
 
 if __package__:
-    from scripts.video_utils import (
+    from scripts.common.video_utils import (
         as_numpy,
         color_for_label,
         COLORS,
@@ -133,7 +133,7 @@ if __package__:
         utc_now as _utc_now,
     )
 else:
-    from video_utils import (  # type: ignore[no-redef]
+    from common.video_utils import (  # type: ignore[no-redef]
         as_numpy,
         color_for_label,
         COLORS,

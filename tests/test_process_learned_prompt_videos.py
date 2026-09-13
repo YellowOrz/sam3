@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from scripts import process_learned_prompt_videos as processor
+from scripts.common import compare_gt_masks as evaluation
 
 
 def test_list_only_does_not_require_learned_prompt(tmp_path: Path, capsys) -> None:
@@ -121,8 +122,8 @@ def test_comparison_sampling_metrics_and_frame_limit(tmp_path: Path) -> None:
     import csv
     import json
 
-    from scripts.compare_gt_masks import compare_masks, metric_summary
-    from scripts.video_utils import probe_video
+    from scripts.common.compare_gt_masks import compare_masks, metric_summary
+    from scripts.common.video_utils import probe_video
 
     rgb, gt, output, predictions = comparison_fixture(tmp_path)
     result = compare_masks(rgb, gt, output, None, 2)
@@ -149,7 +150,7 @@ def test_comparison_sampling_metrics_and_frame_limit(tmp_path: Path) -> None:
 def test_invalid_gt(tmp_path: Path, problem: str) -> None:
     import numpy as np
 
-    from scripts.compare_gt_masks import compare_masks
+    from scripts.common.compare_gt_masks import compare_masks
 
     rgb, gt, output, _ = comparison_fixture(tmp_path)
     if problem == "missing":
@@ -228,14 +229,14 @@ def test_cached_cli_comparison_and_failure_continuation(
     batch = json.loads((output / "gt_summary.json").read_text())
     assert batch["directions"]["forward"]["frames_evaluated"] == 3
     assert batch["directions"]["backward"]["pixel_iou"] == 0.5
-    original_compare = processor.compare_masks
+    original_compare = evaluation.compare_masks
 
     def fail_forward(*args):
         if args[2].name == "forward":
             raise ValueError("broken GT")
         return original_compare(*args)
 
-    monkeypatch.setattr(processor, "compare_masks", fail_forward)
+    monkeypatch.setattr(evaluation, "compare_masks", fail_forward)
     assert processor.main(args) == 1
     batch = json.loads((output / "gt_summary.json").read_text())
     assert [seq["status"] for seq in batch["sequences"]] == ["failed", "success"]
@@ -297,6 +298,8 @@ def test_inference_then_comparison(tmp_path: Path, monkeypatch) -> None:
                 "--checkpoint",
                 str(checkpoint),
                 "--compare-gt",
+                "--gt-mask-name",
+                "left_hand.mkv",
                 "--gt-dir-name",
                 "truth",
             ]

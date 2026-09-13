@@ -1,5 +1,6 @@
 """Compare aligned RGB and lossless foreground mask videos without a model."""
 
+import argparse
 import csv
 import math
 import tempfile
@@ -9,10 +10,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-if __package__:
-    from scripts.video_utils import MASK_ALPHA, probe_video, write_json
-else:
-    from video_utils import MASK_ALPHA, probe_video, write_json
+from .video_utils import MASK_ALPHA, probe_video, write_json
 
 
 def metric_summary(rows: list) -> Dict[str, Any]:
@@ -185,3 +183,98 @@ def compare_masks(
         for capture in captures:
             capture.release()
     return {"summary": summary, "rows": rows}
+
+
+def file_name(value: str) -> str:
+    if not value or value in (".", "..") or any(c in value for c in "/\\*?[]"):
+        raise argparse.ArgumentTypeError(
+            "expected a single name, without paths or globs"
+        )
+    return value
+
+
+def nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return number
+
+
+def add_gt_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--compare-gt", action="store_true", help="Compare predictions with GT"
+    )
+    parser.add_argument("--gt-dir-name", type=file_name, default="masks_sam3")
+    parser.add_argument(
+        "--gt-mask-name", type=file_name, help="GT filename; required with --compare-gt"
+    )
+    parser.add_argument(
+        "--compare-skip-frames",
+        type=nonnegative_int,
+        default=0,
+        help="Skip N frames after each evaluated frame; 2 selects frames 0, 3, 6, ...",
+    )
+
+
+def validate_gt_arguments(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.compare_gt and not args.gt_mask_name:
+        parser.error("--gt-mask-name is required with --compare-gt")
+
+
+class GTComparison:
+    """Collect one batch's comparisons, failures and per-direction frame metrics."""
+
+    def __init__(self, args: argparse.Namespace, directions: tuple[str, ...]) -> None:
+        self.args = args
+        self.sequences: list[Dict[str, Any]] = []
+        self.rows: Dict[str, list] = {direction: [] for direction in directions}
+
+    def compare(self, video: Path, output: Path, direction: str) -> None:
+        if not self.args.compare_gt:
+            return
+        result = compare_masks(
+            video,
+            video.parent / self.args.gt_dir_name / self.args.gt_mask_name,
+            output,
+            self.args.max_frames,
+            self.args.compare_skip_frames,
+        )
+        self.sequences.append({"direction": direction, **result["summary"]})
+        self.rows[direction].extend(result["rows"])
+
+    def record_failure(
+        self, video: Path, output: Path, direction: str, error: Exception
+    ) -> None:
+        if not self.args.compare_gt:
+            return
+        failure = {
+            "status": "failed",
+            "input_video": str(video),
+            "direction": direction,
+            "error": str(error),
+        }
+        self.sequences.append(failure)
+        for name in ("comparison.mp4", "gt_metrics.csv"):
+            (output / name).unlink(missing_ok=True)
+        write_json(output / "gt_metrics.json", failure)
+
+    def write_summary(self, output_root: Path) -> None:
+        if not self.args.compare_gt:
+            return
+        write_json(
+            output_root / "gt_summary.json",
+            {
+                "status": "failed"
+                if any(s["status"] == "failed" for s in self.sequences)
+                else "success",
+                "skip_frames": self.args.compare_skip_frames,
+                "empty_masks_score": 1.0,
+                "directions": {
+                    direction: metric_summary(rows)
+                    for direction, rows in self.rows.items()
+                },
+                "sequences": self.sequences,
+            },
+        )

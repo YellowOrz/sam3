@@ -27,6 +27,11 @@ MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
   --max-sequences、--max-frames：可选的序列数和帧数上限。
   --list-only：核对视频、NPZ、投影及缺失统计，不加载模型或写输出。
   --overwrite：重新处理已有结果；--help：显示参数帮助。
+  --compare-gt：启用 GT 评测；--gt-mask-name：启用评测时必填，不从手侧推导。
+  --gt-dir-name：RGB 同级 GT 目录名，默认 masks_sam3。
+  --compare-skip-frames：每次评测后跳过的帧数，默认 0；2 评测第 0、3、6…帧。
+      生成 comparison.mp4、gt_metrics.csv/json 和根目录 gt_summary.json。
+      完整预测可免 GPU 补评测，仍校验 MANO 和缓存配置；GT 失败保留预测并继续批次。
 
 示例：python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT \
   --prompt "left hand" --hand-side left --prompt-mode both --device cuda:0 --list-only
@@ -244,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    dataset.validate_gt_arguments(parser, args)
     if not args.prompt.strip() or args.prompt == "visual":
         parser.error("--prompt must be nonempty text, not the reserved value 'visual'")
     logging.basicConfig(
@@ -265,82 +271,88 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.error("Checkpoint does not exist: %s", checkpoint)
         return 2
 
-    predictor = None
+    comparison = dataset.GTComparison(
+        args, dataset.processing_directions(args.direction)
+    )
     results = []
-    try:
-        for video in videos:
-            output = dataset.output_dir_for(video, input_root, output_root)
-            try:
-                mano = find_mano(video, args.hand_side, args.mano_name)
-                info = dataset.probe_video(video)
-                prompts, metadata = load_geometry(mano, info, args)
-            except Exception as exc:
-                LOGGER.exception("MANO validation failed: %s", video)
-                results.append(
-                    {"video": str(video), "status": "failed", "error": str(exc)}
-                )
-                continue
-            LOGGER.info(
-                "%s: %s, geometry=%d frames, missing=%d, unusable=%d",
-                video,
-                mano.name,
-                len(prompts),
-                len(metadata["missing_frames"]),
-                len(metadata["unusable_prompt_frames"]),
-            )
-            if args.list_only:
-                print(f"{video.relative_to(input_root)} -> {mano}")
-                continue
-            if predictor is None:
-                if not dataset.require_cuda(*args.device):
-                    return 2
-                from sam3 import build_sam3_predictor
-
-                kwargs = dict(version="sam3", compile=False, async_loading_frames=True)
-                if checkpoint is not None:
-                    kwargs["checkpoint_path"] = str(checkpoint)
-                predictor = build_sam3_predictor(**kwargs)
-            video_stat = video.stat()
-            checkpoint_stat = checkpoint.stat() if checkpoint is not None else None
-            extra = {
-                "mano": metadata,
-                "processor": "mano_geometry_v1",
-                "input_size": video_stat.st_size,
-                "input_mtime_ns": video_stat.st_mtime_ns,
-                "checkpoint": str(checkpoint) if checkpoint else None,
-                "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns
-                if checkpoint_stat
-                else None,
-            }
-            for direction in dataset.processing_directions(args.direction):
-                destination = dataset.directional_output_dir(
-                    output, args.direction, direction
-                )
-                record = {"video": str(video), "direction": direction}
+    with dataset.lazy_predictor(args) as get_predictor:
+        try:
+            for video in videos:
+                output = dataset.output_dir_for(video, input_root, output_root)
                 try:
-                    record["status"] = dataset.process_video(
-                        predictor,
-                        video,
-                        destination,
-                        input_root,
-                        args.prompt,
-                        "sam3",
-                        args.max_frames,
-                        args.overwrite,
-                        direction,
-                        extra_metadata=extra,
-                        geometry_prompts=prompts,
-                    )
+                    mano = find_mano(video, args.hand_side, args.mano_name)
+                    info = dataset.probe_video(video)
+                    prompts, metadata = load_geometry(mano, info, args)
                 except Exception as exc:
-                    LOGGER.exception("Sequence failed: %s (%s)", video, direction)
-                    record.update(status="failed", error=str(exc))
-                results.append(record)
-    finally:
-        if predictor is not None:
-            predictor.shutdown()
-        if not args.list_only:
-            output_root.mkdir(parents=True, exist_ok=True)
-            dataset.write_json(output_root / "batch_summary.json", {"results": results})
+                    LOGGER.exception("MANO validation failed: %s", video)
+                    results.append(
+                        {"video": str(video), "status": "failed", "error": str(exc)}
+                    )
+                    if not args.list_only:
+                        for direction in dataset.processing_directions(args.direction):
+                            destination = dataset.directional_output_dir(
+                                output, args.direction, direction
+                            )
+                            comparison.record_failure(
+                                video, destination, direction, exc
+                            )
+                    continue
+                LOGGER.info(
+                    "%s: %s, geometry=%d frames, missing=%d, unusable=%d",
+                    video,
+                    mano.name,
+                    len(prompts),
+                    len(metadata["missing_frames"]),
+                    len(metadata["unusable_prompt_frames"]),
+                )
+                if args.list_only:
+                    print(f"{video.relative_to(input_root)} -> {mano}")
+                    continue
+                video_stat = video.stat()
+                checkpoint_stat = checkpoint.stat() if checkpoint is not None else None
+                extra = {
+                    "mano": metadata,
+                    "processor": "mano_geometry_v1",
+                    "input_size": video_stat.st_size,
+                    "input_mtime_ns": video_stat.st_mtime_ns,
+                    "checkpoint": str(checkpoint) if checkpoint else None,
+                    "checkpoint_mtime_ns": checkpoint_stat.st_mtime_ns
+                    if checkpoint_stat
+                    else None,
+                }
+                for direction in dataset.processing_directions(args.direction):
+                    destination = dataset.directional_output_dir(
+                        output, args.direction, direction
+                    )
+                    record = {"video": str(video), "direction": direction}
+                    try:
+                        record["status"] = dataset.process_video(
+                            None,
+                            video,
+                            destination,
+                            input_root,
+                            args.prompt,
+                            "sam3",
+                            args.max_frames,
+                            args.overwrite,
+                            direction,
+                            extra_metadata=extra,
+                            geometry_prompts=prompts,
+                            predictor_factory=get_predictor,
+                        )
+                        comparison.compare(video, destination, direction)
+                    except Exception as exc:
+                        comparison.record_failure(video, destination, direction, exc)
+                        LOGGER.exception("Sequence failed: %s (%s)", video, direction)
+                        record.update(status="failed", error=str(exc))
+                    results.append(record)
+        finally:
+            if not args.list_only:
+                output_root.mkdir(parents=True, exist_ok=True)
+                dataset.write_json(
+                    output_root / "batch_summary.json", {"results": results}
+                )
+                comparison.write_summary(output_root)
     return 1 if any(item["status"] == "failed" for item in results) else 0
 
 

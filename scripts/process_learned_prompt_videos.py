@@ -38,7 +38,7 @@
     --gt-dir-name NAME
         每个 RGB 视频同级的 GT 文件夹名；默认 masks_sam3。
     --gt-mask-name NAME
-        GT 标签视频文件名；默认 <target_id>.mkv，例如 left_hand.mkv。
+        GT 标签视频文件名；启用 --compare-gt 时必填，例如 left_hand.mkv。
     --compare-skip-frames N
         每比较一帧后跳过 N 帧，N 为非负整数；默认 0，即逐帧比较。
         例如 2 取原视频第 0、3、6…帧，同时作用于对比视频和指标计算，
@@ -84,7 +84,13 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 if __package__:
-    from scripts.compare_gt_masks import compare_masks, metric_summary
+    from scripts.common.compare_gt_masks import (
+        add_gt_arguments,
+        file_name,
+        GTComparison,
+        validate_gt_arguments,
+    )
+    from scripts.common.video_utils import expand_path, parse_device, positive_int
     from scripts.process_dataset_videos import (
         directional_output_dir,
         expected_frame_count,
@@ -95,9 +101,14 @@ if __package__:
         processing_directions,
         require_cuda,
     )
-    from scripts.video_utils import expand_path, parse_device, positive_int, write_json
 else:
-    from compare_gt_masks import compare_masks, metric_summary
+    from common.compare_gt_masks import (
+        add_gt_arguments,
+        file_name,
+        GTComparison,
+        validate_gt_arguments,
+    )
+    from common.video_utils import expand_path, parse_device, positive_int
     from process_dataset_videos import (  # type: ignore[no-redef]
         directional_output_dir,
         expected_frame_count,
@@ -108,7 +119,6 @@ else:
         processing_directions,
         require_cuda,
     )
-    from video_utils import expand_path, parse_device, positive_int, write_json
 
 
 LOGGER = logging.getLogger("sam3_learned_prompt_processor")
@@ -124,21 +134,6 @@ def read_target_id(learned_prompt: Path) -> str:
     return target_id
 
 
-def file_name(value: str) -> str:
-    if not value or value in (".", "..") or any(c in value for c in "/\\*?[]"):
-        raise argparse.ArgumentTypeError(
-            "expected a single name, without paths or globs"
-        )
-    return value
-
-
-def nonnegative_int(value: str) -> int:
-    number = int(value)
-    if number < 0:
-        raise argparse.ArgumentTypeError("value must be non-negative")
-    return number
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -148,17 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input-root", default="~/Datasets")
     parser.add_argument("--rgb-name", type=file_name, default="color.mp4")
-    parser.add_argument("--compare-gt", action="store_true")
-    parser.add_argument("--gt-dir-name", type=file_name, default="masks_sam3")
-    parser.add_argument(
-        "--gt-mask-name", type=file_name, help="GT filename; default: <target_id>.mkv"
-    )
-    parser.add_argument(
-        "--compare-skip-frames",
-        type=nonnegative_int,
-        default=0,
-        help="Skip N frames after each evaluated frame; 2 selects frames 0, 3, 6, ...",
-    )
+    add_gt_arguments(parser)
     parser.add_argument("--output-root", default="~/sam3_learned_outputs")
     parser.add_argument(
         "--checkpoint",
@@ -203,7 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validate_gt_arguments(parser, args)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -253,18 +240,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             stored_target_id,
         )
         return 2
-    try:
-        gt_name = file_name(args.gt_mask_name or f"{target_id}.mkv")
-    except argparse.ArgumentTypeError as exc:
-        if args.compare_gt:
-            LOGGER.error("Invalid GT filename: %s; use --gt-mask-name", exc)
-            return 2
-        gt_name = ""
-
     predictor = None
     counts = {"success": 0, "skipped": 0, "failed": 0}
-    comparisons = []
-    batch_rows = {direction: [] for direction in processing_directions(args.direction)}
+    comparison = GTComparison(args, processing_directions(args.direction))
     try:
         for video_path in videos:
             for direction in processing_directions(args.direction):
@@ -316,52 +294,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                                 "checkpoint": str(checkpoint),
                             },
                         )
-                    if args.compare_gt:
-                        result = compare_masks(
-                            video_path,
-                            video_path.parent / args.gt_dir_name / gt_name,
-                            output_dir,
-                            args.max_frames,
-                            args.compare_skip_frames,
-                        )
-                        comparisons.append(
-                            {"direction": direction, **result["summary"]}
-                        )
-                        batch_rows[direction].extend(result["rows"])
+                    comparison.compare(video_path, output_dir, direction)
                     counts[status] += 1
                 except Exception as exc:
                     counts["failed"] += 1
                     LOGGER.exception("Sequence failed (%s): %s", direction, video_path)
-                    if args.compare_gt:
-                        failure = {
-                            "status": "failed",
-                            "input_video": str(video_path),
-                            "direction": direction,
-                            "error": str(exc),
-                        }
-                        comparisons.append(failure)
-                        # Do not leave an old successful comparison attached to a failed run.
-                        for name in ("comparison.mp4", "gt_metrics.csv"):
-                            (output_dir / name).unlink(missing_ok=True)
-                        write_json(output_dir / "gt_metrics.json", failure)
+                    comparison.record_failure(video_path, output_dir, direction, exc)
     finally:
         if predictor is not None:
             predictor.shutdown()
 
-    if args.compare_gt:
-        write_json(
-            output_root / "gt_summary.json",
-            {
-                "status": "failed" if counts["failed"] else "success",
-                "skip_frames": args.compare_skip_frames,
-                "empty_masks_score": 1.0,
-                "directions": {
-                    direction: metric_summary(rows)
-                    for direction, rows in batch_rows.items()
-                },
-                "sequences": comparisons,
-            },
-        )
+    comparison.write_summary(output_root)
 
     LOGGER.info(
         "Finished: %d succeeded, %d skipped, %d failed",
