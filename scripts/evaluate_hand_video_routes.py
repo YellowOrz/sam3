@@ -14,19 +14,24 @@ from scripts import evaluate_realsense_full as full
 from scripts.evaluate_hand_routes import selected_checkpoint, require_residual_epoch, protocol
 from scripts.hand_evaluation_metrics import summarize_outputs, temporal_diagnostics
 from scripts.video_hand_routes import VideoResidualTextEncoder, union_video_outputs, select_video_indices
+from scripts.senior_video_evaluation import require_validated_step, score_video_rows
 from sam3.model.spatial_mask_adapter import attach_spatial_mask_adapter
 
 
 def run(args):
+    step = getattr(args, 'step', None)
+    compare_stride = getattr(args, 'compare_stride', 1)
+    if type(compare_stride) is not int or compare_stride < 1:
+        raise ValueError('Positive scoring stride required')
     if args.output_dir.exists():
         raise ValueError('New output directory required')
     if not 0 < args.gpu_memory_fraction <= 1:
         raise ValueError('Invalid memory limit')
-    if (args.method == 've' and any((args.adapter_checkpoint, args.delta_checkpoint, args.epoch,
+    if (args.method == 've' and any((args.adapter_checkpoint, args.delta_checkpoint, args.epoch, step,
                                    args.initial_cache, args.training_data_root))
             or args.method == 'spatial' and (not args.adapter_checkpoint or args.epoch is None
-                or any((args.delta_checkpoint, args.initial_cache, args.training_data_root)))
-            or args.method == 'residual' and (args.adapter_checkpoint or args.epoch is None
+                or any((args.delta_checkpoint, args.initial_cache, args.training_data_root, step)))
+            or args.method == 'residual' and (args.adapter_checkpoint or (args.epoch is None) == (step is None)
                 or not all((args.delta_checkpoint, args.initial_cache, args.training_data_root)))):
         raise ValueError('Invalid method/checkpoint/cache/epoch combination')
     root = args.data_root.resolve()
@@ -41,7 +46,11 @@ def run(args):
         state = selected_checkpoint(args.adapter_checkpoint, args.epoch, base_hash, token_hash)
         paths.append(args.adapter_checkpoint)
     if args.method == 'residual':
-        require_residual_epoch(torch.load(args.delta_checkpoint, map_location='cpu', weights_only=True), args.epoch)
+        delta_state = torch.load(args.delta_checkpoint, map_location='cpu', weights_only=True)
+        if step is None:
+            require_residual_epoch(delta_state, args.epoch)
+        else:
+            require_validated_step(delta_state, step)
         cache, metadata = full.fixed.load_residual(args.delta_checkpoint, args.initial_cache,
             args.training_data_root, base_hash=base_hash, tokenizer_hash=token_hash)
         paths.extend([args.delta_checkpoint, args.initial_cache, args.training_data_root / 'annotations.json'])
@@ -54,6 +63,8 @@ def run(args):
         confidence='video predictor filtering; no additional mask/GT selection',
         direction='forward', separate_side_sessions=True, temporal_disambiguation=True,
         start_frame=0, frame_stride=1, frame_limit=args.frame_limit,
+        scoring_frame_stride=compare_stride, scoring_source_anchor=0,
+        sampled_mean_dice_empty_empty_one=True,
         scope='bounded_continuous_pilot' if args.frame_limit is not None else 'complete_selected_recordings',
         recordings=list(selected), publication_sha256=publication_hash,
         implementation_sha256=hashlib.sha256(json.dumps({str(Path(p).relative_to(project)): d
@@ -62,7 +73,7 @@ def run(args):
     visual_ids = {images[values[j]]['id'] for values in selected.values()
                   for j in sorted({0, len(values)//4, len(values)//2, 3*len(values)//4, len(values)-1})}
     spec['visual_image_ids'] = sorted(visual_ids)
-    summary = dict(status='running', method=args.method, epoch=args.epoch, protocol=spec,
+    summary = dict(status='running', method=args.method, epoch=args.epoch, step=step, protocol=spec,
         residual_metadata=metadata, images=len(indices), queries=2*len(indices),
         checkpoint_sha256=full.shared.sha256(args.adapter_checkpoint or args.delta_checkpoint)
             if args.method != 've' else None,
@@ -133,6 +144,8 @@ def run(args):
                                 reference_quality_flags=own_flags, pair_quality_flags=sorted(set(own_flags+other_flags)),
                                 legacy_fixed128=image['legacy_fixed128'], output_object_ids=ids,
                                 output_object_probabilities=scores,
+                                actual_reference_intersection_pixels=int((mask & refs[side]).sum())
+                                    if refs[side] is not None else None,
                                 prediction_rle=full.mask_utils.encode(np.asfortranarray(mask.astype('uint8'))),
                                 **full.measure_partial(mask, refs[side], refs[other], float(mask.any())))
                             row['prediction_rle']['counts'] = row['prediction_rle']['counts'].decode('ascii')
@@ -160,6 +173,7 @@ def run(args):
                 raise RuntimeError('Input/code changed during video evaluation')
         summary.update(status='complete', elapsed_seconds=time.monotonic()-started,
             metrics=full.summarize(records), output_metrics=summarize_outputs(records),
+            sampled_video_metrics=score_video_rows(records, compare_stride),
             temporal_diagnostics=temporal_diagnostics(records), visuals=visuals,
             records_sha256=full.shared.sha256(args.output_dir/'records.jsonl'),
             actual_complete_query_coverage_verified=True)
@@ -183,7 +197,11 @@ def main():
     parser.add_argument('--method',choices=('ve','spatial','residual'),required=True)
     parser.add_argument('--recording',action='append',required=True)
     parser.add_argument('--frame-limit',type=int)
-    parser.add_argument('--epoch',type=int)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--epoch',type=int)
+    selection.add_argument('--step',type=int,help='Explicit validated diagnostic step; not a completed epoch')
+    parser.add_argument('--compare-stride',type=int,default=1,
+                        help='Score 0,stride,2*stride...; always propagate every source frame')
     parser.add_argument('--gpu-memory-fraction',type=float,default=.5)
     run(parser.parse_args())
 

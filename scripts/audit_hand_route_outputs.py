@@ -10,6 +10,7 @@ import numpy as np
 from scipy.ndimage import binary_erosion
 from scripts import evaluate_realsense_full as publication
 from scripts.compare_realsense_full import decode_rle
+from scripts.senior_video_evaluation import score_video_rows
 
 
 def actual_metrics(mask, reference):
@@ -70,6 +71,10 @@ def audit(data_root, run, output):
             raise ValueError('Actual-output pixel count mismatch')
         if refs[side] is not None and int(refs[side].sum())!=r['reference_pixels']:
             raise ValueError('Reference pixel count mismatch')
+        if 'sampled_video_metrics' in summary:
+            intersection = int((mask & refs[side]).sum()) if refs[side] is not None else None
+            if r.get('actual_reference_intersection_pixels') != intersection:
+                raise ValueError('Sampled-video intersection differs from independent RLE/PNG pixels')
         dice,boundary=actual_metrics(mask,refs[side])
         for field,value in [('miss_zero_dice',dice),('miss_zero_boundary_iou_4px',boundary)]:
             supplied=r[field]
@@ -78,6 +83,10 @@ def audit(data_root, run, output):
             elif supplied is None or not math.isclose(value,supplied,rel_tol=1e-9,abs_tol=1e-9):
                 raise ValueError(f'Independent RLE metric mismatch: {field}')
         checked+=1
+    if 'sampled_video_metrics' in summary:
+        if (spec['evaluation_layer'] != 'video_system'
+                or score_video_rows(records, spec['scoring_frame_stride']) != summary['sampled_video_metrics']):
+            raise ValueError('Sampled-video summary differs from independently checked records')
     for path,digest in hashes.items():
         if publication.shared.sha256(Path(path))!=digest:
             raise ValueError('Publication changed during audit')
