@@ -51,8 +51,8 @@ def parse_args(argv=None):
     parser.add_argument("--val-root", type=Path, help="Relocated copy of the approved validation split")
     parser.add_argument("--base-checkpoint", type=Path, required=True)
     parser.add_argument("--initial-cache", type=Path, required=True)
-    parser.add_argument("--residual-positions", choices=("all", "content"), default="all",
-                        help="Update all four valid positions, or only the two body-token positions")
+    parser.add_argument("--residual-positions", choices=("all", "content", "unmasked32"), default="all",
+                        help="Four valid / two body / 32 unmasked output positions; unmasked32 changes the zero-delta baseline")
     parser.add_argument("--tokenizer-path", type=Path,
                         default=Path(__file__).resolve().parents[1] / "sam3/assets/bpe_simple_vocab_16e6.txt.gz")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -163,9 +163,7 @@ def training_configuration(args, contract, approval_hash, world_size, initial_st
                                  "min_delta": args.early_stopping_min_delta},
         }
     positions = getattr(args, "residual_positions", "all")
-    mode = "zero_delta" if positions == "all" else "content_delta"
-    if positions not in ("all", "content"):
-        raise ValueError("Unknown residual position policy")
+    mode = cached.residual_mode(positions)
     delta_shape = cached.expected_delta_shape(mode)
     if (cached.validate_delta_state(initial_state) != delta_shape
             or initial_state["_extra_state"]["mode"] != mode
@@ -189,9 +187,12 @@ def training_configuration(args, contract, approval_hash, world_size, initial_st
             "implementation_sha256": canonical_hash(fingerprints["implementation"])}
     # Leave the legacy all-position configuration byte-for-byte unchanged.
     # The opt-in layout is bound explicitly, not inferred from a small tensor.
-    if positions == "content":
+    if positions != "all":
         config.update(residual_positions=positions, residual_mode=mode,
                       trainable_parameter_count=math.prod(delta_shape))
+    if positions == "unmasked32":
+        config.update(prompt_mask_policy="all_32_positions_valid",
+                      zero_delta_original_ve_equivalent=False)
     return config
 
 

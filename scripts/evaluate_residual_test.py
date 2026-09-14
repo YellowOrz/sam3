@@ -134,7 +134,7 @@ def load_residual(path, initial_cache, training_root, *, base_hash, tokenizer_ha
     # Share the trainer's strict layout contract: historical v1 files default
     # to all positions; content files must explicitly bind mode/shape/count.
     shape = checkpoint.configured_delta_shape(config)
-    mode = "content_delta" if positions == "content" else "zero_delta"
+    mode = initializer.cached.residual_mode(positions)
     parameter_count = int(np.prod(shape))
     initial = initializer.load_initial_cache(initial_cache, base_hash=base_hash, tokenizer_hash=tokenizer_hash,
                                              residual_positions=positions)

@@ -94,8 +94,7 @@ def core_source_hashes(project_root: Path) -> dict:
 
 def load_initial_cache(path: Path, *, base_hash: str, tokenizer_hash: str,
                        residual_positions: str = "all") -> cached.CachedVETextEncoder:
-    if residual_positions not in ("all", "content"):
-        raise ValueError("residual_positions must be 'all' or 'content'")
+    mode = cached.residual_mode(residual_positions)
     state = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(state, dict) or state.get("_extra_state", {}).get("mode") not in ("frozen", "zero_delta"):
         raise ValueError("Initial cache must be a frozen/zero-delta CachedVETextEncoder.state_dict")
@@ -114,7 +113,7 @@ def load_initial_cache(path: Path, *, base_hash: str, tokenizer_hash: str,
     source.load_state_dict(state, strict=True)
     encoder = cached.CachedVETextEncoder(state["padding_cache"], state["resized_cache"], state["raw_cache"],
                                         metadata=metadata,
-                                        mode="zero_delta" if residual_positions == "all" else "content_delta")
+                                        mode=mode)
     if not torch.equal(encoder.valid_positions, state["valid_positions"]):
         raise ValueError("Initial cache valid positions differ from padding mask")
     if encoder.resized_cache.dtype != torch.bfloat16 or encoder.raw_cache.dtype != torch.float32:

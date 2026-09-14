@@ -56,25 +56,29 @@ def canonical_hash(value):
 
 
 def configured_delta_shape(config):
-    """Bind the opt-in content layout; old configs without fields mean all only."""
+    """Bind opt-in layouts; old configs without fields mean four valid slots."""
     positions = config.get("residual_positions", "all")
-    if positions not in ("all", "content"):
-        raise ValueError("Invalid configured residual positions")
-    mode = "zero_delta" if positions == "all" else "content_delta"
+    mode = shared.cached.residual_mode(positions)
     shape = shared.cached.expected_delta_shape(mode)
     if (config.get("residual_mode", mode) != mode
             or config.get("delta_shape", list(shape)) != list(shape)
             or config.get("trainable_parameter_count", math.prod(shape)) != math.prod(shape)):
         raise ValueError("Residual mode, delta_shape and parameter count disagree")
-    if positions == "content" and any(name not in config for name in
+    if positions != "all" and any(name not in config for name in
             ("residual_mode", "delta_shape", "trainable_parameter_count")):
-        raise ValueError("Content residual configuration must explicitly bind mode, shape and count")
+        raise ValueError("Opt-in residual configuration must explicitly bind mode, shape and count")
+    if positions == "unmasked32":
+        if (config.get("prompt_mask_policy") != "all_32_positions_valid"
+                or config.get("zero_delta_original_ve_equivalent") is not False):
+            raise ValueError("Unmasked32 must explicitly declare changed padding and non-equivalent VE baseline")
+    elif "prompt_mask_policy" in config or "zero_delta_original_ve_equivalent" in config:
+        raise ValueError("Unmasked prompt policy cannot be attached to a legacy residual layout")
     return shape
 
 
 def _validate_configured_delta(state, config):
     shape = configured_delta_shape(config)
-    expected_mode = "content_delta" if config.get("residual_positions", "all") == "content" else "zero_delta"
+    expected_mode = shared.cached.residual_mode(config.get("residual_positions", "all"))
     if (shared.cached.validate_delta_state(state) != shape
             or state["_extra_state"]["mode"] != expected_mode):
         raise ValueError("Output residual state does not match configured mode and shape")
@@ -229,8 +233,8 @@ def validate_resume(state, config, image_ids, initial_state):
     if ("trainable_parameter_count" in state
             and state["trainable_parameter_count"] != math.prod(delta_shape)):
         raise ValueError("Checkpoint trainable parameter count disagrees with residual layout")
-    if config.get("residual_positions") == "content" and "trainable_parameter_count" not in state:
-        raise ValueError("Content checkpoint must record its trainable parameter count")
+    if config.get("residual_positions", "all") != "all" and "trainable_parameter_count" not in state:
+        raise ValueError("Opt-in checkpoint must record its trainable parameter count")
     step = state.get("progress", {}).get("global_step")
     if state.get("progress") != progress_at(step, config):
         raise ValueError("Checkpoint progress is inconsistent")

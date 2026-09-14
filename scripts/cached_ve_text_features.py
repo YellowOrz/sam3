@@ -4,7 +4,9 @@ This is not a general text encoder and is not enabled by any existing builder.
 The complete original VE triple is retained. Four valid positions are updated
 in ``zero_delta``; ``content_delta`` updates only the middle two (body text),
 without deleting or masking the start/end features. CPU feature equality alone
-is not full SAM3 validation.
+is not full SAM3 validation. ``unmasked32_delta`` is a separate opt-in
+experiment: retain the original cache, but expose all 32 output positions.
+Even with zero delta, this is NOT equivalent to the original masked VE.
 """
 
 from __future__ import annotations
@@ -24,6 +26,14 @@ NATURAL_PROMPTS = ("left hand", "right hand")
 CACHE_FORMAT = "sam3-cached-natural-ve-hand-features-v1"
 
 
+def residual_mode(positions: str) -> str:
+    """Explicit policies; legacy 'all' still means four ORIGINAL valid slots."""
+    modes = {"all": "zero_delta", "content": "content_delta", "unmasked32": "unmasked32_delta"}
+    if positions not in modes:
+        raise ValueError("Unknown residual position policy")
+    return modes[positions]
+
+
 def _valid_sha(value) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
@@ -34,7 +44,9 @@ def expected_delta_shape(mode: str) -> tuple[int, int, int]:
         return (2, 4, 256)
     if mode == "content_delta":
         return (2, 2, 256)
-    raise ValueError("Delta mode must be 'zero_delta' or 'content_delta'")
+    if mode == "unmasked32_delta":
+        return (2, 32, 256)
+    raise ValueError("Unknown trainable delta mode")
 
 
 def _validate_tensors(padding: torch.Tensor, resized: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
@@ -118,7 +130,9 @@ class CachedVETextEncoder(nn.Module):
     parameters added only to valid resized-feature positions. ``content_delta``
     has 2*2*256 FP32 parameters, added only at the middle two valid positions;
     start/end output features stay frozen but continue participating downstream.
-    The 32-position padding mask and raw 1024-dimensional embeddings never change.
+    ``unmasked32_delta`` has 2*32*256 parameters and returns an all-valid mask;
+    the original four-valid mask remains immutable in padding_cache as provenance.
+    Raw embeddings and original cache buffers never change in any mode.
 
     Move explicitly with ``encoder.to(device=...)``. Changing feature dtype is
     rejected at forward time because it invalidates cached-VE equivalence.
@@ -129,8 +143,8 @@ class CachedVETextEncoder(nn.Module):
     def __init__(self, padding_mask: torch.Tensor, resized_features: torch.Tensor,
                  raw_features: torch.Tensor, *, metadata: dict, mode: str = "frozen"):
         super().__init__()
-        if mode not in ("frozen", "zero_delta", "content_delta"):
-            raise ValueError("mode must be 'frozen', 'zero_delta' or 'content_delta'")
+        if mode not in ("frozen", "zero_delta", "content_delta", "unmasked32_delta"):
+            raise ValueError("Unknown cached VE mode")
         positions = _validate_tensors(padding_mask, resized_features, raw_features)
         self.mode = mode
         self.context_length = 32
@@ -203,10 +217,15 @@ class CachedVETextEncoder(nn.Module):
             positions = self.valid_positions.index_select(0, indices)
             if self.mode == "content_delta":
                 positions = positions[:, 1:3]
+            elif self.mode == "unmasked32_delta":
+                positions = torch.arange(self.context_length, device=indices.device).expand(len(captions), -1)
+                # Do not mutate padding_cache: it describes ORIGINAL VE features.
+                padding = torch.zeros_like(padding)
             rows = torch.arange(len(captions), device=indices.device)[:, None].expand(-1, positions.shape[1])
             delta = self.delta.index_select(0, indices).to(dtype=resized.dtype)
             # Do not shortcut delta==0: it must have gradients at initialization.
-            # Only these valid positions are written, leaving padded bytes untouched.
+            # In legacy modes only original valid positions change. The explicit
+            # unmasked32 mode instead exposes and updates every output position.
             resized[positions, rows] = resized[positions, rows] + delta
         return padding, resized, raw
 
