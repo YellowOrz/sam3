@@ -168,7 +168,7 @@ output = response["outputs"]
 
 ### MANO-guided video segmentation (SAM3)
 
-[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-name` when that directory contains multiple files. Check inputs first:
+[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-dir-name NAME` to replace `MANO_wilor`, and `--mano-name` when the hand directory contains multiple files. Videos missing the requested hand directory or NPZ file are skipped without inference or GT evaluation; invalid or ambiguous MANO data still fails. Check inputs first:
 
 ```bash
 python scripts/process_mano_prompt_videos.py \

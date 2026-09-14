@@ -122,6 +122,9 @@ def test_cli_invalid_options_and_ambiguous_files(tmp_path):
         ["--box-padding", "nan"],
         ["--focal-length", "0"],
         ["--mano-name", "../result.npz"],
+        ["--mano-dir-name", "../MANO"],
+        ["--mano-dir-name", ""],
+        ["--mano-dir-name", "*"],
         ["--prompt-mode", "tracker"],
     ]:
         with pytest.raises(SystemExit):
@@ -296,7 +299,8 @@ def make_video(path):
     writer.release()
 
 
-def test_list_only_and_missing_file_batch_failure(tmp_path, capsys):
+@pytest.mark.parametrize("dir_name", ["MANO_wilor", "MANO_custom"])
+def test_list_only_and_missing_file_skip(tmp_path, capsys, dir_name):
     video = tmp_path / "color.mp4"
     make_video(video)
     output = tmp_path / "out"
@@ -311,10 +315,15 @@ def test_list_only_and_missing_file_batch_failure(tmp_path, capsys):
         "left",
         "--list-only",
     ]
-    assert mano.main(cli) == 1
-    sample_npz(tmp_path / "MANO_wilor/left_hand/result_mano_1.npz")
+    assert arguments().mano_dir_name == "MANO_wilor"
+    if dir_name != "MANO_wilor":
+        cli += ["--mano-dir-name", dir_name]
+    assert mano.main(cli) == 0
+    sample_npz(tmp_path / dir_name / "left_hand/result_mano_1.npz")
     assert mano.main(cli) == 0
     assert "result_mano_1.npz" in capsys.readouterr().out
+    sample_npz(tmp_path / dir_name / "left_hand/result_mano_2.npz")
+    assert mano.main(cli) == 1
     assert not output.exists()
 
 
@@ -361,10 +370,12 @@ def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch, text):
                 "left",
             ]
         )
-        == 1
+        == 0
     )
     records = json.loads((output / "batch_summary.json").read_text())["results"]
-    assert [record["status"] for record in records] == ["failed", "success"]
+    assert [record["status"] for record in records] == ["skipped", "success"]
+    assert "no MANO NPZ" in records[0]["reason"]
+    assert not (output / "a_missing").exists()
     assert calls == [root / "b_valid/color.mp4"]
 
 

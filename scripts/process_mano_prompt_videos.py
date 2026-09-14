@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 r"""说明：递归处理 RGB 视频（默认 color.mp4），保留输入目录结构；使用文本和指定侧 MANO 信息执行 SAM3
 视频分割。点、框直接进入 detector geometry encoder，保留视频检测、跟踪与 memory。
-MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
+MANO 文件位于视频同级 <mano-dir-name>/<left|right>_hand/result_mano_*.npz。
 默认每帧使用提示；间隔 N 对应原视频第 0、N、2N…帧，与传播方向无关。
 点使用有效、在画面内的全部关节，均为正点；NPZ 没有可见性，遮挡关节也可能被使用。
 框由投影 mesh（默认）或 joints 包围框生成，每侧默认扩张原宽高的 5%，再裁到画面内。
-缺失帧退回文本和已有 memory（禁用文本时仅跟踪已有对象）；整段缺少 NPZ 或匹配多个文件时记录失败并继续批次。
+缺失帧退回文本和已有 memory（禁用文本时仅跟踪已有对象）；缺少指定手的 NPZ 时跳过视频，匹配多个文件或数据无效时记录失败并继续批次。
 输出：masks.mkv（全部实例、FFV1）、result.mp4（黄点/青框）、metadata.json；
 批次汇总写入 batch_summary.json。双向模式分别写 forward/、backward/，均正序播放。
 
@@ -17,6 +17,7 @@ MANO 文件位于视频同级 MANO_wilor/<left|right>_hand/result_mano_*.npz。
   --prompt-mode：points / box / both，默认 both。
   --box-source：mesh / joints，默认 mesh；--box-padding：每侧扩张比例，默认 0.05。
   --prompt-interval：提示帧间隔，正整数，默认 1。
+  --mano-dir-name：视频同级的 MANO 目录名，默认 MANO_wilor。
   --mano-name：指定侧目录中的 NPZ 文件名；默认自动选择唯一 result_mano_*.npz。
   --focal-length：原图像素单位焦距，默认 5000 / 256 * max(width, height)。
       投影为 p_cam = joints/vertices + camera_translation，uv = f*xy/z + [W/2,H/2]；
@@ -54,6 +55,7 @@ import numpy as np
 
 if __package__:
     from scripts import process_dataset_videos as dataset
+    from scripts.common.compare_gt_masks import file_name
     from scripts.common.video_cli import (
         add_video_arguments,
         discover_rgb_videos,
@@ -61,6 +63,7 @@ if __package__:
     )
 else:
     import process_dataset_videos as dataset
+    from common.compare_gt_masks import file_name
     from common.video_cli import (
         add_video_arguments,
         discover_rgb_videos,
@@ -91,8 +94,10 @@ def mano_filename(value: str) -> str:
     return value
 
 
-def find_mano(video: Path, side: str, name: Optional[str]) -> Path:
-    directory = video.parent / "MANO_wilor" / f"{side}_hand"
+def find_mano(
+    video: Path, side: str, name: Optional[str], dir_name: str = "MANO_wilor"
+) -> Path:
+    directory = video.parent / dir_name / f"{side}_hand"
     matches = (
         [directory / name]
         if name is not None
@@ -268,6 +273,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--box-padding", type=nonnegative_float, default=0.05)
     parser.add_argument("--prompt-interval", type=dataset.positive_int, default=1)
     parser.add_argument("--mano-name", type=mano_filename)
+    parser.add_argument(
+        "--mano-dir-name",
+        type=file_name,
+        default="MANO_wilor",
+        help="MANO directory beside RGB (default: MANO_wilor); missing hand NPZ skips video",
+    )
     parser.add_argument("--focal-length", type=positive_float)
     return parser
 
@@ -311,7 +322,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             for video in videos:
                 output = dataset.output_dir_for(video, input_root, output_root)
                 try:
-                    mano = find_mano(video, args.hand_side, args.mano_name)
+                    try:
+                        mano = find_mano(
+                            video, args.hand_side, args.mano_name, args.mano_dir_name
+                        )
+                    except FileNotFoundError as exc:
+                        LOGGER.info("Skipping %s: %s", video, exc)
+                        results.append(
+                            {
+                                "video": str(video),
+                                "status": "skipped",
+                                "reason": str(exc),
+                            }
+                        )
+                        continue
                     info = dataset.probe_video(video)
                     prompts, metadata = load_geometry(mano, info, args)
                 except Exception as exc:

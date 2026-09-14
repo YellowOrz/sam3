@@ -14,7 +14,29 @@ from .video_utils import MASK_ALPHA, probe_video, write_json
 
 
 def metric_summary(rows: list) -> Dict[str, Any]:
-    """Aggregate frame scores and pixel counts; empty batches have no score."""
+    """! @brief 汇总逐帧前景重叠统计；空批次不给出分数。
+
+    每帧的 ``intersection``、``prediction_pixels``、``gt_pixels`` 先按像素求和，
+    再据此计算整批 micro 指标；``iou`` / ``dice`` 则对帧求算术平均。
+
+    @param rows 逐帧记录，需含 ``intersection``、``prediction_pixels``、
+        ``gt_pixels``、``iou``、``dice``。
+    @return 汇总字典，字段含义如下：
+        - ``frames_evaluated``：参与评测的帧数。
+        - ``intersection``：各帧预测与 GT 前景交集像素数之和。
+        - ``prediction_pixels``：各帧预测前景像素数之和。
+        - ``gt_pixels``：各帧 GT 前景像素数之和。
+        - ``mean_iou``：逐帧 IoU 的算术平均；空批次为 ``None``。
+          单帧 IoU 为交集 / 并集，预测与 GT 均为空时记 1。
+        - ``mean_dice``：逐帧 Dice 的算术平均；空批次为 ``None``。
+          单帧 Dice 为 ``2 * 交集 / (预测像素 + GT 像素)``，分母为 0 时记 1。
+        - ``pixel_iou``：整批 micro IoU，
+          ``sum(intersection) / (sum(prediction) + sum(GT) - sum(intersection))``；
+          空批次为 ``None``，并集为 0 时记 1。大掩码帧权重大于小掩码帧。
+        - ``pixel_dice``：整批 micro Dice，
+          ``2 * sum(intersection) / (sum(prediction) + sum(GT))``；
+          空批次为 ``None``，分母为 0 时记 1。同样按像素加权。
+    """
     count = len(rows)
     intersection = sum(row["intersection"] for row in rows)
     prediction = sum(row["prediction_pixels"] for row in rows)

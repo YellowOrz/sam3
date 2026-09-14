@@ -213,10 +213,12 @@ def test_inference_cached_comparison_and_failure(
             raise FileNotFoundError("missing MANO")
 
         monkeypatch.setattr(mano, "find_mano", missing_mano)
-        assert processor.main(args) == 1
+        assert processor.main(args) == 0
         summary = json.loads((output / "gt_summary.json").read_text())
-        assert all(row["status"] == "failed" for row in summary["sequences"])
-        assert not (output / "backward" / "comparison.mp4").exists()
+        assert summary["sequences"] == []
+        assert (output / "backward" / "comparison.mp4").is_file()
+        records = json.loads((output / "batch_summary.json").read_text())["results"]
+        assert [row["status"] for row in records] == ["skipped"]
 
 
 @pytest.mark.parametrize(
@@ -249,7 +251,7 @@ def test_shared_io_discovery_and_validation(
     ]
     checked = []
 
-    def find_mano(video, side, name):
+    def find_mano(video, side, name, dir_name):
         checked.append(video)
         return video.with_suffix(".npz")
 
