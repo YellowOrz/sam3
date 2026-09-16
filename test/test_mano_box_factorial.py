@@ -1,6 +1,7 @@
 import unittest
 import argparse
 import ast
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -117,6 +118,151 @@ class FactorialProtocolTests(unittest.TestCase):
             (args["text_run"]/"sample.jsonl").write_text("{}\n")
             with self.assertRaises(ValueError):
                 f.audit(argparse.Namespace(root=root, run=args["text_run"], output=Path(tmp)/"tampered-audit"))
+
+    def _nake_fixture(self, tmp):
+        root = Path(tmp) / "inputs"
+        for sub in ("rgb", "right"):
+            (root / "ego_recording" / sub).mkdir(parents=True)
+        refs = []
+        for i in range(7):
+            ref = np.zeros((16, 16), bool)
+            if i == 3:
+                ref[3:8, 3:8] = True
+            refs.append(ref)
+            Image.new("RGB", (16, 16), color=(i, i, i)).save(root / "ego_recording/rgb" / f"{i:06d}.png")
+            if i not in (0, 4):
+                Image.fromarray(ref.astype(np.uint8) * 255).save(root / "ego_recording/right" / f"{i:06d}.png")
+        seq = dict(name="ego_recording", frame_count=7, height=16, width=16,
+            sampled_indices=[3, 6], render_indices=[0, 3, 4, 6],
+            reference_excluded_indices=[0, 4], prompts={},
+            file_sha256={str(p.relative_to(root)): f.sha(p) for p in root.rglob("*.png")})
+        plan = dict(contract=f.NAKE_CONTRACT, sequences=[seq], scoring_frames=2)
+        f.write_json(root / "plan.json", plan)
+        return root, plan, refs
+
+    def _nake_run(self, tmp, root, refs, mode):
+        run = Path(tmp) / mode
+        run.mkdir()
+        with (run / "ego_recording.jsonl").open("w") as stream:
+            for i, ref in enumerate(refs):
+                # Excluded context deliberately has a nonempty prediction. It must
+                # not silently be scored against a fabricated empty reference.
+                prediction = np.ones_like(ref) if i in (0, 4) else ref
+                for stage in ("frame", "video"):
+                    row = dict(sequence="ego_recording", frame_index=i, method=f"{stage}_{mode}",
+                        geometry=[], geometry_available=False,
+                        **f.instance_record(prediction[None], [.9], [1], ref.shape))
+                    stream.write(json.dumps(row) + "\n")
+        summary = dict(status="complete", mode=mode, engineering=False, counts={"ego_recording": 7},
+            contract=f.NAKE_CONTRACT, plan_sha256=f.sha(root / "plan.json"), runner_sha256="runner",
+            model_source_sha256={}, base_sha256="base", torch_version="test",
+            records_sha256={"ego_recording": f.sha(run / "ego_recording.jsonl")})
+        f.write_json(run / "summary.json", summary)
+        return run
+
+    def test_nake_exclusion_preserves_rgb_and_original_sampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _ = self._nake_fixture(tmp)
+            f.check_inputs(root, plan)
+            self.assertEqual(len(list((root / "ego_recording/rgb").glob("*.png"))), 7)
+            self.assertFalse((root / "ego_recording/right/000000.png").exists())
+            self.assertEqual(plan["sequences"][0]["sampled_indices"], [3, 6])
+            bad = copy.deepcopy(plan)
+            bad["sequences"][0]["sampled_indices"] = [1, 5]
+            with self.assertRaisesRegex(ValueError, "Sampling anchor"):
+                f.check_inputs(root, bad)
+            missing_rgb = copy.deepcopy(plan)
+            del missing_rgb["sequences"][0]["file_sha256"]["ego_recording/rgb/000000.png"]
+            with self.assertRaisesRegex(ValueError, "contiguous RGB"):
+                f.check_inputs(root, missing_rgb)
+
+    def test_nake_requires_explicit_exclusions_and_known_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _ = self._nake_fixture(tmp)
+            for excluded in (None, [0, 0], [0, 7], [True]):
+                bad = copy.deepcopy(plan)
+                bad["sequences"][0]["reference_excluded_indices"] = excluded
+                with self.assertRaisesRegex(ValueError, "explicit, unique"):
+                    f.check_inputs(root, bad)
+            missing = copy.deepcopy(plan)
+            del missing["sequences"][0]["file_sha256"]["ego_recording/right/000001.png"]
+            with self.assertRaisesRegex(ValueError, "Missing unexcluded"):
+                f.check_inputs(root, missing)
+            Image.new("L", (16, 16)).save(root / "ego_recording/right/000000.png")
+            with self.assertRaisesRegex(ValueError, "must not be synthesized"):
+                f.check_inputs(root, plan)
+
+    def test_nake_contract_tampering_rejected_and_legacy_unchanged(self):
+        self.assertEqual(f.CONTRACT["format"], "sam3-mano-box-factorial-v1")
+        self.assertNotIn("dataset", f.CONTRACT)
+        self.assertNotIn("reference_exclusion_policy", f.CONTRACT)
+        self.assertEqual(f.CONTRACT["box_source"], "MANO_wilor/right_hand/result_mano_1.npz:mesh")
+        self.assertEqual(f.NAKE_CONTRACT["box_source"], "declared-unique-active-instance-mesh")
+        for key in f.CONTRACT:
+            if key not in ("format", "box_source"):
+                self.assertEqual(f.NAKE_CONTRACT[key], f.CONTRACT[key])
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, _ = self._nake_fixture(tmp)
+            for key, value in (("scoring_stride", 2), ("detector_threshold", .4),
+                               ("box_padding", .1), ("prompt", "hand")):
+                bad = copy.deepcopy(plan)
+                bad["contract"][key] = value
+                with self.assertRaisesRegex(ValueError, "Protocol mismatch"):
+                    f.check_inputs(root, bad)
+
+    def test_nake_engineering_uses_first_sequence_not_milk(self):
+        seqs = [dict(name="ego_one"), dict(name="exo_two")]
+        self.assertEqual(f.select_sequences(dict(contract=f.NAKE_CONTRACT, sequences=seqs), True), seqs[:1])
+        self.assertEqual(f.select_sequences(dict(contract=f.NAKE_CONTRACT, sequences=seqs)), seqs)
+        legacy = [dict(name="basket"), dict(name="milk")]
+        self.assertEqual(f.select_sequences(dict(contract=f.CONTRACT, sequences=legacy), True), legacy[1:])
+
+    def test_nake_audit_excluded_context_not_negative_and_compare_skips_panels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, plan, refs = self._nake_fixture(tmp)
+            args = dict(root=root, output=Path(tmp) / "comparison")
+            for mode in ("text", "box"):
+                run = self._nake_run(tmp, root, refs, mode)
+                audit = Path(tmp) / (mode + "-audit")
+                f.audit(argparse.Namespace(root=root, run=run, output=audit))
+                result = json.loads((audit / "metrics.json").read_text())
+                self.assertEqual(result["all_frames_verified"], 14)
+                self.assertEqual(result["reference_excluded_records"], 4)
+                scored = [json.loads(line) for line in (audit / "scores.jsonl").read_text().splitlines()]
+                self.assertEqual({r["frame_index"] for r in scored}, {1, 2, 3, 5, 6})
+                excluded = [json.loads(line) for line in (audit / "reference-excluded.jsonl").read_text().splitlines()]
+                self.assertTrue(all(r["reference_excluded"] and "dice" not in r for r in excluded))
+                self.assertTrue(all(r["prediction_pixels"] == 256 for r in excluded))
+                for metrics in result["methods"].values():
+                    self.assertEqual(metrics["frames"], 2)
+                    self.assertEqual(metrics["positive_frames"], 1)
+                    self.assertEqual(metrics["empty_frames"], 1)
+                    self.assertEqual(metrics["mean_dice"], 1.)
+                    self.assertEqual(metrics["empty_false_positive"], 0)
+                args[mode + "_run"] = run
+                args[mode + "_audit"] = audit
+            f.compare(argparse.Namespace(**args))
+            result = json.loads((args["output"] / "metrics.json").read_text())
+            self.assertEqual(result["contract"], f.NAKE_CONTRACT)
+            self.assertEqual(result["raw_frames_per_condition"], 7)
+            self.assertEqual(result["scoring_frames_per_condition"], 2)
+            self.assertEqual(sorted(p.name for p in (args["output"] / "visualizations").iterdir()),
+                             ["ego_recording-000003", "ego_recording-000006"])
+
+    def test_nake_excluded_context_still_checks_prediction_area(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, refs = self._nake_fixture(tmp)
+            run = self._nake_run(tmp, root, refs, "text")
+            path = run / "ego_recording.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[0]["prediction_pixels"] = 0
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            summary_path = run / "summary.json"
+            summary = json.loads(summary_path.read_text())
+            summary["records_sha256"]["ego_recording"] = f.sha(path)
+            summary_path.write_text(json.dumps(summary))
+            with self.assertRaisesRegex(ValueError, "saved area mismatch"):
+                f.audit(argparse.Namespace(root=root, run=run, output=Path(tmp) / "audit"))
 
 
 if __name__ == "__main__":

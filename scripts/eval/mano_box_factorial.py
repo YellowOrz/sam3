@@ -34,6 +34,10 @@ CONTRACT = dict(
     box_padding=0.05, prompt_interval=1, missing_geometry="text-fallback",
     independent_ground_truth=False,
 )
+NAKE_CONTRACT = dict(CONTRACT, format="sam3-mano-box-factorial-nakehand-v1",
+    dataset="nakehand",
+    box_source="declared-unique-active-instance-mesh",
+    reference_exclusion_policy="explicit-original-frame-indices-context-only")
 
 
 def sha(path):
@@ -59,6 +63,41 @@ def sampling_indices(count):
     if type(count) is not int or count < 1:
         raise ValueError("Require positive source frame count")
     return list(range(0, count, 3))
+
+
+def reference_exclusions(plan, seq):
+    """Unknown references retain their original RGB frame, never become negatives."""
+    if plan["contract"] == CONTRACT:
+        return set()
+    if plan["contract"] != NAKE_CONTRACT:
+        raise ValueError("Protocol mismatch")
+    values = seq.get("reference_excluded_indices")
+    if (not isinstance(values, list) or any(type(i) is not int or not 0 <= i < seq["frame_count"] for i in values)
+            or len(values) != len(set(values))):
+        raise ValueError("Require explicit, unique original-frame reference exclusions")
+    return set(values)
+
+
+def select_sequences(plan, engineering=False):
+    if not engineering:
+        return plan["sequences"]
+    if plan["contract"] == NAKE_CONTRACT:
+        return plan["sequences"][:1]
+    return [next(s for s in plan["sequences"] if s["name"] == "milk")]
+
+
+def sampled_rows(rows, plan):
+    indices = {s["name"]: set(s["sampled_indices"]) for s in plan["sequences"]}
+    return [r for r in rows if r["frame_index"] in indices[r["sequence"]]]
+
+
+def verify_scored_rows(rows, counts, methods, plan):
+    exclusions = {s["name"]: reference_exclusions(plan, s) for s in plan["sequences"]}
+    expected = {(s, i, m) for s, n in counts.items() for i in range(n)
+                if i not in exclusions[s] for m in methods}
+    keys = [(r["sequence"], r["frame_index"], r["method"]) for r in rows]
+    if len(set(keys)) != len(keys) or set(keys) != expected:
+        raise ValueError("Missing/duplicate/unexpected known-reference score coverage")
 
 
 def box_cxcywh(value):
@@ -201,15 +240,31 @@ def prepare(a):
 
 
 def check_inputs(root, plan, source=None, checkpoint=None):
-    if plan["contract"] != CONTRACT:
+    if plan["contract"] not in (CONTRACT, NAKE_CONTRACT):
         raise ValueError("Protocol mismatch")
     if source is not None and code_hashes(source) != plan["model_source_sha256"]:
         raise ValueError("Frozen source mismatch")
     if checkpoint is not None and sha(checkpoint) != plan["base_sha256"]:
         raise ValueError("Base checkpoint mismatch")
+    if plan["contract"] == NAKE_CONTRACT and plan["scoring_frames"] != sum(len(s["sampled_indices"]) for s in plan["sequences"]):
+        raise ValueError("Scoring frame count differs from registered samples")
     for seq in plan["sequences"]:
-        if seq["sampled_indices"] != sampling_indices(seq["frame_count"]):
+        excluded = reference_exclusions(plan, seq)
+        if seq["sampled_indices"] != [i for i in sampling_indices(seq["frame_count"]) if i not in excluded]:
             raise ValueError("Sampling anchor changed")
+        if plan["contract"] == NAKE_CONTRACT:
+            if any(type(seq.get(k)) is not int or seq[k] < 1 for k in ("height", "width")):
+                raise ValueError("Require original image dimensions")
+            for i in range(seq["frame_count"]):
+                rgb = f"{seq['name']}/rgb/{i:06d}.png"
+                ref = f"{seq['name']}/right/{i:06d}.png"
+                if rgb not in seq["file_sha256"]:
+                    raise ValueError("Require hashed contiguous RGB including excluded context")
+                if i in excluded:
+                    if ref in seq["file_sha256"] or (root / ref).exists():
+                        raise ValueError("Excluded reference must not be synthesized or exported")
+                elif ref not in seq["file_sha256"]:
+                    raise ValueError("Missing unexcluded right-hand reference")
         for p, digest in seq["file_sha256"].items():
             if sha(root / p) != digest:
                 raise ValueError(f"Input changed: {p}")
@@ -233,7 +288,7 @@ def run(a):
     sys.path.insert(0, str(a.model_source))
     from sam3.model.sam3_video_predictor import Sam3VideoPredictor
     a.output.mkdir(parents=True)
-    runinfo = dict(contract=CONTRACT, plan_sha256=sha(a.root / "plan.json"),
+    runinfo = dict(contract=plan["contract"], plan_sha256=sha(a.root / "plan.json"),
         runner_sha256=sha(__file__), mode=a.mode, engineering=a.engineering,
         model_source_sha256=plan["model_source_sha256"], base_sha256=plan["base_sha256"],
         gpu=torch.cuda.get_device_name(0), torch_version=torch.__version__,
@@ -252,7 +307,7 @@ def run(a):
     counts, summaries = {}, {}
 
     try:
-        sequences = plan["sequences"] if not a.engineering else [next(s for s in plan["sequences"] if s["name"] == "milk")]
+        sequences = select_sequences(plan, a.engineering)
         for seq in sequences:
             name = seq["name"]
             n = seq["frame_count"] if not a.engineering else min(96, seq["frame_count"])
@@ -396,7 +451,8 @@ def audit(a):
     plan = json.loads((a.root / "plan.json").read_text())
     check_inputs(a.root, plan)
     summary = json.loads((a.run / "summary.json").read_text())
-    if summary["status"] != "complete" or summary["plan_sha256"] != sha(a.root / "plan.json"):
+    if (summary["status"] != "complete" or summary["plan_sha256"] != sha(a.root / "plan.json")
+            or summary["contract"] != plan["contract"]):
         raise ValueError("Require complete run from exactly this plan")
     records = []
     for s in summary["counts"]:
@@ -406,8 +462,9 @@ def audit(a):
         records.extend(json.loads(line) for line in path.read_text().splitlines())
     methods = (f"frame_{summary['mode']}", f"video_{summary['mode']}")
     verify_rows(records, summary["counts"], methods)
-    scored = []
+    scored, excluded_records = [], []
     by_name = {s["name"]: s for s in plan["sequences"]}
+    exclusions = {name: reference_exclusions(plan, s) for name, s in by_name.items()}
     # Decode every mask (including nonscored context); never trust saved scalar metrics.
     for row in records:
         name, i = row["sequence"], row["frame_index"]
@@ -416,31 +473,46 @@ def audit(a):
         if (row["geometry_available"] != available or len(row["geometry"]) != len(expected)
                 or (expected and not np.allclose(row["geometry"], expected, atol=1e-6))):
             raise ValueError("Saved prompt/absence differs from frozen source-frame plan")
-        ref = np.asarray(Image.open(a.root / name / "right" / f"{i:06d}.png")) > 0
         p = decode(row["union_rle"])
-        union = np.zeros_like(ref)
+        if plan["contract"] == NAKE_CONTRACT and p.shape != (by_name[name]["height"], by_name[name]["width"]):
+            raise ValueError("Prediction shape differs from source frame")
+        union = np.zeros_like(p)
         for instance in row["instances"]:
             mask = decode(instance["rle"])
-            if mask.shape != ref.shape:
+            if mask.shape != p.shape:
                 raise ValueError("Instance shape mismatch")
             union |= mask
         if not np.array_equal(union, p) or int(p.sum()) != row["prediction_pixels"]:
             raise ValueError("Instance union or saved area mismatch")
+        if i in exclusions[name]:
+            excluded_records.append(dict(sequence=name, frame_index=i, method=row["method"],
+                reference_excluded=True, reason="predeclared-reference-exclusion",
+                geometry_available=row["geometry_available"], prediction_pixels=int(p.sum())))
+            continue
+        ref = np.asarray(Image.open(a.root / name / "right" / f"{i:06d}.png")) > 0
         other_path = a.root / name / "left" / f"{i:06d}.png"
         other = np.asarray(Image.open(other_path)) > 0 if other_path.exists() else None
         scored.append(dict(sequence=name, frame_index=i, method=row["method"],
             geometry_available=row["geometry_available"], **score(p, ref, other)))
-    sampled = [r for r in scored if r["frame_index"] % 3 == 0]
+    verify_scored_rows(scored, summary["counts"], methods, plan)
+    sampled = sampled_rows(scored, plan)
     a.output.mkdir(parents=True)
     with (a.output / "scores.jsonl").open("x") as stream:
         for row in scored:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
+    if plan["contract"] == NAKE_CONTRACT:
+        with (a.output / "reference-excluded.jsonl").open("x") as stream:
+            for row in excluded_records:
+                stream.write(json.dumps(row, allow_nan=False) + "\n")
     write_json(a.output / "metrics.json", dict(status="complete", plan_sha256=summary["plan_sha256"],
         run_summary_sha256=sha(a.run / "summary.json"), engineering=summary["engineering"],
         counts=summary["counts"], methods={m: aggregate([r for r in sampled if r["method"] == m]) for m in methods},
         per_sequence={s: {m: aggregate([r for r in sampled if r["method"] == m and r["sequence"] == s])
             for m in methods} for s in summary["counts"]},
-        all_frames_verified=len(scored), scores_sha256=sha(a.output / "scores.jsonl")))
+        all_frames_verified=len(records), scores_sha256=sha(a.output / "scores.jsonl"),
+        **(dict(reference_excluded_records=len(excluded_records),
+            reference_excluded_sha256=sha(a.output / "reference-excluded.jsonl"))
+           if plan["contract"] == NAKE_CONTRACT else {})))
 
 
 def compare(a):
@@ -459,6 +531,9 @@ def compare(a):
                 or proof["scores_sha256"] != sha(audit_path / "scores.jsonl")
                 or runinfo["mode"] != mode):
             raise ValueError("Require complete independently audited formal runs")
+        if (plan["contract"] == NAKE_CONTRACT and
+                proof["reference_excluded_sha256"] != sha(audit_path / "reference-excluded.jsonl")):
+            raise ValueError("Reference exclusion audit changed")
         runs.append(runinfo)
         scored.extend(json.loads(line) for line in (audit_path / "scores.jsonl").read_text().splitlines())
         for name, digest in runinfo["records_sha256"].items():
@@ -471,26 +546,30 @@ def compare(a):
     for key in ("contract", "plan_sha256", "runner_sha256", "model_source_sha256", "base_sha256", "counts", "torch_version"):
         if runs[0][key] != runs[1][key]:
             raise ValueError(f"Unpaired experiment field: {key}")
-    if runs[0]["plan_sha256"] != sha(a.root / "plan.json"):
+    if runs[0]["plan_sha256"] != sha(a.root / "plan.json") or runs[0]["contract"] != plan["contract"]:
         raise ValueError("Different data plan")
     counts = {s["name"]: s["frame_count"] for s in plan["sequences"]}
-    verify_rows(scored, counts, METHODS)
+    verify_scored_rows(scored, counts, METHODS, plan)
     verify_rows(list(records.values()), counts, METHODS)
-    sampled = [r for r in scored if r["frame_index"] % 3 == 0]
+    sampled = sampled_rows(scored, plan)
     a.output.mkdir(parents=True)
-    report = dict(status="complete", contract=CONTRACT, plan_sha256=sha(a.root / "plan.json"),
+    report = dict(status="complete", contract=plan["contract"], plan_sha256=sha(a.root / "plan.json"),
         raw_frames_per_condition=sum(counts.values()), scoring_frames_per_condition=plan["scoring_frames"],
         overall={m: aggregate([r for r in sampled if r["method"] == m]) for m in METHODS},
         per_sequence={s: {m: aggregate([r for r in sampled if r["method"] == m and r["sequence"] == s]) for m in METHODS} for s in counts},
-        geometry_coverage={str(flag): {m: aggregate([r for r in sampled if r["method"] == m and r["geometry_available"] == flag]) for m in METHODS} for flag in (True, False)})
+        geometry_coverage={str(flag): {m: aggregate([r for r in sampled if r["method"] == m and r["geometry_available"] == flag]) for m in METHODS} for flag in (True, False)},
+        **(dict(reference_excluded_indices={s["name"]: sorted(reference_exclusions(plan, s)) for s in plan["sequences"]})
+           if plan["contract"] == NAKE_CONTRACT else {}))
     write_json(a.output / "metrics.json", report)
     scores_by_key = {(r["sequence"], r["frame_index"], r["method"]): r for r in scored}
     panels = []
-    known_diagnostics = {"blue_pen": [534], "milk": [432], "right_hand": [222]}
+    known_diagnostics = {"blue_pen": [534], "milk": [432], "right_hand": [222]} if plan["contract"] == CONTRACT else {}
     for seq in plan["sequences"]:
         name = seq["name"]
         chosen = sorted(set(seq["render_indices"] + known_diagnostics.get(name, [])))
         for i in chosen:
+            if i in reference_exclusions(plan, seq):
+                continue
             folder = a.output / "visualizations" / f"{name}-{i:06d}"
             folder.mkdir(parents=True)
             rgb = Image.open(a.root / name / "rgb" / f"{i:06d}.png").convert("RGB")
@@ -510,8 +589,11 @@ def compare(a):
             canvas.save(folder / "comparison.png")
             panels.append((name, i, str((folder / "comparison.png").relative_to(a.output)),
                 "预登记等间隔" if i in seq["render_indices"] else "先前已知错误/改善诊断，非随机样本"))
+    protocol_text = (f"每条件完整推理 {sum(counts.values())} 帧；只对原始0::3的 {plan['scoring_frames']} 帧计分。参考为已查看的SAM3辅助标签，不是独立精标；没有训练或调阈值。"
+        if plan["contract"] == CONTRACT else
+        f"每条件完整推理 {sum(counts.values())} 帧；只对预登记原始0::3且参考有效的 {plan['scoring_frames']} 帧计分。未知/排除参考的原帧仍保留推理上下文，不当负样本。参考不是独立精标；没有训练或调阈值。")
     lines = ["# MANO box 四条件完整结果", "", "四条件共享同一原始模型、输入和MANO框。frame=同一次前向的Detector NMS/门控后、跟踪前输出；video=最终系统输出，不是单独图像API。",
-        "", f"每条件完整推理 {sum(counts.values())} 帧；只对原始0::3的 {plan['scoring_frames']} 帧计分。参考为已查看的SAM3辅助标签，不是独立精标；没有训练或调阈值。",
+        "", protocol_text,
         "", "| 条件 | mean Dice | 正参考Dice | 正参考边界IoU | 正参考全漏检 | 空参考有预测 |", "|---|---:|---:|---:|---:|---:|"]
     for m, r in report["overall"].items():
         lines.append(f"| {m} | {r['mean_dice']:.6f} | {r['positive_dice']:.6f} | {r['positive_boundary_iou_4px']:.6f} | {r['missed_positive']}/{r['positive_frames']} | {r['empty_false_positive']}/{r['empty_frames']} |")
