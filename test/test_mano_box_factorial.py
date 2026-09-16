@@ -11,6 +11,29 @@ from scripts.eval import mano_box_factorial as f
 
 
 class FactorialProtocolTests(unittest.TestCase):
+    def test_storage_trace_requires_actual_cpu_tensors_and_full_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            group = {d: dict(tensor_count=0) for d in ('cpu','cuda','other')}
+            row = dict(sequence='a',frame_index=0,host_available_bytes=20*1024**3,
+                storage=dict(storage_devices=['cpu'],cached_frame_outputs=copy.deepcopy(group),
+                    large_tracker_outputs={'pred_masks':copy.deepcopy(group),'maskmem_features':copy.deepcopy(group)}))
+            path = root/'storage.jsonl'
+            summary = dict(storage_policy='cpu-tracker-and-forward-output-cache-v1',counts={'a':1})
+            def save():
+                path.write_text(json.dumps(row)+'\n')
+                summary['storage_records_sha256']=f.sha(path)
+            save(); f.verify_storage_trace(root,summary)
+            row['storage']['large_tracker_outputs']['pred_masks']['cuda']['tensor_count']=1
+            save()
+            with self.assertRaisesRegex(ValueError,'not CPU-offloaded'): f.verify_storage_trace(root,summary)
+            row['storage']['large_tracker_outputs']['pred_masks']['cuda']['tensor_count']=0
+            save(); summary['counts']['a']=101
+            with self.assertRaisesRegex(ValueError,'coverage'): f.verify_storage_trace(root,summary)
+            summary['counts']['a']=1
+            path.write_text('changed')
+            with self.assertRaisesRegex(ValueError,'telemetry changed'): f.verify_storage_trace(root,summary)
+
     def test_tapped_method_is_in_actual_model_source(self):
         source = Path(__file__).parents[1] / "sam3/model/sam3_video_base.py"
         methods = {node.name: node for node in ast.walk(ast.parse(source.read_text()))

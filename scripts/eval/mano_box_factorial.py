@@ -273,6 +273,25 @@ def check_inputs(root, plan, source=None, checkpoint=None):
 def run(a):
     import torch
     import torch.nn.functional as F
+    from contextlib import ExitStack
+    import resource
+    cpu_storage = getattr(a, "cpu_tracker_state", False)
+    equivalent_to = getattr(a, "equivalent_to", None)
+    engineering_frames = getattr(a, "engineering_frames", 96)
+    if engineering_frames < 1 or (not a.engineering and engineering_frames != 96):
+        raise ValueError("Engineering length requires a positive explicit engineering run")
+    if equivalent_to is not None and not cpu_storage:
+        raise ValueError("Exact-prefix validation is reserved for explicit CPU-storage repair")
+    helpers = {}
+    if cpu_storage:
+        if __package__:
+            from scripts.eval import video_state_offload as storage
+            from scripts.eval.video_output_equivalence import SavedOutputEquivalence
+        else:
+            import video_state_offload as storage
+            from video_output_equivalence import SavedOutputEquivalence
+        helpers = {p: sha(Path(__file__).parent / p) for p in
+                   ("video_state_offload.py", "video_output_equivalence.py")}
     if a.output.exists():
         raise ValueError("Run output must be new; never append to partial videos")
     plan = json.loads((a.root / "plan.json").read_text())
@@ -292,7 +311,9 @@ def run(a):
         runner_sha256=sha(__file__), mode=a.mode, engineering=a.engineering,
         model_source_sha256=plan["model_source_sha256"], base_sha256=plan["base_sha256"],
         gpu=torch.cuda.get_device_name(0), torch_version=torch.__version__,
-        started_at=datetime.now(timezone.utc).isoformat())
+        started_at=datetime.now(timezone.utc).isoformat(),
+        storage_policy="cpu-tracker-and-forward-output-cache-v1" if cpu_storage else "native-gpu",
+        storage_helpers_sha256=helpers, engineering_frames=engineering_frames if a.engineering else None)
     write_json(a.output / "run.json", runinfo)
     started = time.monotonic()
     predictor = Sam3VideoPredictor(checkpoint_path=str(a.checkpoint), bpe_path=str(tokenizer),
@@ -305,12 +326,20 @@ def run(a):
     original = model.run_backbone_and_detection
     signature = inspect.signature(original)
     counts, summaries = {}, {}
+    stack = ExitStack()
+    verifier = SavedOutputEquivalence(equivalent_to, runinfo) if equivalent_to is not None else None
 
     try:
+        if cpu_storage:
+            stack.enter_context(storage.force_tracker_state_cpu(model.tracker))
+            stack.enter_context(storage.force_forward_output_cache_cpu(model))
+            memory_stream = stack.enter_context((a.output / "storage.jsonl").open("x"))
         sequences = select_sequences(plan, a.engineering)
         for seq in sequences:
             name = seq["name"]
-            n = seq["frame_count"] if not a.engineering else min(96, seq["frame_count"])
+            n = seq["frame_count"] if not a.engineering else min(engineering_frames, seq["frame_count"])
+            if verifier is not None:
+                verifier.begin(name, n)
             shape = (seq["height"], seq["width"])
             counts[name] = n
             prompts = {int(k): v for k, v in seq["prompts"].items() if int(k) < n}
@@ -350,7 +379,7 @@ def run(a):
             try:
                 # Engineering limits only propagation, never remaps original frame indices.
                 response = predictor.handle_request(dict(type="start_session", resource_path=str(a.root / name / "rgb"),
-                    offload_video_to_cpu=True, offload_state_to_cpu=False))
+                    offload_video_to_cpu=True, offload_state_to_cpu=cpu_storage))
                 session_id = response["session_id"]
                 # Include full-video geometry so any one-frame lookahead has the correct prompt.
                 full_prompts = {int(k): v for k, v in seq["prompts"].items()}
@@ -379,16 +408,45 @@ def run(a):
                         geometry=frame_rows[i]["geometry"], geometry_available=i in prompts,
                         **instance_record(masks, scores, ids, shape))
                     for record in (frame_rows[i], row):
+                        if verifier is not None:
+                            verifier.check(record)
                         stream.write(json.dumps(record, allow_nan=False) + "\n")
                     stream.flush()
                     seen.append(i)
                     if len(seen) % 50 == 0 or len(seen) == n:
                         print(json.dumps(dict(mode=a.mode, sequence=name, frames=len(seen), total=n,
                             elapsed_seconds=round(time.monotonic()-started, 1))), flush=True)
+                    if cpu_storage and (i % 100 == 0 or i == n - 1):
+                        state = predictor._all_inference_states[session_id]["state"]
+                        # Native memory/low-resolution masks must really live on CPU.
+                        for tracker_state in state["tracker_inference_states"]:
+                            if str(tracker_state["storage_device"]) != "cpu":
+                                raise ValueError("Tracker state did not adopt CPU storage")
+                            for bucket in tracker_state["output_dict"].values():
+                                for saved in bucket.values():
+                                    for key in ("maskmem_features", "pred_masks"):
+                                        value = saved.get(key)
+                                        if value is not None and value.device.type != "cpu":
+                                            raise ValueError(f"Persistent {key} unexpectedly remains on GPU")
+                        for cached in state["cached_frame_outputs"].values():
+                            if any(mask.device.type != "cpu" for mask in cached.values()):
+                                raise ValueError("Forward output cache unexpectedly remains on GPU")
+                        available = next(int(line.split()[1]) * 1024 for line in
+                            Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
+                        memory_stream.write(json.dumps(dict(sequence=name, frame_index=i,
+                            cuda_allocated=torch.cuda.memory_allocated(), cuda_reserved=torch.cuda.memory_reserved(),
+                            max_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+                            host_available_bytes=available,
+                            storage=storage.tracker_state_storage_snapshot(state))) + "\n")
+                        memory_stream.flush()
+                        if available < 12 * 1024**3:
+                            raise RuntimeError("Host RAM reserve below 12 GiB; stopping safely")
                     if time.monotonic() - started > a.max_seconds:
                         raise RuntimeError("Finite inference budget exceeded")
                 if seen != list(range(n)):
                     raise ValueError("Incomplete propagation")
+                if verifier is not None:
+                    verifier.finish_sequence()
                 summaries[name] = dict(frames=n, geometry_calls=len(geometry_seen),
                     distinct_detector_frames=len(set(geometry_seen)))
             finally:
@@ -403,17 +461,27 @@ def run(a):
         check_inputs(a.root, plan, a.model_source, a.checkpoint)
         records = [json.loads(line) for s in counts for line in (a.output / f"{s}.jsonl").read_text().splitlines()]
         verify_rows(records, counts, (f"frame_{a.mode}", f"video_{a.mode}"))
+        equivalence = verifier.summary() if verifier is not None else None
+        if cpu_storage:
+            memory_stream.flush()
+            if any(sha(Path(__file__).parent / p) != digest for p, digest in helpers.items()):
+                raise ValueError("Storage repair helper changed during inference")
         write_json(a.output / "summary.json", dict(status="complete", **runinfo, counts=counts,
             sequences=summaries, frozen_weights_verified=True, output_records=len(records),
             records_sha256={s: sha(a.output / f"{s}.jsonl") for s in counts},
-            elapsed_seconds=time.monotonic()-started, peak_cuda_bytes=torch.cuda.max_memory_allocated()))
+            elapsed_seconds=time.monotonic()-started, peak_cuda_bytes=torch.cuda.max_memory_allocated(),
+            equivalence=equivalence,
+            storage_records_sha256=sha(a.output / "storage.jsonl") if cpu_storage else None))
     except Exception as exc:
         write_json(a.output / "failure.json", dict(error=f"{type(exc).__name__}: {exc}",
             elapsed_seconds=time.monotonic()-started))
         raise
     finally:
         model.run_backbone_and_detection = original
-        predictor.shutdown()
+        try:
+            stack.close()
+        finally:
+            predictor.shutdown()
 
 
 def score(prediction, reference, other=None):
@@ -445,6 +513,29 @@ def aggregate(rows):
         **{k: sum(r[k] for r in rows) for k in ("missed_positive", "empty_false_positive", "fp_pixels", "fn_pixels")})
 
 
+def verify_storage_trace(folder, summary):
+    if summary.get("storage_policy") != "cpu-tracker-and-forward-output-cache-v1":
+        return
+    path = folder / "storage.jsonl"
+    if sha(path) != summary["storage_records_sha256"]:
+        raise ValueError("CPU storage telemetry changed")
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    expected = {(name, i) for name, count in summary["counts"].items()
+                for i in sorted(set(range(0, count, 100)) | {count - 1})}
+    keys = [(r["sequence"], r["frame_index"]) for r in rows]
+    if len(keys) != len(set(keys)) or set(keys) != expected:
+        raise ValueError("Incomplete CPU storage telemetry coverage")
+    for row in rows:
+        state = row["storage"]
+        if state["storage_devices"] not in ([], ["cpu"]):
+            raise ValueError("Tracker state did not remain on CPU")
+        for values in [state["cached_frame_outputs"], *state["large_tracker_outputs"].values()]:
+            if any(values[device]["tensor_count"] for device in ("cuda", "other")):
+                raise ValueError("Large persistent output tensors were not CPU-offloaded")
+        if row["host_available_bytes"] < 12 * 1024**3:
+            raise ValueError("Host RAM reserve violated")
+
+
 def audit(a):
     if a.output.exists():
         raise ValueError("Audit output must be new")
@@ -454,6 +545,7 @@ def audit(a):
     if (summary["status"] != "complete" or summary["plan_sha256"] != sha(a.root / "plan.json")
             or summary["contract"] != plan["contract"]):
         raise ValueError("Require complete run from exactly this plan")
+    verify_storage_trace(a.run, summary)
     records = []
     for s in summary["counts"]:
         path = a.run / f"{s}.jsonl"
@@ -546,6 +638,9 @@ def compare(a):
     for key in ("contract", "plan_sha256", "runner_sha256", "model_source_sha256", "base_sha256", "counts", "torch_version"):
         if runs[0][key] != runs[1][key]:
             raise ValueError(f"Unpaired experiment field: {key}")
+    for key in ("storage_policy", "storage_helpers_sha256"):
+        if runs[0].get(key) != runs[1].get(key):
+            raise ValueError(f"Unpaired storage-only repair field: {key}")
     if runs[0]["plan_sha256"] != sha(a.root / "plan.json") or runs[0]["contract"] != plan["contract"]:
         raise ValueError("Different data plan")
     counts = {s["name"]: s["frame_count"] for s in plan["sequences"]}
@@ -618,6 +713,11 @@ def main():
         inference.add_argument("--" + key, type=Path, required=True)
     inference.add_argument("--mode", choices=("text", "box"), required=True)
     inference.add_argument("--engineering", action="store_true")
+    inference.add_argument("--engineering-frames", type=int, default=96)
+    inference.add_argument("--cpu-tracker-state", action="store_true",
+        help="Explicit noninteractive forward-only CPU storage repair; no history deletion")
+    inference.add_argument("--equivalent-to", type=Path,
+        help="Original failed run whose saved prefix must match every RLE, ID and score exactly")
     inference.add_argument("--max-seconds", type=int, default=10800)
     cpu = sub.add_parser("audit")
     for key in ("root", "run", "output"):
