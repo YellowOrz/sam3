@@ -34,6 +34,7 @@ MANO 文件位于视频同级 <mano-dir-name>/<left|right>_hand/result_mano_*.np
   --gt-dir-name：RGB 同级 GT 目录名，默认 masks_sam3。
   --compare-skip-frames：每次评测后跳过的帧数，默认 0；2 评测第 0、3、6…帧。
       生成 comparison.mp4、gt_metrics.csv/json 和根目录 gt_summary.json。
+      comparison.mp4 最左侧 RGB 列叠加该帧实际使用的黄色点／青色框。
       完整预测可免 GPU 补评测，仍校验 MANO 和缓存配置；GT 失败保留预测并继续批次。
 
 示例：python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT \
@@ -395,7 +396,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             geometry_prompts=prompts,
                             predictor_factory=get_predictor,
                         )
-                        comparison.compare(video, destination, direction)
+                        comparison.compare(video, destination, direction, prompts)
                     except Exception as exc:
                         comparison.record_failure(video, destination, direction, exc)
                         LOGGER.exception("Sequence failed: %s (%s)", video, direction)

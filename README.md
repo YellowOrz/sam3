@@ -177,7 +177,7 @@ python scripts/process_mano_prompt_videos.py \
     --checkpoint /path/to/sam3.pt --device cuda:0 --list-only
 ```
 
-Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` displays the actual points and boxes, and `masks.mkv` stores lossless instance labels. The script's Chinese header documents every option and TODO, including SAM3.1, visibility filtering, and matching multiple MANO files.
+Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` displays the actual points and boxes, and `masks.mkv` stores lossless instance labels. With GT evaluation enabled, `comparison.mp4` also overlays the sampled frame's actual geometry on its leftmost RGB panel. The script's Chinese header documents every option and TODO, including SAM3.1, visibility filtering, and matching multiple MANO files.
 
 ### GT evaluation for video scripts
 

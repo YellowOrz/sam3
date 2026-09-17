@@ -46,6 +46,7 @@ if __package__:
     )
     from scripts.common.video_utils import (
         color_for_label,
+        draw_geometry,
         expand_path,
         extract_png_frames,
         lighter_color,
@@ -64,6 +65,7 @@ else:
     )
     from common.video_utils import (  # type: ignore[no-redef]
         color_for_label,
+        draw_geometry,
         expand_path,
         extract_png_frames,
         lighter_color,
@@ -309,22 +311,7 @@ def write_frame_outputs(
         frame, outputs, object_to_label, frame_index, prompt
     )
     geometry = (geometry_prompts or {}).get(frame_index, {})
-    height, width = frame.shape[:2]
-    for x, y in geometry.get("points", []):
-        center = (min(width - 1, round(x * width)), min(height - 1, round(y * height)))
-        cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
-        cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
-    for x, y, w, h in geometry.get("boxes", []):
-        cv2.rectangle(
-            overlay,
-            (round(x * width), round(y * height)),
-            (
-                min(width - 1, round((x + w) * width)),
-                min(height - 1, round((y + h) * height)),
-            ),
-            (255, 255, 0),
-            2,
-        )
+    draw_geometry(overlay, geometry)
     mask_writer.write(label_image)
     result_writer.write(overlay)
 

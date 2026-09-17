@@ -312,3 +312,41 @@ def test_inference_then_comparison(tmp_path: Path, monkeypatch) -> None:
     summary = json.loads((output / "gt_metrics.json").read_text())
     assert summary["frames_evaluated"] == 7
     assert summary["mean_iou"] == pytest.approx(4 / 7)
+
+
+def test_comparison_geometry_only_on_rgb_and_sampled_frames(tmp_path):
+    import cv2
+
+    from scripts.common.compare_gt_masks import compare_masks
+
+    rgb, gt, output, _ = comparison_fixture(tmp_path)
+    baseline = compare_masks(rgb, gt, output, None, 2)
+    result = compare_masks(
+        rgb,
+        gt,
+        output,
+        None,
+        2,
+        geometry_prompts={
+            0: {"points": [[0.5, 0.75]]},
+            1: {"points": [[0.5, 0.75]]},
+            6: {"boxes": [[0.25, 2 / 3, 0.5, 1 / 6]]},
+        },
+    )
+    assert result["rows"] == baseline["rows"]
+    capture = cv2.VideoCapture(str(output / "comparison.mp4"))
+    try:
+        for index in (0, 3, 6):
+            ok, frame = capture.read()
+            assert ok
+            if index == 0:
+                assert frame[36, 32, 1] > 100 and frame[36, 32, 2] > 100
+            elif index == 3:
+                assert frame[34:42, 24:40].max() < 40
+            else:
+                assert frame[32, 32, 0] > 100 and frame[32, 32, 1] > 100
+            for offset in (64, 128):
+                assert frame[36, offset + 32, 0] < 80
+                assert frame[36, offset + 32, 2] < 80
+    finally:
+        capture.release()

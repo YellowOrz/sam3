@@ -157,3 +157,23 @@ def lighter_color(
     color: Tuple[int, int, int], amount: float = 0.45
 ) -> Tuple[int, int, int]:
     return tuple(round(channel + (255 - channel) * amount) for channel in color)
+
+
+def draw_geometry(overlay: np.ndarray, geometry: Dict[str, Any]) -> None:
+    """Draw normalized detector points and xywh boxes in place."""
+    height, width = overlay.shape[:2]
+    for x, y in geometry.get("points", []):
+        center = (min(width - 1, round(x * width)), min(height - 1, round(y * height)))
+        cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
+    for x, y, w, h in geometry.get("boxes", []):
+        cv2.rectangle(
+            overlay,
+            (round(x * width), round(y * height)),
+            (
+                min(width - 1, round((x + w) * width)),
+                min(height - 1, round((y + h) * height)),
+            ),
+            (255, 255, 0),
+            2,
+        )

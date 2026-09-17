@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from .video_utils import MASK_ALPHA, probe_video, write_json
+from .video_utils import draw_geometry, MASK_ALPHA, probe_video, write_json
 
 
 def metric_summary(rows: list) -> Dict[str, Any]:
@@ -79,6 +79,7 @@ def compare_masks(
     output_dir: Path,
     max_frames: Optional[int],
     skip_frames: int,
+    geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Write comparison artifacts only after successful aligned decoding."""
     if skip_frames < 0:
@@ -147,6 +148,9 @@ def compare_masks(
                     }
                     rows.append(row)
                     panels = [frames[0].copy() for _ in range(3)]
+                    draw_geometry(
+                        panels[0], (geometry_prompts or {}).get(frame_index, {})
+                    )
                     for panel, mask in zip(panels[1:], (prediction, gt)):
                         panel[mask] = (
                             panel[mask] * (1 - MASK_ALPHA)
@@ -253,7 +257,13 @@ class GTComparison:
         self.sequences: list[Dict[str, Any]] = []
         self.rows: Dict[str, list] = {direction: [] for direction in directions}
 
-    def compare(self, video: Path, output: Path, direction: str) -> None:
+    def compare(
+        self,
+        video: Path,
+        output: Path,
+        direction: str,
+        geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> None:
         if not self.args.compare_gt:
             return
         result = compare_masks(
@@ -262,6 +272,7 @@ class GTComparison:
             output,
             self.args.max_frames,
             self.args.compare_skip_frames,
+            geometry_prompts,
         )
         self.sequences.append({"direction": direction, **result["summary"]})
         self.rows[direction].extend(result["rows"])
