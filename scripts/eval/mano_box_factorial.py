@@ -78,7 +78,14 @@ def reference_exclusions(plan, seq):
     return set(values)
 
 
-def select_sequences(plan, engineering=False):
+def select_sequences(plan, engineering=False, sequence=None):
+    if sequence is not None:
+        if engineering:
+            raise ValueError("A sequence partition must run the full original video")
+        selected = [s for s in plan["sequences"] if s["name"] == sequence]
+        if len(selected) != 1:
+            raise ValueError("Sequence partition must name exactly one registered video")
+        return selected
     if not engineering:
         return plan["sequences"]
     if plan["contract"] == NAKE_CONTRACT:
@@ -295,6 +302,7 @@ def run(a):
     if a.output.exists():
         raise ValueError("Run output must be new; never append to partial videos")
     plan = json.loads((a.root / "plan.json").read_text())
+    sequences = select_sequences(plan, a.engineering, getattr(a, "sequence", None))
     check_inputs(a.root, plan, a.model_source, a.checkpoint)
     tokenizer = a.model_source / "sam3/assets/bpe_simple_vocab_16e6.txt.gz"
     if sha(tokenizer) != plan["tokenizer_sha256"]:
@@ -313,7 +321,8 @@ def run(a):
         gpu=torch.cuda.get_device_name(0), torch_version=torch.__version__,
         started_at=datetime.now(timezone.utc).isoformat(),
         storage_policy="cpu-tracker-and-forward-output-cache-v1" if cpu_storage else "native-gpu",
-        storage_helpers_sha256=helpers, engineering_frames=engineering_frames if a.engineering else None)
+        storage_helpers_sha256=helpers, engineering_frames=engineering_frames if a.engineering else None,
+        sequence_filter=getattr(a, "sequence", None))
     write_json(a.output / "run.json", runinfo)
     started = time.monotonic()
     predictor = Sam3VideoPredictor(checkpoint_path=str(a.checkpoint), bpe_path=str(tokenizer),
@@ -334,7 +343,6 @@ def run(a):
             stack.enter_context(storage.force_tracker_state_cpu(model.tracker))
             stack.enter_context(storage.force_forward_output_cache_cpu(model))
             memory_stream = stack.enter_context((a.output / "storage.jsonl").open("x"))
-        sequences = select_sequences(plan, a.engineering)
         for seq in sequences:
             name = seq["name"]
             n = seq["frame_count"] if not a.engineering else min(engineering_frames, seq["frame_count"])
@@ -714,6 +722,7 @@ def main():
     inference.add_argument("--mode", choices=("text", "box"), required=True)
     inference.add_argument("--engineering", action="store_true")
     inference.add_argument("--engineering-frames", type=int, default=96)
+    inference.add_argument("--sequence", help="One exact registered video, complete from original frame zero; new process per video")
     inference.add_argument("--cpu-tracker-state", action="store_true",
         help="Explicit noninteractive forward-only CPU storage repair; no history deletion")
     inference.add_argument("--equivalent-to", type=Path,

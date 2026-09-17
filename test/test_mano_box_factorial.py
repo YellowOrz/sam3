@@ -11,6 +11,19 @@ from scripts.eval import mano_box_factorial as f
 
 
 class FactorialProtocolTests(unittest.TestCase):
+    def test_sequence_partition_selects_complete_registered_video_only(self):
+        plan = dict(sequences=[dict(name='a', frame_count=99), dict(name='b', frame_count=120)])
+        self.assertEqual(f.select_sequences(plan, sequence='b'), [plan['sequences'][1]])
+        self.assertEqual(f.select_sequences(plan), plan['sequences'])
+        for name in ('missing', '', '../b'):
+            with self.assertRaisesRegex(ValueError, 'exactly one registered'):
+                f.select_sequences(plan, sequence=name)
+        with self.assertRaisesRegex(ValueError, 'full original video'):
+            f.select_sequences(plan, engineering=True, sequence='b')
+        plan['sequences'].append(dict(name='b', frame_count=5))
+        with self.assertRaisesRegex(ValueError, 'exactly one registered'):
+            f.select_sequences(plan, sequence='b')
+
     def test_storage_trace_requires_actual_cpu_tensors_and_full_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
