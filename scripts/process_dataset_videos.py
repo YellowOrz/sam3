@@ -132,10 +132,12 @@ def is_complete(
     expected_frames: int,
     direction: str,
     extra_metadata: Optional[Dict[str, Any]] = None,
+    save_detector: bool = False,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
     masks_path = output_dir / "masks.mkv"
+    detector_path = output_dir / "detector_masks.mkv"
     try:
         with metadata_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -154,13 +156,17 @@ def is_complete(
         )
         and result_path.is_file()
         and masks_path.is_file()
+        and (not save_detector or detector_path.is_file())
     ):
         return False
     try:
         mask_info = probe_video(masks_path)
+        detector_info = probe_video(detector_path) if save_detector else mask_info
     except RuntimeError:
         return False
-    return int(mask_info["frame_count"]) == expected_frames
+    return int(mask_info["frame_count"]) == expected_frames and (
+        not save_detector or int(detector_info["frame_count"]) == expected_frames
+    )
 
 
 def prepare_output_dir(output_dir: Path) -> Tuple[Path, Path, Path]:
@@ -172,7 +178,7 @@ def prepare_output_dir(output_dir: Path) -> Tuple[Path, Path, Path]:
     legacy_masks_dir = output_dir / "masks"
     if legacy_masks_dir.exists():
         shutil.rmtree(legacy_masks_dir)
-    for generated_path in (masks_path, result_path):
+    for generated_path in (masks_path, result_path, output_dir / "detector_masks.mkv"):
         if generated_path.exists():
             generated_path.unlink()
     return masks_path, result_path, metadata_path
@@ -293,6 +299,22 @@ def empty_outputs() -> Dict[str, np.ndarray]:
     }
 
 
+def detector_label_image(
+    outputs: Dict[str, Any], height: int, width: int
+) -> np.ndarray:
+    mask = outputs.get("out_detector_mask")
+    if mask is None:
+        return np.zeros((height, width), dtype=np.uint8)
+    mask = np.asarray(mask)
+    if mask.ndim > 2:
+        mask = np.any(mask.reshape(-1, *mask.shape[-2:]), axis=0)
+    if mask.shape != (height, width):
+        mask = cv2.resize(
+            mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST
+        )
+    return (mask != 0).astype(np.uint8)
+
+
 def write_frame_outputs(
     frame_dir: Path,
     mask_writer: cv2.VideoWriter,
@@ -302,6 +324,7 @@ def write_frame_outputs(
     object_to_label: Dict[int, int],
     prompt: str,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    detector_writer: Optional[cv2.VideoWriter] = None,
 ) -> None:
     frame_path = frame_dir / f"{frame_index:06d}.png"
     frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
@@ -314,6 +337,10 @@ def write_frame_outputs(
     draw_geometry(overlay, geometry)
     mask_writer.write(label_image)
     result_writer.write(overlay)
+    if detector_writer is not None:
+        detector_writer.write(
+            detector_label_image(outputs, frame.shape[0], frame.shape[1])
+        )
 
 
 def propagate_and_write(
@@ -329,6 +356,8 @@ def propagate_and_write(
     prompt: str,
     direction: str,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    save_detector: bool = False,
+    prompt_outputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, int]:
     result_fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     result_writer = cv2.VideoWriter(
@@ -347,14 +376,54 @@ def propagate_and_write(
         mask_writer.release()
         raise RuntimeError(f"cannot create lossless mask video: {masks_path}")
 
+    detector_writer = None
+    if save_detector:
+        detector_writer = cv2.VideoWriter(
+            str(masks_path.with_name("detector_masks.mkv")),
+            mask_fourcc,
+            fps,
+            (width, height),
+            isColor=False,
+        )
+        if not detector_writer.isOpened():
+            result_writer.release()
+            mask_writer.release()
+            detector_writer.release()
+            raise RuntimeError("cannot create lossless detector mask video")
+
     object_to_label: Dict[int, int] = {}
+    prompt_frame = 0 if direction == "forward" else frame_count - 1
     request = {
         "type": "propagate_in_video",
         "session_id": session_id,
         "propagation_direction": direction,
-        "start_frame_index": 0 if direction == "forward" else frame_count - 1,
+        "start_frame_index": prompt_frame,
         "max_frame_num_to_track": frame_count,
     }
+
+    def write(frame_index: int, outputs: Dict[str, Any]) -> None:
+        if (
+            save_detector
+            and prompt_outputs is not None
+            and frame_index == prompt_frame
+            and outputs.get("out_detector_mask") is None
+        ):
+            outputs = {
+                **outputs,
+                "out_detector_mask": prompt_outputs.get("out_detector_mask"),
+            }
+        write_frame_outputs(
+            frame_dir,
+            mask_writer,
+            result_writer,
+            frame_index,
+            outputs,
+            object_to_label,
+            prompt,
+            geometry_prompts,
+            detector_writer,
+        )
+
     try:
         if direction == "backward":
             with tempfile.TemporaryDirectory(
@@ -372,42 +441,26 @@ def propagate_and_write(
                             "while propagating backward"
                         )
                     previous_frame_index = frame_index
-                    obj_ids, probs, masks = normalize_outputs(
-                        response.get("outputs", empty_outputs())
-                    )
-                    np.savez(
-                        output_cache / f"{frame_index:06d}.npz",
-                        out_obj_ids=obj_ids,
-                        out_probs=probs,
-                        out_binary_masks=masks,
-                    )
+                    outputs = response.get("outputs", empty_outputs())
+                    obj_ids, probs, masks = normalize_outputs(outputs)
+                    saved = {
+                        "out_obj_ids": obj_ids,
+                        "out_probs": probs,
+                        "out_binary_masks": masks,
+                    }
+                    if save_detector:
+                        saved["out_detector_mask"] = detector_label_image(
+                            outputs, height, width
+                        )
+                    np.savez(output_cache / f"{frame_index:06d}.npz", **saved)
 
                 for frame_index in range(frame_count):
                     cached_path = output_cache / f"{frame_index:06d}.npz"
                     if cached_path.is_file():
                         with np.load(cached_path) as cached:
-                            outputs = dict(cached.items())
-                            write_frame_outputs(
-                                frame_dir,
-                                mask_writer,
-                                result_writer,
-                                frame_index,
-                                outputs,
-                                object_to_label,
-                                prompt,
-                                geometry_prompts,
-                            )
+                            write(frame_index, dict(cached.items()))
                     else:
-                        write_frame_outputs(
-                            frame_dir,
-                            mask_writer,
-                            result_writer,
-                            frame_index,
-                            empty_outputs(),
-                            object_to_label,
-                            prompt,
-                            geometry_prompts,
-                        )
+                        write(frame_index, empty_outputs())
         else:
             next_frame_index = 0
             for response in predictor.handle_stream_request(request):
@@ -420,44 +473,19 @@ def propagate_and_write(
                         f"{next_frame_index - 1}"
                     )
                 while next_frame_index < frame_index:
-                    write_frame_outputs(
-                        frame_dir,
-                        mask_writer,
-                        result_writer,
-                        next_frame_index,
-                        empty_outputs(),
-                        object_to_label,
-                        prompt,
-                        geometry_prompts,
-                    )
+                    write(next_frame_index, empty_outputs())
                     next_frame_index += 1
-                write_frame_outputs(
-                    frame_dir,
-                    mask_writer,
-                    result_writer,
-                    frame_index,
-                    response.get("outputs", empty_outputs()),
-                    object_to_label,
-                    prompt,
-                    geometry_prompts,
-                )
+                write(frame_index, response.get("outputs", empty_outputs()))
                 next_frame_index = frame_index + 1
 
             while next_frame_index < frame_count:
-                write_frame_outputs(
-                    frame_dir,
-                    mask_writer,
-                    result_writer,
-                    next_frame_index,
-                    empty_outputs(),
-                    object_to_label,
-                    prompt,
-                    geometry_prompts,
-                )
+                write(next_frame_index, empty_outputs())
                 next_frame_index += 1
     finally:
         mask_writer.release()
         result_writer.release()
+        if detector_writer is not None:
+            detector_writer.release()
     return object_to_label
 
 
@@ -498,6 +526,7 @@ def process_video(
     extra_metadata: Optional[Dict[str, Any]] = None,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
     predictor_factory: Optional[Callable[[], Any]] = None,
+    save_detector: bool = False,
 ) -> str:
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
@@ -509,6 +538,7 @@ def process_video(
         requested_frames,
         direction,
         extra_metadata if geometry_prompts is not None else None,
+        save_detector,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -560,7 +590,7 @@ def process_video(
                 request.update(
                     type="add_geometry_prompts", geometry_prompts=geometry_prompts
                 )
-            predictor.handle_request(request)
+            prompt_response = predictor.handle_request(request)
             object_to_label = propagate_and_write(
                 predictor=predictor,
                 session_id=session_id,
@@ -574,6 +604,10 @@ def process_video(
                 prompt=prompt,
                 direction=direction,
                 geometry_prompts=geometry_prompts,
+                save_detector=save_detector,
+                prompt_outputs=(
+                    prompt_response.get("outputs") if save_detector else None
+                ),
             )
 
         metadata.update(
@@ -593,6 +627,11 @@ def process_video(
                     "visualization_video": result_path.name,
                     "label_dtype": "uint8",
                     "background_label": 0,
+                    **(
+                        {"detector_masks_video": "detector_masks.mkv"}
+                        if save_detector
+                        else {}
+                    ),
                 },
             }
         )

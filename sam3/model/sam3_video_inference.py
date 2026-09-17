@@ -460,6 +460,7 @@ class Sam3VideoInference(Sam3VideoBase):
             tracker_metadata_new,
             frame_stats,
             _,
+            det_out,
         ) = self._det_track_one_frame(
             frame_idx=frame_idx,
             num_frames=inference_state["num_frames"],
@@ -497,6 +498,7 @@ class Sam3VideoInference(Sam3VideoBase):
             "obj_id_to_tracker_score": tracker_metadata_new[
                 "obj_id_to_tracker_score_frame_wise"
             ][frame_idx],
+            "det_out": det_out,
         }
         # removed_obj_ids is only needed on rank 0 to handle hotstart delay buffer
         if self.rank == 0:
@@ -515,6 +517,22 @@ class Sam3VideoInference(Sam3VideoBase):
                 out["unconfirmed_obj_ids"] = []
 
         return out
+
+    def _union_detector_mask(self, det_out, height, width):
+        """Video-resolution union of thresholded detector masks; empty if none."""
+        empty = np.zeros((height, width), dtype=bool)
+        if not det_out:
+            return empty
+        masks = det_out.get("mask")
+        if masks is None or masks.numel() == 0:
+            return empty
+        video = F.interpolate(
+            masks.unsqueeze(1).float(),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return video.squeeze(1).gt(0).any(dim=0).cpu().numpy()
 
     def _postprocess_output(
         self,
@@ -617,6 +635,9 @@ class Sam3VideoInference(Sam3VideoBase):
             "out_tracker_probs": out_tracker_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
+            "out_detector_mask": self._union_detector_mask(
+                out.get("det_out"), H_video, W_video
+            ),
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
@@ -1009,7 +1030,9 @@ class Sam3VideoInference(Sam3VideoBase):
 
         num_frames = inference_state["num_frames"]
         assert (
-            text_str is not None or boxes_xywh is not None or geometry_prompts is not None
+            text_str is not None
+            or boxes_xywh is not None
+            or geometry_prompts is not None
         ), "at least one type of prompt (text, boxes, geometry) must be provided"
         assert (
             0 <= frame_idx < num_frames
@@ -1019,7 +1042,9 @@ class Sam3VideoInference(Sam3VideoBase):
         if geometry_prompts is not None:
             if text_str is not None:
                 if not isinstance(text_str, str) or text_str.strip() == "visual":
-                    raise ValueError("geometry text must be a string other than 'visual'")
+                    raise ValueError(
+                        "geometry text must be a string other than 'visual'"
+                    )
                 text_str = text_str.strip() or None
             if boxes_xywh is not None or box_labels is not None:
                 raise ValueError("put detector boxes inside geometry_prompts")

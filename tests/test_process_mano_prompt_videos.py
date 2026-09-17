@@ -431,3 +431,84 @@ def test_output_videos_overlay_and_configuration_skip(tmp_path, direction, text)
     assert data["mano"] == metadata["mano"] and data["status"] == "success"
     assert run(metadata) == "skipped"
     assert run({"mano": {"mode": "points"}}) == "success"
+
+
+def test_union_detector_mask_empty_and_threshold():
+    empty = Sam3VideoInference._union_detector_mask(
+        None, {"mask": torch.zeros(0, 2, 2)}, 4, 4
+    )
+    assert empty.shape == (4, 4) and not empty.any()
+    logits = torch.tensor([[[-1.0, 2.0], [-1.0, -1.0]]])
+    union = Sam3VideoInference._union_detector_mask(None, {"mask": logits}, 2, 2)
+    assert union[0, 1] and not union[0, 0]
+
+
+def test_save_detector_writes_binary_and_reuses_prompt_frame(tmp_path):
+    video = tmp_path / "color.mp4"
+    make_video(video)
+    output = tmp_path / "out"
+    detector = np.zeros((80, 100), dtype=bool)
+    detector[10:20, 10:20] = True
+
+    class Predictor:
+        def handle_request(self, request):
+            return {
+                "session_id": "s",
+                "outputs": {"out_detector_mask": detector},
+            }
+
+        def handle_stream_request(self, request):
+            indices = range(3)
+            for index in indices:
+                yield {
+                    "frame_index": index,
+                    "outputs": {
+                        **dataset.empty_outputs(),
+                        "out_detector_mask": detector if index != 1 else None,
+                    },
+                }
+
+    assert (
+        dataset.process_video(
+            Predictor(),
+            video,
+            output,
+            tmp_path,
+            "left hand",
+            "sam3",
+            None,
+            False,
+            "forward",
+            extra_metadata={"mano": {"mode": "both"}},
+            geometry_prompts={0: {"points": [[0.5, 0.5]]}},
+            save_detector=True,
+        )
+        == "success"
+    )
+    assert dataset.probe_video(output / "detector_masks.mkv")["frame_count"] == 3
+    capture = cv2.VideoCapture(str(output / "detector_masks.mkv"))
+    ok, frame = capture.read()
+    capture.release()
+    assert ok
+    label = frame[:, :, 0] if frame.ndim == 3 else frame
+    assert set(np.unique(label)) <= {0, 1}
+    assert label[15, 15] == 1
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["outputs"]["detector_masks_video"] == "detector_masks.mkv"
+    assert (
+        dataset.process_video(
+            Predictor(),
+            video,
+            output,
+            tmp_path,
+            "left hand",
+            "sam3",
+            None,
+            False,
+            "forward",
+            extra_metadata={"mano": {"mode": "both"}},
+            geometry_prompts={0: {"points": [[0.5, 0.5]]}},
+            save_detector=True,
+        )
+        == "skipped"
+    )

@@ -144,6 +144,31 @@ def test_comparison_sampling_metrics_and_frame_limit(tmp_path: Path) -> None:
     assert metric_summary([])["mean_iou"] is None
 
 
+def test_comparison_includes_detector_column_and_metrics(tmp_path: Path) -> None:
+    import json
+
+    import numpy as np
+
+    from scripts.common.compare_gt_masks import compare_masks
+    from scripts.common.video_utils import probe_video
+
+    rgb, gt, output, _ = comparison_fixture(tmp_path)
+    empty = np.zeros((48, 64), dtype=np.uint8)
+    full = np.ones_like(empty)
+    write_video(
+        output / "detector_masks.mkv",
+        [full, empty, empty, full, empty, empty, empty],
+    )
+    result = compare_masks(
+        rgb, gt, output, None, 2, detector_path=output / "detector_masks.mkv"
+    )
+    assert [row["detector_iou"] for row in result["rows"]] == [0, 0, 0]
+    assert result["summary"]["detector_mean_iou"] == 0
+    assert probe_video(output / "comparison.mp4")["width"] == 256
+    metrics = json.loads((output / "gt_metrics.json").read_text())
+    assert metrics["detector_video"].endswith("detector_masks.mkv")
+
+
 @pytest.mark.parametrize(
     "problem", ["missing", "count", "fps", "dimensions", "channels"]
 )

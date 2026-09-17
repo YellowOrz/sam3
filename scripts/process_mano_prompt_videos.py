@@ -33,9 +33,13 @@ MANO 文件位于视频同级 <mano-dir-name>/<left|right>_hand/result_mano_*.np
   --compare-gt：启用 GT 评测；--gt-mask-name：启用评测时必填，不从手侧推导。
   --gt-dir-name：RGB 同级 GT 目录名，默认 masks_sam3。
   --compare-skip-frames：每次评测后跳过的帧数，默认 0；2 评测第 0、3、6…帧。
-      生成 comparison.mp4、gt_metrics.csv/json 和根目录 gt_summary.json。
+      生成 comparison.mp4、gt_metrics.csv/json 和根目录 gt_summary.json
       comparison.mp4 最左侧 RGB 列叠加该帧实际使用的黄色点／青色框。
       完整预测可免 GPU 补评测，仍校验 MANO 和缓存配置；GT 失败保留预测并继续批次。
+  --save-detector：另存 detector_masks.mkv（阈值后的原始 det_out 并集，FFV1 gray8）。
+      与 --compare-gt 同时开启时，comparison.mp4 为 RGB／Detector／Prediction／GT，
+      并在 gt_metrics 中增加 detector_* 指标。无 GT 时不生成 comparison.mp4。
+      缺少完整 detector 视频的已有预测会重新推理。
 
 示例：python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT \
   --text-prompt "left hand" --hand-side left --prompt-mode both --device cuda:0 --list-only
@@ -281,6 +285,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="MANO directory beside RGB (default: MANO_wilor); missing hand NPZ skips video",
     )
     parser.add_argument("--focal-length", type=positive_float)
+    parser.add_argument(
+        "--save-detector",
+        action="store_true",
+        help="Save thresholded detector masks as detector_masks.mkv",
+    )
     return parser
 
 
@@ -395,6 +404,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             extra_metadata=extra,
                             geometry_prompts=prompts,
                             predictor_factory=get_predictor,
+                            save_detector=args.save_detector,
                         )
                         comparison.compare(video, destination, direction, prompts)
                     except Exception as exc:

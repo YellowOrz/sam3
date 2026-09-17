@@ -537,6 +537,7 @@ class Sam3VideoBase(nn.Module):
             tracker_metadata_new,
             frame_stats,
             tracker_obj_scores_global,  # 字典：obj_id --> tracker 帧级分数
+            det_out,
         )
 
     def _suppress_detections_close_to_boundary(self, boxes, margin=0.025):
