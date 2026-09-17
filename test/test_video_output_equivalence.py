@@ -37,6 +37,12 @@ class EquivalenceTests(unittest.TestCase):
         q.begin('new',4); q.finish_sequence()
         self.assertEqual(q.summary()['identical_records'],4)
 
+    def test_algorithm_change_is_not_storage_equivalence(self):
+        bad=dict(self.info,tracker_policy='successful-recondition-selected-mask-v1',tracker_policy_sha256='patch')
+        with self.assertRaisesRegex(ValueError,'Algorithm policy differs'):
+            SavedOutputEquivalence(self.root,bad)
+        SavedOutputEquivalence(self.root,dict(self.info,tracker_policy='legacy',tracker_policy_sha256=None))
+
     def test_engineering_subset(self):
         q=SavedOutputEquivalence(self.root,self.info); q.begin('a',1)
         for row in self.rows[:2]: q.check(row)

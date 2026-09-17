@@ -284,6 +284,17 @@ def run(a):
     import resource
     cpu_storage = getattr(a, "cpu_tracker_state", False)
     equivalent_to = getattr(a, "equivalent_to", None)
+    consistent_reconditioning = getattr(a, "consistent_reconditioning", False)
+    policy_module = None
+    if consistent_reconditioning:
+        if equivalent_to is not None:
+            raise ValueError("Algorithm experiment cannot claim storage-only output equivalence")
+        if not getattr(a, "sequence", None):
+            raise ValueError("Reconditioning experiment requires one complete --sequence per process")
+        if __package__:
+            from scripts.eval import recondition_consistency as policy_module
+        else:
+            import recondition_consistency as policy_module
     engineering_frames = getattr(a, "engineering_frames", 96)
     if engineering_frames < 1 or (not a.engineering and engineering_frames != 96):
         raise ValueError("Engineering length requires a positive explicit engineering run")
@@ -322,7 +333,9 @@ def run(a):
         started_at=datetime.now(timezone.utc).isoformat(),
         storage_policy="cpu-tracker-and-forward-output-cache-v1" if cpu_storage else "native-gpu",
         storage_helpers_sha256=helpers, engineering_frames=engineering_frames if a.engineering else None,
-        sequence_filter=getattr(a, "sequence", None))
+        sequence_filter=getattr(a, "sequence", None),
+        tracker_policy=policy_module.POLICY if policy_module else "legacy",
+        tracker_policy_sha256=sha(policy_module.__file__) if policy_module else None)
     write_json(a.output / "run.json", runinfo)
     started = time.monotonic()
     predictor = Sam3VideoPredictor(checkpoint_path=str(a.checkpoint), bpe_path=str(tokenizer),
@@ -337,8 +350,12 @@ def run(a):
     counts, summaries = {}, {}
     stack = ExitStack()
     verifier = SavedOutputEquivalence(equivalent_to, runinfo) if equivalent_to is not None else None
+    policy = None
 
     try:
+        if policy_module is not None:
+            policy_stream = stack.enter_context((a.output / "reconditioning.jsonl").open("x"))
+            policy = stack.enter_context(policy_module.ConsistentReconditioning(model, policy_stream))
         if cpu_storage:
             stack.enter_context(storage.force_tracker_state_cpu(model.tracker))
             stack.enter_context(storage.force_forward_output_cache_cpu(model))
@@ -474,11 +491,15 @@ def run(a):
             memory_stream.flush()
             if any(sha(Path(__file__).parent / p) != digest for p, digest in helpers.items()):
                 raise ValueError("Storage repair helper changed during inference")
+        if policy_module is not None and sha(policy_module.__file__) != runinfo["tracker_policy_sha256"]:
+            raise ValueError("Reconditioning policy changed during inference")
         write_json(a.output / "summary.json", dict(status="complete", **runinfo, counts=counts,
             sequences=summaries, frozen_weights_verified=True, output_records=len(records),
             records_sha256={s: sha(a.output / f"{s}.jsonl") for s in counts},
             elapsed_seconds=time.monotonic()-started, peak_cuda_bytes=torch.cuda.max_memory_allocated(),
             equivalence=equivalence,
+            reconditioning_counts=dict(policy.counts) if policy is not None else None,
+            reconditioning_records_sha256=sha(a.output / "reconditioning.jsonl") if policy is not None else None,
             storage_records_sha256=sha(a.output / "storage.jsonl") if cpu_storage else None))
     except Exception as exc:
         write_json(a.output / "failure.json", dict(error=f"{type(exc).__name__}: {exc}",
@@ -544,6 +565,34 @@ def verify_storage_trace(folder, summary):
             raise ValueError("Host RAM reserve violated")
 
 
+def verify_reconditioning_trace(folder, summary):
+    policy = summary.get("tracker_policy", "legacy")
+    if policy == "legacy":
+        return
+    if policy != "successful-recondition-selected-mask-v1":
+        raise ValueError("Unknown tracker experiment policy")
+    path = folder / "reconditioning.jsonl"
+    if sha(path) != summary["reconditioning_records_sha256"]:
+        raise ValueError("Reconditioning trace changed")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    calls = [r for r in events if r["event"] == "recondition"]
+    selected = [r for r in events if r["event"] == "selected"]
+    memory = [r for r in events if r["event"] == "memory_input"]
+    output = [r for r in events if r["event"] == "output_source"]
+    # Each independent run uses one original video when this policy is audited.
+    if len(summary["counts"]) != 1:
+        raise ValueError("Policy audit requires one complete video per process")
+    counts = summary["reconditioning_counts"]
+    if (counts["correction_calls"] != len(calls) or counts["corrected_objects"] != len(selected)
+            or counts["memory_writes_with_correction"] != len(memory)
+            or counts["outputs_with_correction"] != len(output)):
+        raise ValueError("Reconditioning counter/trace mismatch")
+    if [(r["frame"], r["masks"]) for r in memory] != [(r["frame"], r["masks"]) for r in output]:
+        raise ValueError("Memory input and output did not share selected mask source")
+    if counts["corrected_frames"] != len(memory):
+        raise ValueError("Missing memory/output for successful correction")
+
+
 def audit(a):
     if a.output.exists():
         raise ValueError("Audit output must be new")
@@ -554,6 +603,7 @@ def audit(a):
             or summary["contract"] != plan["contract"]):
         raise ValueError("Require complete run from exactly this plan")
     verify_storage_trace(a.run, summary)
+    verify_reconditioning_trace(a.run, summary)
     records = []
     for s in summary["counts"]:
         path = a.run / f"{s}.jsonl"
@@ -649,6 +699,9 @@ def compare(a):
     for key in ("storage_policy", "storage_helpers_sha256"):
         if runs[0].get(key) != runs[1].get(key):
             raise ValueError(f"Unpaired storage-only repair field: {key}")
+    if (runs[0].get("tracker_policy", "legacy") != runs[1].get("tracker_policy", "legacy")
+            or runs[0].get("tracker_policy_sha256") != runs[1].get("tracker_policy_sha256")):
+        raise ValueError("Unpaired tracker policy; do not confuse algorithm and prompt effects")
     if runs[0]["plan_sha256"] != sha(a.root / "plan.json") or runs[0]["contract"] != plan["contract"]:
         raise ValueError("Different data plan")
     counts = {s["name"]: s["frame_count"] for s in plan["sequences"]}
@@ -725,6 +778,8 @@ def main():
     inference.add_argument("--sequence", help="One exact registered video, complete from original frame zero; new process per video")
     inference.add_argument("--cpu-tracker-state", action="store_true",
         help="Explicit noninteractive forward-only CPU storage repair; no history deletion")
+    inference.add_argument("--consistent-reconditioning", action="store_true",
+        help="Opt-in single-GPU SAM3 experiment: successful corrections feed output and memory; legacy default unchanged")
     inference.add_argument("--equivalent-to", type=Path,
         help="Original failed run whose saved prefix must match every RLE, ID and score exactly")
     inference.add_argument("--max-seconds", type=int, default=10800)

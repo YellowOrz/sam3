@@ -11,6 +11,32 @@ from scripts.eval import mano_box_factorial as f
 
 
 class FactorialProtocolTests(unittest.TestCase):
+    def test_reconditioning_trace_checks_shared_source_and_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);path=root/'reconditioning.jsonl'
+            mask={'7':dict(shape=[4,4],pixels=4,sha256='same')}
+            rows=[dict(event='selected',frame=16,id=7),dict(event='recondition',frame=16,succeeded=[7]),
+                  dict(event='memory_input',frame=16,masks=mask),dict(event='output_source',frame=16,masks=mask)]
+            summary=dict(tracker_policy='successful-recondition-selected-mask-v1',counts={'a':32},
+                reconditioning_counts=dict(correction_calls=1,corrected_objects=1,corrected_frames=1,
+                    memory_writes_with_correction=1,outputs_with_correction=1))
+            def save():
+                path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
+                summary['reconditioning_records_sha256']=f.sha(path)
+            save();f.verify_reconditioning_trace(root,summary)
+            rows[-1]=dict(rows[-1],masks={})
+            save()
+            with self.assertRaisesRegex(ValueError,'share selected mask source'):
+                f.verify_reconditioning_trace(root,summary)
+            path.write_text('tampered')
+            with self.assertRaisesRegex(ValueError,'trace changed'):
+                f.verify_reconditioning_trace(root,summary)
+            f.verify_reconditioning_trace(root,{})
+
+    def test_algorithm_experiment_rejects_equivalence_flag_before_inference(self):
+        with self.assertRaisesRegex(ValueError,'cannot claim storage-only'):
+            f.run(argparse.Namespace(consistent_reconditioning=True,equivalent_to=Path('baseline')))
+
     def test_sequence_partition_selects_complete_registered_video_only(self):
         plan = dict(sequences=[dict(name='a', frame_count=99), dict(name='b', frame_count=120)])
         self.assertEqual(f.select_sequences(plan, sequence='b'), [plan['sequences'][1]])

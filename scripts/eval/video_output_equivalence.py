@@ -17,6 +17,9 @@ class SavedOutputEquivalence:
         self.root = Path(baseline)
         self.hashes = {'run.json': sha(self.root / 'run.json')}
         original = json.loads((self.root / 'run.json').read_text())
+        if (original.get('tracker_policy', 'legacy') != runinfo.get('tracker_policy', 'legacy')
+                or original.get('tracker_policy_sha256') != runinfo.get('tracker_policy_sha256')):
+            raise ValueError('Algorithm policy differs; not a storage-only equivalence check')
         for key in ('contract', 'plan_sha256', 'base_sha256', 'model_source_sha256',
                     'mode', 'gpu', 'torch_version'):
             if original[key] != runinfo[key]:
