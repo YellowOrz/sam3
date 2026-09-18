@@ -38,7 +38,11 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from scripts.common.compare_gt_masks import (
+        DETECTOR_COLOR,
+        GTComparison,
+        validate_gt_arguments,
+    )
     from scripts.common.video_cli import (
         add_video_arguments,
         discover_rgb_videos,
@@ -57,7 +61,11 @@ if __package__:
         write_json,
     )
 else:
-    from common.compare_gt_masks import GTComparison, validate_gt_arguments
+    from common.compare_gt_masks import (  # type: ignore[no-redef]
+        DETECTOR_COLOR,
+        GTComparison,
+        validate_gt_arguments,
+    )
     from common.video_cli import (
         add_video_arguments,
         discover_rgb_videos,
@@ -156,7 +164,13 @@ def is_complete(
         )
         and result_path.is_file()
         and masks_path.is_file()
-        and (not save_detector or detector_path.is_file())
+        and (
+            not save_detector
+            or (
+                detector_path.is_file()
+                and (output_dir / "detector_result.mp4").is_file()
+            )
+        )
     ):
         return False
     try:
@@ -178,7 +192,12 @@ def prepare_output_dir(output_dir: Path) -> Tuple[Path, Path, Path]:
     legacy_masks_dir = output_dir / "masks"
     if legacy_masks_dir.exists():
         shutil.rmtree(legacy_masks_dir)
-    for generated_path in (masks_path, result_path, output_dir / "detector_masks.mkv"):
+    for generated_path in (
+        masks_path,
+        result_path,
+        output_dir / "detector_masks.mkv",
+        output_dir / "detector_result.mp4",
+    ):
         if generated_path.exists():
             generated_path.unlink()
     return masks_path, result_path, metadata_path
@@ -324,7 +343,9 @@ def write_frame_outputs(
     object_to_label: Dict[int, int],
     prompt: str,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    overlay_geometry: Optional[Dict[int, Dict[str, Any]]] = None,
     detector_writer: Optional[cv2.VideoWriter] = None,
+    detector_result_writer: Optional[cv2.VideoWriter] = None,
 ) -> None:
     frame_path = frame_dir / f"{frame_index:06d}.png"
     frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
@@ -333,14 +354,27 @@ def write_frame_outputs(
     label_image, overlay = build_label_and_overlay(
         frame, outputs, object_to_label, frame_index, prompt
     )
-    geometry = (geometry_prompts or {}).get(frame_index, {})
-    draw_geometry(overlay, geometry)
+    draw_geometry(
+        overlay, (overlay_geometry or geometry_prompts or {}).get(frame_index, {})
+    )
     mask_writer.write(label_image)
     result_writer.write(overlay)
+    detector = (
+        detector_label_image(outputs, frame.shape[0], frame.shape[1])
+        if detector_writer is not None or detector_result_writer is not None
+        else None
+    )
     if detector_writer is not None:
-        detector_writer.write(
-            detector_label_image(outputs, frame.shape[0], frame.shape[1])
-        )
+        detector_writer.write(detector)
+    if detector_result_writer is not None:
+        panel = frame.copy()
+        mask = detector != 0
+        if mask.any():
+            panel[mask] = (
+                panel[mask] * (1 - MASK_ALPHA) + DETECTOR_COLOR * MASK_ALPHA
+            ).astype(np.uint8)
+        draw_geometry(panel, (geometry_prompts or {}).get(frame_index, {}))
+        detector_result_writer.write(panel)
 
 
 def propagate_and_write(
@@ -356,6 +390,7 @@ def propagate_and_write(
     prompt: str,
     direction: str,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    overlay_geometry: Optional[Dict[int, Dict[str, Any]]] = None,
     save_detector: bool = False,
     prompt_outputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, int]:
@@ -377,6 +412,7 @@ def propagate_and_write(
         raise RuntimeError(f"cannot create lossless mask video: {masks_path}")
 
     detector_writer = None
+    detector_result_writer = None
     if save_detector:
         detector_writer = cv2.VideoWriter(
             str(masks_path.with_name("detector_masks.mkv")),
@@ -385,11 +421,18 @@ def propagate_and_write(
             (width, height),
             isColor=False,
         )
-        if not detector_writer.isOpened():
+        detector_result_writer = cv2.VideoWriter(
+            str(result_path.with_name("detector_result.mp4")),
+            result_fourcc,
+            fps,
+            (width, height),
+        )
+        if not detector_writer.isOpened() or not detector_result_writer.isOpened():
             result_writer.release()
             mask_writer.release()
             detector_writer.release()
-            raise RuntimeError("cannot create lossless detector mask video")
+            detector_result_writer.release()
+            raise RuntimeError("cannot create detector mask or result video")
 
     object_to_label: Dict[int, int] = {}
     prompt_frame = 0 if direction == "forward" else frame_count - 1
@@ -421,7 +464,9 @@ def propagate_and_write(
             object_to_label,
             prompt,
             geometry_prompts,
+            overlay_geometry,
             detector_writer,
+            detector_result_writer,
         )
 
     try:
@@ -486,6 +531,8 @@ def propagate_and_write(
         result_writer.release()
         if detector_writer is not None:
             detector_writer.release()
+        if detector_result_writer is not None:
+            detector_result_writer.release()
     return object_to_label
 
 
@@ -525,6 +572,7 @@ def process_video(
     prompt_request_type: str = "text",
     extra_metadata: Optional[Dict[str, Any]] = None,
     geometry_prompts: Optional[Dict[int, Dict[str, Any]]] = None,
+    overlay_geometry: Optional[Dict[int, Dict[str, Any]]] = None,
     predictor_factory: Optional[Callable[[], Any]] = None,
     save_detector: bool = False,
 ) -> str:
@@ -604,6 +652,7 @@ def process_video(
                 prompt=prompt,
                 direction=direction,
                 geometry_prompts=geometry_prompts,
+                overlay_geometry=overlay_geometry,
                 save_detector=save_detector,
                 prompt_outputs=(
                     prompt_response.get("outputs") if save_detector else None
@@ -628,7 +677,10 @@ def process_video(
                     "label_dtype": "uint8",
                     "background_label": 0,
                     **(
-                        {"detector_masks_video": "detector_masks.mkv"}
+                        {
+                            "detector_masks_video": "detector_masks.mkv",
+                            "detector_visualization_video": "detector_result.mp4",
+                        }
                         if save_detector
                         else {}
                     ),

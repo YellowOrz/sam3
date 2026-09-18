@@ -157,12 +157,13 @@ def test_inference_cached_comparison_and_failure(
     ]
     if processor is mano:
         args += ["--hand-side", "left"]
-        monkeypatch.setattr(mano, "find_mano", lambda *args: root / "geometry.npz")
+        monkeypatch.setattr(mano, "find_mano", lambda *args: [root / "geometry.npz"])
         monkeypatch.setattr(
             mano,
             "load_geometry",
             lambda *args: (
                 {0: {"points": [[0.5, 0.5]]}},
+                {},
                 {"missing_frames": [], "unusable_prompt_frames": []},
             ),
         )
@@ -273,12 +274,13 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
         sys.modules, "sam3", SimpleNamespace(build_sam3_predictor=build)
     )
     monkeypatch.setattr(dataset, "require_cuda", lambda *args: True)
-    monkeypatch.setattr(mano, "find_mano", lambda *args: root / "geometry.npz")
+    monkeypatch.setattr(mano, "find_mano", lambda *args: [root / "geometry.npz"])
     monkeypatch.setattr(
         mano,
         "load_geometry",
         lambda *args: (
             {0: {"points": [[0.5, 0.5]]}},
+            {},
             {"missing_frames": [], "unusable_prompt_frames": []},
         ),
     )
@@ -346,16 +348,16 @@ def test_shared_io_discovery_and_validation(
     ]
     checked = []
 
-    def find_mano(video, side, name, dir_name):
+    def find_mano(video, side, dir_name):
         checked.append(video)
-        return video.with_suffix(".npz")
+        return [video.with_suffix(".npz")]
 
     monkeypatch.setattr(mano, "find_mano", find_mano)
     monkeypatch.setattr(dataset, "probe_video", lambda path: {})
     monkeypatch.setattr(
         mano,
         "load_geometry",
-        lambda *args: ({}, {"missing_frames": [], "unusable_prompt_frames": []}),
+        lambda *args: ({}, {}, {"missing_frames": [], "unusable_prompt_frames": []}),
     )
     assert processor.main(argv) == 0
     listing = capsys.readouterr().out

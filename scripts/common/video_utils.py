@@ -159,11 +159,65 @@ def lighter_color(
     return tuple(round(channel + (255 - channel) * amount) for channel in color)
 
 
+MANO_EDGES = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (0, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (0, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
+
+
+def _pixel(x: float, y: float, width: int, height: int) -> Tuple[int, int]:
+    return (
+        min(width - 1, round(x * width)),
+        min(height - 1, round(y * height)),
+    )
+
+
 def draw_geometry(overlay: np.ndarray, geometry: Dict[str, Any]) -> None:
-    """Draw normalized detector points and xywh boxes in place."""
+    """Draw normalized detector points, xywh boxes, and optional MANO hands."""
     height, width = overlay.shape[:2]
+    for hand in geometry.get("hands", []):
+        joints = np.asarray(hand, dtype=np.float64)
+        for start, end in MANO_EDGES:
+            if start >= len(joints) or end >= len(joints):
+                continue
+            if not (
+                np.isfinite(joints[start]).all() and np.isfinite(joints[end]).all()
+            ):
+                continue
+            cv2.line(
+                overlay,
+                _pixel(*joints[start], width, height),
+                _pixel(*joints[end], width, height),
+                (0, 200, 200),
+                1,
+                cv2.LINE_AA,
+            )
+        for x, y in joints:
+            if not np.isfinite([x, y]).all():
+                continue
+            center = _pixel(x, y, width, height)
+            cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
     for x, y in geometry.get("points", []):
-        center = (min(width - 1, round(x * width)), min(height - 1, round(y * height)))
+        center = _pixel(x, y, width, height)
         cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
     for x, y, w, h in geometry.get("boxes", []):

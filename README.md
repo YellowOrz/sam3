@@ -168,7 +168,7 @@ output = response["outputs"]
 
 ### MANO-guided video segmentation (SAM3)
 
-[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads a unique `MANO_wilor/<left|right>_hand/result_mano_*.npz`; use `--mano-dir-name NAME` to replace `MANO_wilor`, and `--mano-name` when the hand directory contains multiple files. Videos missing the requested hand directory or NPZ file are skipped without inference or GT evaluation; invalid or ambiguous MANO data still fails. Check inputs first:
+[`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads all `*.npz` files under `MANO_wilor/<left|right>_hand/` (override the directory with `--mano-dir-name NAME`) and feeds every file's boxes/points into one detector query. Videos missing the requested hand directory or NPZ file are skipped without inference or GT evaluation; any invalid NPZ still fails. Check inputs first:
 
 ```bash
 python scripts/process_mano_prompt_videos.py \
@@ -177,7 +177,7 @@ python scripts/process_mano_prompt_videos.py \
     --checkpoint /path/to/sam3.pt --device cuda:0 --list-only
 ```
 
-Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` displays the actual points and boxes, and `masks.mkv` stores lossless instance labels. With GT evaluation enabled, `comparison.mp4` also overlays the sampled frame's actual geometry on its leftmost RGB panel. The script's Chinese header documents every option and TODO, including SAM3.1, visibility filtering, and matching multiple MANO files.
+Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint points, a projected bounding box, or both. Boxes default to mesh vertices with 5% padding per side (`--box-source mesh|joints`, `--box-padding 0.05`). Prompts apply on frames 0, N, 2N… (`--prompt-interval N`, default 1). Missing MANO frames retain text detection and tracking. All predicted instances are preserved; `result.mp4` overlays predictions, the MANO skeleton on frames that have a hand, and the actual prompt points/boxes. `masks.mkv` stores lossless instance labels. `--save-detector` also writes `detector_masks.mkv` and `detector_result.mp4`. With GT evaluation enabled, `comparison.mp4` overlays the sampled frame's skeleton and actual geometry on its leftmost RGB panel. The script's Chinese header documents every option and TODO, including SAM3.1 and visibility filtering.
 
 ### GT evaluation for video scripts
 

@@ -64,10 +64,12 @@ INFO = dict(width=100, height=80, frame_count=3, fps=10.0)
 @pytest.mark.parametrize("source", ["mesh", "joints"])
 def test_modes_projection_alignment_and_missing_frames(tmp_path, mode, source):
     path = sample_npz(tmp_path / "sample.npz")
-    prompts, metadata = mano.load_geometry(
+    prompts, overlay, metadata = mano.load_geometry(
         path, INFO, arguments("--prompt-mode", mode, "--box-source", source)
     )
     assert set(prompts) == {0, 2}
+    assert set(overlay) == {0, 2}
+    assert len(overlay[0]) == 1
     assert metadata["missing_frames"] == [1]
     assert metadata["unusable_prompt_frames"] == []
     expected_keys = (
@@ -87,8 +89,11 @@ def test_modes_projection_alignment_and_missing_frames(tmp_path, mode, source):
             else [0.28, 0.3625, 0.44, 0.275]
         )
         np.testing.assert_allclose(prompts[0]["boxes"][0], expected)
-    sparse, _ = mano.load_geometry(path, INFO, arguments("--prompt-interval", "3"))
+    sparse, sparse_overlay, _ = mano.load_geometry(
+        path, INFO, arguments("--prompt-interval", "3")
+    )
     assert set(sparse) == {0}
+    assert set(sparse_overlay) == {0, 2}
 
 
 def test_invalid_coordinates_clipping_and_schema(tmp_path):
@@ -101,7 +106,7 @@ def test_invalid_coordinates_clipping_and_schema(tmp_path):
     )
     np.testing.assert_allclose(xy, [[50, 40], [250, 40]])
     path = sample_npz(tmp_path / "sample.npz")
-    prompts, _ = mano.load_geometry(path, INFO, arguments("--box-padding", "5"))
+    prompts, _, _ = mano.load_geometry(path, INFO, arguments("--box-padding", "5"))
     np.testing.assert_allclose(prompts[0]["boxes"], [[0, 0, 1, 1]])
     for override, message in [
         ({"width": 101}, "dimensions"),
@@ -121,7 +126,7 @@ def test_cli_invalid_options_and_ambiguous_files(tmp_path):
         ["--prompt-interval", "0"],
         ["--box-padding", "nan"],
         ["--focal-length", "0"],
-        ["--mano-name", "../result.npz"],
+        ["--mano-name", "result.npz"],
         ["--mano-dir-name", "../MANO"],
         ["--mano-dir-name", ""],
         ["--mano-dir-name", "*"],
@@ -131,13 +136,10 @@ def test_cli_invalid_options_and_ambiguous_files(tmp_path):
             arguments(*extra)
     video = tmp_path / "color.mp4"
     with pytest.raises(FileNotFoundError):
-        mano.find_mano(video, "left", None)
-    first = sample_npz(tmp_path / "MANO_wilor/left_hand/result_mano_1.npz")
-    assert mano.find_mano(video, "left", None) == first
-    sample_npz(first.with_name("result_mano_2.npz"))
-    with pytest.raises(ValueError, match="multiple"):
-        mano.find_mano(video, "left", None)
-    assert mano.find_mano(video, "left", first.name) == first
+        mano.find_mano(video, "left")
+    first = sample_npz(tmp_path / "MANO_wilor/left_hand/result_mano.npz")
+    second = sample_npz(tmp_path / "MANO_wilor/left_hand/result_mano_2.npz")
+    assert mano.find_mano(video, "left") == [first, second]
 
 
 @pytest.mark.parametrize("text", ["left hand", "", "   ", None])
@@ -319,11 +321,13 @@ def test_list_only_and_missing_file_skip(tmp_path, capsys, dir_name):
     if dir_name != "MANO_wilor":
         cli += ["--mano-dir-name", dir_name]
     assert mano.main(cli) == 0
-    sample_npz(tmp_path / dir_name / "left_hand/result_mano_1.npz")
+    sample_npz(tmp_path / dir_name / "left_hand/result_mano.npz")
     assert mano.main(cli) == 0
-    assert "result_mano_1.npz" in capsys.readouterr().out
+    assert "result_mano.npz" in capsys.readouterr().out
     sample_npz(tmp_path / dir_name / "left_hand/result_mano_2.npz")
-    assert mano.main(cli) == 1
+    assert mano.main(cli) == 0
+    listing = capsys.readouterr().out
+    assert "result_mano.npz" in listing and "result_mano_2.npz" in listing
     assert not output.exists()
 
 
@@ -433,6 +437,33 @@ def test_output_videos_overlay_and_configuration_skip(tmp_path, direction, text)
     assert run({"mano": {"mode": "points"}}) == "success"
 
 
+def test_multiple_npz_merge_and_box_mode_overlay(tmp_path):
+    first = sample_npz(tmp_path / "a.npz")
+    joints = np.zeros((3, 21, 3))
+    joints[:, :, 0] = np.linspace(0.0, 0.4, 21)
+    vertices = np.zeros((3, 778, 3))
+    vertices[:, :, 0] = np.linspace(0.0, 0.5, 778)
+    vertices[:, :, 1] = np.linspace(-0.2, 0.2, 778)
+    second = sample_npz(tmp_path / "b.npz", joints=joints, vertices=vertices)
+    prompts, overlay, metadata = mano.load_geometries(
+        [first, second], INFO, arguments("--prompt-mode", "box")
+    )
+    assert len(prompts[0]["boxes"]) == 2
+    assert "points" not in prompts[0]
+    assert len(overlay[0]) == 2
+    assert metadata["files"][0]["path"].endswith("a.npz")
+    sample_npz(tmp_path / "bad.npz", hand="right_hand")
+    with pytest.raises(ValueError, match="hand"):
+        mano.load_geometries(
+            [first, tmp_path / "bad.npz"], INFO, arguments("--prompt-mode", "box")
+        )
+    image = np.zeros((80, 100, 3), dtype=np.uint8)
+    from scripts.common.video_utils import draw_geometry
+
+    draw_geometry(image, {"hands": overlay[0], "boxes": prompts[0]["boxes"]})
+    assert image[..., 1].max() > 0
+
+
 def test_union_detector_mask_empty_and_threshold():
     empty = Sam3VideoInference._union_detector_mask(
         None, {"mask": torch.zeros(0, 2, 2)}, 4, 4
@@ -486,6 +517,7 @@ def test_save_detector_writes_binary_and_reuses_prompt_frame(tmp_path):
         == "success"
     )
     assert dataset.probe_video(output / "detector_masks.mkv")["frame_count"] == 3
+    assert dataset.probe_video(output / "detector_result.mp4")["frame_count"] == 3
     capture = cv2.VideoCapture(str(output / "detector_masks.mkv"))
     ok, frame = capture.read()
     capture.release()
@@ -495,6 +527,7 @@ def test_save_detector_writes_binary_and_reuses_prompt_frame(tmp_path):
     assert label[15, 15] == 1
     metadata = json.loads((output / "metadata.json").read_text())
     assert metadata["outputs"]["detector_masks_video"] == "detector_masks.mkv"
+    assert metadata["outputs"]["detector_visualization_video"] == "detector_result.mp4"
     assert (
         dataset.process_video(
             Predictor(),
