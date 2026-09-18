@@ -77,16 +77,16 @@ def recommend_grid(cell_count: int) -> Grid:
     )
 
 
-def discover_results(output_root: Path) -> Dict[Path, Path]:
+def discover_results(output_root: Path, video_name: str) -> Dict[Path, Path]:
     """Map each result video by its sequence directory relative to a root."""
     results: Dict[Path, Path] = {}
-    for video_path in sorted(output_root.rglob("result.mp4")):
+    for video_path in sorted(output_root.rglob(video_name)):
         if not video_path.is_file():
             continue
         relative_dir = video_path.parent.relative_to(output_root)
         if relative_dir == Path("."):
             raise RuntimeError(
-                f"result.mp4 must be inside a sequence directory: {video_path}"
+                f"{video_name} must be inside a sequence directory: {video_path}"
             )
         results[relative_dir] = video_path
     return results
@@ -136,22 +136,27 @@ def validate_video_info(
         )
 
 
-def collect_sequences(output_roots: Sequence[Path]) -> List[SequenceInputs]:
+def collect_sequences(
+    output_roots: Sequence[Path], video_name: str = "result.mp4"
+) -> List[SequenceInputs]:
     """Discover and fully preflight all inputs before writing any output."""
-    discovered = [discover_results(root) for root in output_roots]
+    discovered = [discover_results(root, video_name) for root in output_roots]
     if not discovered[0]:
-        raise RuntimeError(f"no result.mp4 files found below {output_roots[0]}")
+        raise RuntimeError(f"no {video_name} files found below {output_roots[0]}")
 
     path_sets = [set(result) for result in discovered]
     common_paths = set.intersection(*path_sets)
     skipped_paths = set.union(*path_sets) - common_paths
     if skipped_paths:
         LOGGER.warning(
-            "Skipping result.mp4 paths missing from one or more roots: %s",
+            "Skipping %s paths missing from one or more roots: %s",
+            video_name,
             ", ".join(path.as_posix() for path in sorted(skipped_paths)),
         )
     if not common_paths:
-        raise RuntimeError("no result.mp4 relative paths are shared by all input roots")
+        raise RuntimeError(
+            f"no {video_name} relative paths are shared by all input roots"
+        )
 
     names: Dict[str, Path] = {}
     for relative_dir in sorted(common_paths, key=lambda path: path.as_posix()):
@@ -340,7 +345,12 @@ def build_parser() -> argparse.ArgumentParser:
         "output_roots",
         nargs="+",
         metavar="OUTPUT_ROOT",
-        help="Prompt-specific roots containing result.mp4 files",
+        help="Prompt-specific roots containing result videos",
+    )
+    parser.add_argument(
+        "--video-name",
+        default="result.mp4",
+        help="Video file name to look for under each root (default: result.mp4)",
     )
     parser.add_argument(
         "--output-dir",
@@ -363,6 +373,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     if len(args.output_roots) < 2:
         parser.error("at least two OUTPUT_ROOT arguments are required")
+    if Path(args.video_name).name != args.video_name:
+        parser.error("--video-name must be a file name, not a path")
     output_roots = [expand_path(value) for value in args.output_roots]
     if len(set(output_roots)) != len(output_roots):
         parser.error("OUTPUT_ROOT arguments must be unique")
@@ -378,7 +390,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     output_dir = expand_path(args.output_dir)
     try:
-        sequences = collect_sequences(output_roots)
+        sequences = collect_sequences(output_roots, args.video_name)
         labels = [root.name for root in output_roots]
         LOGGER.info(
             "Validated %d sequence(s) across %d roots; using grid %dx%d",
