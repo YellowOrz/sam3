@@ -65,6 +65,7 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
 * 传播运行时只能点击传播暂停，其他传播方向按钮暂时禁用；自然完成后自动
   回到传播暂停。点击任一传播方向会确认未提交点，并从编辑帧（没有编辑时为
   当前帧）启动传播。
+* 画面右侧显示键盘按键的中文说明。
 * 只有播放和传播都暂停后才能操作视频画面或使用编辑快捷键；运行期间除
   ``Q`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
 * 鼠标中键点击 mask 可选择对象；重叠区域从小到大循环，循环末尾取消选择；
@@ -108,17 +109,20 @@ import math
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 if __package__:
@@ -157,6 +161,30 @@ SELECTED_EDGE_THICKNESS = 2
 TIMELINE_HEIGHT = 72
 BUTTON_ROW_HEIGHT = 82
 CONTROL_HEIGHT = TIMELINE_HEIGHT + BUTTON_ROW_HEIGHT
+HELP_PANEL_WIDTH = 268
+KEY_HELP = (
+    ("P", "刷新当前帧预览", "preview current frame"),
+    ("Backspace", "撤销未确认点击", "undo last uncommitted click"),
+    ("Esc", "放弃未确认编辑", "discard uncommitted edit"),
+    ("D", "删除选中对象", "delete selected object"),
+    ("[", "当前帧设为传播左界", "set prop window left at frame"),
+    ("]", "当前帧设为传播右界", "set prop window right at frame"),
+    ("C", "清点并从第 0 帧重传", "clear points and re-propagate"),
+    ("Q", "全部处理完后退出写出", "quit after all frames processed"),
+    ("Enter/Space", "无操作", "no action"),
+)
+_CJK_FONT_CANDIDATES = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+)
 FRAME_STATUS_BORDER = 6
 FRAME_STATUS_STYLES = {
     "current": {
@@ -233,6 +261,114 @@ def enter_cuda_amp() -> torch.dtype:
     dtype = cuda_amp_dtype()
     torch.autocast(device_type="cuda", dtype=dtype).__enter__()
     return dtype
+
+
+def _windows_font_dir() -> Path:
+    return Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+
+
+def _fc_match_zh() -> Tuple[str, ...]:
+    exe = shutil.which("fc-match")
+    if exe is None:
+        return ()
+    paths: List[str] = []
+    for query in (":lang=zh-cn", ":lang=zh"):
+        try:
+            result = subprocess.run(
+                [exe, "-f", "%{file}", query],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        path = result.stdout.strip()
+        if path:
+            paths.append(path)
+    return tuple(paths)
+
+
+def iter_cjk_font_paths() -> Iterable[str]:
+    seen: set[str] = set()
+    extra = []
+    if os.name == "nt":
+        extra = [
+            str(_windows_font_dir() / name)
+            for name in (
+                "msyh.ttc",
+                "msyh.ttf",
+                "simhei.ttf",
+                "simsun.ttc",
+                "msyhl.ttc",
+            )
+        ]
+    for path in (*_fc_match_zh(), *extra, *_CJK_FONT_CANDIDATES):
+        if path not in seen:
+            seen.add(path)
+            yield path
+
+
+@lru_cache(maxsize=1)
+def cjk_font_path() -> Optional[str]:
+    for path in iter_cjk_font_paths():
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+@lru_cache(maxsize=8)
+def _help_font(size: int) -> ImageFont.ImageFont:
+    path = cjk_font_path()
+    if path is not None:
+        for index in (2, 0, 1):
+            try:
+                return ImageFont.truetype(path, size=size, index=index)
+            except OSError:
+                continue
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def key_help_copy(
+    use_cjk: Optional[bool] = None,
+) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
+    if use_cjk is None:
+        use_cjk = cjk_font_path() is not None
+    if use_cjk:
+        title = "键盘说明"
+        note = "编辑需暂停播放和传播（Q 除外）"
+        rows = tuple((key, zh) for key, zh, _en in KEY_HELP)
+    else:
+        title = "Keyboard"
+        note = "Pause play and prop to edit (except Q)"
+        rows = tuple((key, en) for key, _zh, en in KEY_HELP)
+    return title, note, rows
+
+
+@lru_cache(maxsize=8)
+def render_key_help_panel(height: int, use_cjk: Optional[bool] = None) -> np.ndarray:
+    if use_cjk is None:
+        use_cjk = cjk_font_path() is not None
+    title, note, rows = key_help_copy(use_cjk)
+    panel = np.full((height, HELP_PANEL_WIDTH, 3), (27, 29, 32), dtype=np.uint8)
+    image = Image.fromarray(panel[:, :, ::-1])
+    draw = ImageDraw.Draw(image)
+    title_font = _help_font(15) if use_cjk else ImageFont.load_default()
+    body_font = _help_font(13) if use_cjk else ImageFont.load_default()
+    draw.text((14, 12), title, font=title_font, fill=(220, 220, 220))
+    draw.text((14, 34), note, font=body_font, fill=(170, 170, 170))
+    y = 58
+    for key, desc in rows:
+        draw.text((14, y), key, font=body_font, fill=(80, 200, 255))
+        draw.text((108, y), desc, font=body_font, fill=(210, 210, 210))
+        y += 22
+        if y > height - 20:
+            break
+    return np.asarray(image)[:, :, ::-1].copy()
 
 
 def window_width_int(value: str) -> int:
@@ -1313,6 +1449,10 @@ class InteractiveApp:
             self.timeline_dragging = False
             self.range_dragging = None
             return
+        if self.timeline_dragging or self.range_dragging:
+            x = min(max(x, 0), self.display_width - 1)
+        elif x >= self.display_width:
+            return
         if event == cv2.EVENT_MOUSEMOVE and self.range_dragging is not None:
             if flags & cv2.EVENT_FLAG_LBUTTON:
                 self.set_prop_bound(
@@ -2063,7 +2203,8 @@ class InteractiveApp:
                 interpolation=cv2.INTER_AREA,
             )
         draw_frame_status_overlay(rendered, self.display_frame_status())
-        return np.vstack((rendered, self.render_controls()))
+        stacked = np.vstack((rendered, self.render_controls()))
+        return np.hstack((stacked, render_key_help_panel(stacked.shape[0])))
 
     def advance_playback(self) -> None:
         if not self.playing:

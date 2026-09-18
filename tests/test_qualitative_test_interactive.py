@@ -282,10 +282,13 @@ def test_control_panel_draws_dynamic_timeline_and_all_buttons(tmp_path: Path) ->
     )
     assert rendered.shape == (
         app.display_height + qualitative.CONTROL_HEIGHT,
-        app.display_width,
+        app.display_width + qualitative.HELP_PANEL_WIDTH,
         3,
     )
     assert app.timeline_bounds[0] < app.timeline_bounds[1] < app.display_width - 20
+    help_strip = rendered[:, app.display_width :]
+    assert help_strip.shape[1] == qualitative.HELP_PANEL_WIDTH
+    assert tuple(int(v) for v in help_strip[8, 8]) == (27, 29, 32)
     assert set(app.hitboxes) == {
         "play_backward",
         "play_step_backward",
@@ -298,6 +301,35 @@ def test_control_panel_draws_dynamic_timeline_and_all_buttons(tmp_path: Path) ->
         "prop_forward_backward",
         "prop_backward_forward",
     }
+
+
+def test_help_panel_ignores_clicks(tmp_path: Path, capsys) -> None:
+    app = make_app(tmp_path)
+    added: list[tuple[int, int, int]] = []
+    app.add_point = lambda x, y, label: added.append((x, y, label))
+
+    app.on_mouse(cv2.EVENT_LBUTTONDOWN, app.display_width + 10, 3, 0, None)
+
+    assert added == []
+    assert "INTERACTION " not in capsys.readouterr().err
+
+
+def test_key_help_copy_switches_language() -> None:
+    title, note, rows = qualitative.key_help_copy(True)
+    assert title == "键盘说明"
+    assert "暂停" in note
+    assert rows[0] == ("P", "刷新当前帧预览")
+
+    title, note, rows = qualitative.key_help_copy(False)
+    assert title == "Keyboard"
+    assert rows[0][0] == "P"
+    assert "preview" in rows[0][1]
+
+
+def test_english_help_panel_renders_without_cjk_font() -> None:
+    panel = qualitative.render_key_help_panel(200, use_cjk=False)
+    assert panel.shape == (200, qualitative.HELP_PANEL_WIDTH, 3)
+    assert tuple(int(v) for v in panel[8, 8]) == (27, 29, 32)
 
 
 def test_playback_and_propagation_controls_are_independent(tmp_path: Path) -> None:
