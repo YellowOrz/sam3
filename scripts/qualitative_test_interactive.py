@@ -2286,6 +2286,7 @@ class InteractiveApp:
 
     def run(self) -> None:
         cv2.namedWindow(WINDOW_NAME, WINDOW_FLAGS)
+        cv2.setWindowTitle(WINDOW_NAME, f"{WINDOW_NAME} - Text prompt: {self.prompt}")
         self.window_open = True
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
         try:
