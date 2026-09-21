@@ -474,6 +474,101 @@ def test_union_detector_mask_empty_and_threshold():
     assert union[0, 1] and not union[0, 0]
 
 
+@pytest.mark.parametrize("text", ["right hand", ""])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_detector_only_skips_tracker_from_prompt_through_propagation(text, reverse):
+    # No tracker is installed: touching its projection, decoder or memory must fail.
+    model = Sam3VideoInferenceWithInstanceInteractivity.__new__(
+        Sam3VideoInferenceWithInstanceInteractivity
+    )
+    torch.nn.Module.__init__(model)
+    model._device = torch.device("cpu")
+    model.rank = 0
+    model.det_nms_thresh = 0.1
+    model.score_threshold_detection = 0.5
+    model.hotstart_delay = 15
+    model.masklet_confirmation_consecutive_det_thresh = 3
+    model._compile_model = lambda: pytest.fail("tracker compilation was called")
+    seen = []
+
+    def detect(**kwargs):
+        seen.append(kwargs)
+        assert kwargs["return_tracker_backbone_feats"] is False
+        return {
+            "pred_logits": torch.full((1, 2, 1), 3.0),
+            "pred_boxes_xyxy": torch.zeros(1, 2, 4),
+            "pred_masks": torch.tensor(
+                [[[[1.0, -1.0], [-1.0, -1.0]], [[-1.0, -1.0], [-1.0, 1.0]]]]
+            ),
+        }, {}
+
+    model.detector = SimpleNamespace(
+        backbone=SimpleNamespace(forward_text=lambda *a, **kw: {}),
+        forward_video_grounding_multigpu=detect,
+    )
+    empty = Prompt(box_embeddings=torch.zeros(0, 1, 4))
+    state = {
+        "num_frames": 3,
+        "orig_height": 2,
+        "orig_width": 2,
+        "input_batch": SimpleNamespace(
+            find_text_batch=["old"],
+            find_inputs=[SimpleNamespace(text_ids=torch.zeros(1)) for _ in range(3)],
+            img_batch=[None] * 3,
+        ),
+        "constants": {"empty_geometric_prompt": empty},
+        "tracker_inference_states": [],
+        "tracker_metadata": {},
+        "feature_cache": {},
+        "cached_frame_outputs": {},
+        "action_history": [],
+    }
+    for key in (
+        "previous_stages_out",
+        "per_frame_raw_point_input",
+        "per_frame_raw_box_input",
+        "per_frame_visual_prompt",
+        "per_frame_geometric_prompt",
+        "per_frame_cur_step",
+    ):
+        state[key] = [None] * 3
+    predictor = SimpleNamespace(
+        model=model,
+        _get_session=lambda sid: {"state": state},
+        _extend_expiration_time=lambda session: None,
+    )
+    start = 2 if reverse else 0
+    response = Sam3VideoPredictor.handle_request(
+        predictor,
+        {
+            "type": "add_geometry_prompts",
+            "session_id": "s",
+            "frame_index": start,
+            "text": text,
+            "detector_only": True,
+            "geometry_prompts": {t: {"boxes": [[0, 0, 1, 1]]} for t in (0, 2)},
+        },
+    )
+    expected = np.eye(2, dtype=bool)
+    np.testing.assert_array_equal(
+        response["outputs"]["out_binary_masks"], expected[None]
+    )
+    frames = list(model.propagate_in_video(state, start, 3, reverse))
+    assert [t for t, _ in frames] == ([2, 1, 0] if reverse else [0, 1, 2])
+    for t, out in frames:
+        present = bool(text) or t != 1
+        np.testing.assert_array_equal(
+            out["out_detector_mask"], expected if present else np.zeros_like(expected)
+        )
+        assert out["out_obj_ids"].tolist() == ([0] if present else [])
+        assert len(out["out_binary_masks"]) == int(present)
+    assert len(seen) == 4  # Immediate prompt frame and all three video frames.
+    assert state["tracker_inference_states"] == [] and state["tracker_metadata"] == {}
+    assert not any(isinstance(key, int) for key in state["feature_cache"])
+    model.reset_state(state)
+    assert state["detector_only"] is False
+
+
 def test_save_detector_writes_binary_and_reuses_prompt_frame(tmp_path):
     video = tmp_path / "color.mp4"
     make_video(video)

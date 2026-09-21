@@ -568,6 +568,7 @@ class Sam3VideoBase(nn.Module):
         feature_cache: Dict,
         reverse: bool,
         allow_new_detections: bool,
+        prepare_tracker_features: bool = True,
     ):
         """! @brief 计算当前帧的文本条件检测结果，并缓存 tracker 所需视觉特征。
 
@@ -620,7 +621,7 @@ class Sam3VideoBase(nn.Module):
             multigpu_buffer=feature_cache["multigpu_buffer"],
             track_in_reverse=reverse,
             # also get the SAM2 backbone features
-            return_tracker_backbone_feats=True,
+            return_tracker_backbone_feats=prepare_tracker_features,
             # run NMS as a part of distributed computation
             run_nms=self.det_nms_thresh > 0.0,
             nms_prob_thresh=self.score_threshold_detection,
@@ -642,6 +643,9 @@ class Sam3VideoBase(nn.Module):
             "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
             "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
         }
+
+        if not prepare_tracker_features:
+            return det_out
 
         # 将 detector FPN 投影到 tracker 期望的格式，并只缓存当前帧以控制显存。
         backbone_cache = {}

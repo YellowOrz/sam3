@@ -242,6 +242,8 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
 
     class Predictor:
         def handle_request(self, request):
+            if request["type"] == "add_geometry_prompts":
+                self.detector_only = request.get("detector_only", False)
             return {
                 "session_id": "test",
                 "outputs": {"out_detector_mask": np.ones((48, 64), dtype=bool)},
@@ -259,6 +261,14 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
                     "frame_index": index,
                     "outputs": {
                         **dataset.empty_outputs(),
+                        **(
+                            {
+                                "out_obj_ids": np.array([0]),
+                                "out_binary_masks": mask[None],
+                            }
+                            if self.detector_only
+                            else {}
+                        ),
                         "out_detector_mask": mask,
                     },
                 }
@@ -309,13 +319,35 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
     assert dataset.probe_video(output / "comparison.mp4")["width"] == 192
     assert mano.main([*base, "--save-detector"]) == 0
     assert len(builds) == 2
+
+    assert mano.main([*base, "--save-detector", "--detector-only"]) == 0
+    assert (
+        len(builds) == 3
+    )  # Tracker results cannot satisfy detector-only cache checks.
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["detector_only"] is True
+    assert metadata["outputs"]["mask_semantics"] == "binary_union"
+    assert metadata["object_id_to_label"] == {"0": 1}
+    summary = json.loads((output / "gt_metrics.json").read_text())
+    assert summary["mean_iou"] == summary["detector_mean_iou"] == 0.5
+    capture = cv2.VideoCapture(str(output / "masks.mkv"))
+    try:
+        for _ in range(4):
+            ok, frame = capture.read()
+            assert ok and np.all(frame == 1)
+    finally:
+        capture.release()
+    assert mano.main([*base, "--save-detector", "--detector-only"]) == 0
+    assert len(builds) == 3
+    assert mano.main([*base, "--save-detector"]) == 0
+    assert len(builds) == 4
     assert (output / "detector_masks.mkv").is_file()
     info = dataset.probe_video(output / "comparison.mp4")
     assert (info["width"], info["frame_count"]) == (256, 2)
     summary = json.loads((output / "gt_metrics.json").read_text())
     assert summary["detector_mean_iou"] == 0.5
     assert mano.main([*base, "--save-detector"]) == 0
-    assert len(builds) == 2
+    assert len(builds) == 4
 
 
 @pytest.mark.parametrize(

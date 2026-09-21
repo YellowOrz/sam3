@@ -42,6 +42,9 @@ result.mp4 与 comparison 第一列在任一 NPZ 有手的帧上画全部在屏�
       与 --compare-gt 同时开启时，comparison.mp4 为 RGB／Detector／Prediction／GT，
       并在 gt_metrics 中增加 detector_* 指标。无 GT 时不生成 comparison.mp4。
       缺少完整 detector 视频的已有预测会重新推理。
+  --detector-only：只运行逐帧检测，跳过 tracker、关联和 memory 更新；masks.mkv
+      为检测掩码并集（背景 0、前景 1），不提供跨帧实例 ID。缺框时继续文本检测，
+      文本和几何提示都没有时输出空掩码。可与 --save-detector、--compare-gt 同用。
 
 示例：python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT \
   --text-prompt "left hand" --hand-side left --prompt-mode both --device cuda:0 --list-only
@@ -370,6 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--focal-length", type=positive_float)
     parser.add_argument(
+        "--detector-only",
+        action="store_true",
+        help="Skip tracking; write the per-frame detector union as binary masks",
+    )
+    parser.add_argument(
         "--save-detector",
         action="store_true",
         help="Save detector masks and detector_result.mp4",
@@ -492,10 +500,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             overlay_geometry=visualization,
                             predictor_factory=get_predictor,
                             save_detector=args.save_detector,
+                            detector_only=args.detector_only,
                         )
-                        comparison.compare(
-                            video, destination, direction, visualization
-                        )
+                        comparison.compare(video, destination, direction, visualization)
                     except Exception as exc:
                         comparison.record_failure(video, destination, direction, exc)
                         LOGGER.exception("Sequence failed: %s (%s)", video, direction)

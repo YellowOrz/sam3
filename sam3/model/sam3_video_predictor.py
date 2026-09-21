@@ -86,6 +86,7 @@ class Sam3VideoPredictor(Sam3BasePredictor):
                     frame_idx=request["frame_index"],
                     text_str=request["text"],
                     geometry_prompts=request["geometry_prompts"],
+                    detector_only=request.get("detector_only", False),
                 )
             return {"frame_index": frame_idx, "outputs": outputs}
         if request["type"] == "add_learned_prompt":

@@ -145,6 +145,7 @@ class Sam3VideoInference(Sam3VideoBase):
         """
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
+        inference_state["detector_only"] = False
         for t in range(inference_state["num_frames"]):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = 0
             # constructing an output list in inference state (we start with an empty list)
@@ -339,7 +340,9 @@ class Sam3VideoInference(Sam3VideoBase):
         # note that it's intentionally added to `self.propagate_in_video`, so that the first
         # `self.add_prompt` call will be done in eager mode to fill in the decoder buffers
         # such as positional encoding cache)
-        self._compile_model()
+        detector_only = inference_state.get("detector_only", False)
+        if not detector_only:
+            self._compile_model()
 
         processing_order, end_frame_idx = self._get_processing_order(
             inference_state,
@@ -347,6 +350,11 @@ class Sam3VideoInference(Sam3VideoBase):
             max_frame_num_to_track,
             reverse=reverse,
         )
+        if detector_only and reverse:
+            # No temporal anchor: include the requested start frame in both directions.
+            processing_order = range(
+                processing_order.start + 1, processing_order.stop, -1
+            )
 
         # 检测器也要了解传播边界，才能让分布式帧调度与本次跟踪范围一致。
         inference_state["feature_cache"]["tracking_bounds"] = {
@@ -371,6 +379,17 @@ class Sam3VideoInference(Sam3VideoBase):
         ):
             # 每帧同时生成新检测并传播旧对象，随后在父类中完成关联和 memory 更新。
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
+
+            if detector_only:
+                yield (
+                    frame_idx,
+                    (
+                        self._postprocess_output(inference_state, out)
+                        if self.rank == 0
+                        else None
+                    ),
+                )
+                continue
 
             if self.hotstart_delay > 0:
                 # accumulate the outputs for the first `hotstart_delay` frames
@@ -452,6 +471,25 @@ class Sam3VideoInference(Sam3VideoBase):
         has_geometric_prompt = (
             inference_state["per_frame_geometric_prompt"][frame_idx] is not None
         )
+        if inference_state.get("detector_only", False):
+            det_out = self.run_backbone_and_detection(
+                frame_idx=frame_idx,
+                num_frames=inference_state["num_frames"],
+                reverse=reverse,
+                input_batch=input_batch,
+                geometric_prompt=(
+                    inference_state["per_frame_geometric_prompt"][frame_idx]
+                    if has_geometric_prompt
+                    else inference_state["constants"]["empty_geometric_prompt"]
+                ),
+                feature_cache=inference_state["feature_cache"],
+                allow_new_detections=has_text_prompt or has_geometric_prompt,
+                prepare_tracker_features=False,
+            )
+            inference_state["previous_stages_out"][frame_idx] = (
+                "_THIS_FRAME_HAS_OUTPUTS_"
+            )
+            return {"det_out": det_out}
         # 父类将检测器和 tracker 合并为一个原子帧步骤，避免两者使用不一致的状态。
         (
             obj_id_to_mask,
@@ -550,6 +588,21 @@ class Sam3VideoInference(Sam3VideoBase):
 
         非重叠约束在这里再次作用于最终显示掩码；它不改变 tracker 已存的 memory。
         """
+        if inference_state.get("detector_only", False):
+            mask = self._union_detector_mask(
+                out["det_out"],
+                inference_state["orig_height"],
+                inference_state["orig_width"],
+            )
+            count = int(mask.any())
+            return {
+                # ID 0 denotes the foreground union, not a persistent instance.
+                "out_obj_ids": np.arange(count, dtype=np.int64),
+                "out_probs": np.empty(0, dtype=np.float32),
+                "out_binary_masks": mask[None][:count],
+                "out_detector_mask": mask,
+            }
+
         obj_id_to_mask = out["obj_id_to_mask"]  # 内部低分辨率/视频分辨率布尔 mask
         curr_obj_ids = sorted(obj_id_to_mask.keys())
         H_video, W_video = inference_state["orig_height"], inference_state["orig_width"]
@@ -1015,6 +1068,7 @@ class Sam3VideoInference(Sam3VideoBase):
         boxes_xywh=None,
         box_labels=None,
         geometry_prompts=None,
+        detector_only=False,
     ):
         """! @brief 写入提示并只计算提示帧，作为后续时序传播的锚点。
 
@@ -1039,6 +1093,8 @@ class Sam3VideoInference(Sam3VideoBase):
         ), f"{frame_idx=} is out of range for a total of {num_frames} frames"
 
         prepared_geometry = None
+        if not isinstance(detector_only, bool):
+            raise ValueError("detector_only must be a boolean")
         if geometry_prompts is not None:
             if text_str is not None:
                 if not isinstance(text_str, str) or text_str.strip() == "visual":
@@ -1054,6 +1110,7 @@ class Sam3VideoInference(Sam3VideoBase):
 
         # SAM 3 的文本提示是全视频条件，替换它必须丢弃旧的检测和 mask memory。
         self.reset_state(inference_state)
+        inference_state["detector_only"] = detector_only
 
         # 文本写到所有帧的 stage，但仅在当前帧立即执行检测。
         if text_str is not None and text_str != "visual":
@@ -1223,6 +1280,15 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         原始视频分割（VG）结果，只运行这些对象的 tracker，可显著减少开销。
         """
         # 所有 rank 解析同一历史，确保选择相同路径并保持集体通信一致。
+        if inference_state.get("detector_only", False):
+            yield from super().propagate_in_video(
+                inference_state,
+                start_frame_idx=start_frame_idx,
+                max_frame_num_to_track=max_frame_num_to_track,
+                reverse=reverse,
+            )
+            return
+
         propagation_type, obj_ids = self.parse_action_history_for_propagation(
             inference_state
         )
@@ -1597,6 +1663,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         obj_id=None,
         rel_coordinates=True,
         geometry_prompts=None,
+        detector_only=False,
     ):
         """! @brief 分派语义/框提示或对象级点提示。
 
@@ -1608,6 +1675,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         一个明确对象，后续可进行局部 tracker 传播。
         """
         if points is not None:
+            if detector_only or inference_state.get("detector_only", False):
+                raise ValueError(
+                    "tracker point refinement is unavailable in detector-only mode"
+                )
             if geometry_prompts is not None:
                 raise ValueError(
                     "tracker points cannot be mixed with detector geometry"
@@ -1637,6 +1708,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
                 geometry_prompts=geometry_prompts,
+                detector_only=detector_only,
             )
 
     @torch.inference_mode()

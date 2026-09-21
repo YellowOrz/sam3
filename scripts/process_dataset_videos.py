@@ -141,6 +141,7 @@ def is_complete(
     direction: str,
     extra_metadata: Optional[Dict[str, Any]] = None,
     save_detector: bool = False,
+    detector_only: bool = False,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
@@ -157,6 +158,7 @@ def is_complete(
         and metadata.get("input_video") == str(video_path)
         and metadata.get("prompt") == prompt
         and metadata.get("model_version") == model_version
+        and metadata.get("detector_only", False) == detector_only
         and metadata.get("propagation_direction", "forward") == direction
         and metadata.get("frames_processed") == expected_frames
         and all(
@@ -575,7 +577,10 @@ def process_video(
     overlay_geometry: Optional[Dict[int, Dict[str, Any]]] = None,
     predictor_factory: Optional[Callable[[], Any]] = None,
     save_detector: bool = False,
+    detector_only: bool = False,
 ) -> str:
+    if detector_only and (model_version != "sam3" or geometry_prompts is None):
+        raise ValueError("detector-only requires SAM3 geometry prompts")
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
     if not overwrite and is_complete(
@@ -587,6 +592,7 @@ def process_video(
         direction,
         extra_metadata if geometry_prompts is not None else None,
         save_detector,
+        detector_only,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -602,6 +608,7 @@ def process_video(
         "input_relative_path": relative_video,
         "prompt": prompt,
         "model_version": model_version,
+        "detector_only": detector_only,
         "propagation_direction": direction,
         "source": video_info,
         "started_at": utc_now(),
@@ -636,7 +643,9 @@ def process_video(
             )
             if geometry_prompts is not None:
                 request.update(
-                    type="add_geometry_prompts", geometry_prompts=geometry_prompts
+                    type="add_geometry_prompts",
+                    geometry_prompts=geometry_prompts,
+                    detector_only=detector_only,
                 )
             prompt_response = predictor.handle_request(request)
             object_to_label = propagate_and_write(
@@ -676,6 +685,7 @@ def process_video(
                     "visualization_video": result_path.name,
                     "label_dtype": "uint8",
                     "background_label": 0,
+                    **({"mask_semantics": "binary_union"} if detector_only else {}),
                     **(
                         {
                             "detector_masks_video": "detector_masks.mkv",
