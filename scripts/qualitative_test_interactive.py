@@ -65,7 +65,7 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
 * 传播运行时只能点击传播暂停，其他传播方向按钮暂时禁用；自然完成后自动
   回到传播暂停。点击任一传播方向会确认未提交点，并从编辑帧（没有编辑时为
   当前帧）启动传播。
-* 画面右侧显示键盘按键的中文说明。
+* 画面右侧显示键盘和鼠标按键的中文说明。
 * 只有播放和传播都暂停后才能操作视频画面或使用编辑快捷键；运行期间除
   ``Q`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
 * 鼠标中键点击 mask 可选择对象；重叠区域从小到大循环，循环末尾取消选择；
@@ -172,6 +172,12 @@ KEY_HELP = (
     ("C", "清点并从第 0 帧重传", "clear points and re-propagate"),
     ("Q", "全部处理完后退出写出", "quit after all frames processed"),
     ("Enter/Space", "无操作", "no action"),
+)
+MOUSE_HELP = (
+    ("左键", "正点（绿十字）", "L-click", "positive point"),
+    ("右键", "负点（红叉）", "R-click", "negative point"),
+    ("中键·mask", "选中，重叠循环", "Mid·mask", "select / cycle"),
+    ("中键·空白", "取消选择", "Mid·empty", "deselect"),
 )
 _CJK_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -335,25 +341,29 @@ def _help_font(size: int) -> ImageFont.ImageFont:
 
 def key_help_copy(
     use_cjk: Optional[bool] = None,
-) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
+) -> Tuple[str, str, Tuple[Tuple[str, str], ...], str, Tuple[Tuple[str, str], ...]]:
     if use_cjk is None:
         use_cjk = cjk_font_path() is not None
     if use_cjk:
         title = "键盘说明"
         note = "编辑需暂停播放和传播（Q 除外）"
         rows = tuple((key, zh) for key, zh, _en in KEY_HELP)
+        mouse_title = "鼠标说明"
+        mouse_rows = tuple((zh_key, zh) for zh_key, zh, _en_key, _en in MOUSE_HELP)
     else:
         title = "Keyboard"
         note = "Pause play and prop to edit (except Q)"
         rows = tuple((key, en) for key, _zh, en in KEY_HELP)
-    return title, note, rows
+        mouse_title = "Mouse"
+        mouse_rows = tuple((en_key, en) for _zh_key, _zh, en_key, en in MOUSE_HELP)
+    return title, note, rows, mouse_title, mouse_rows
 
 
 @lru_cache(maxsize=8)
 def render_key_help_panel(height: int, use_cjk: Optional[bool] = None) -> np.ndarray:
     if use_cjk is None:
         use_cjk = cjk_font_path() is not None
-    title, note, rows = key_help_copy(use_cjk)
+    title, note, rows, mouse_title, mouse_rows = key_help_copy(use_cjk)
     panel = np.full((height, HELP_PANEL_WIDTH, 3), (27, 29, 32), dtype=np.uint8)
     image = Image.fromarray(panel[:, :, ::-1])
     draw = ImageDraw.Draw(image)
@@ -362,12 +372,22 @@ def render_key_help_panel(height: int, use_cjk: Optional[bool] = None) -> np.nda
     draw.text((14, 12), title, font=title_font, fill=(220, 220, 220))
     draw.text((14, 34), note, font=body_font, fill=(170, 170, 170))
     y = 58
-    for key, desc in rows:
-        draw.text((14, y), key, font=body_font, fill=(80, 200, 255))
-        draw.text((108, y), desc, font=body_font, fill=(210, 210, 210))
-        y += 22
-        if y > height - 20:
-            break
+
+    def draw_rows(items: Tuple[Tuple[str, str], ...]) -> None:
+        nonlocal y
+        for key, desc in items:
+            if y > height - 20:
+                break
+            draw.text((14, y), key, font=body_font, fill=(80, 200, 255))
+            draw.text((108, y), desc, font=body_font, fill=(210, 210, 210))
+            y += 22
+
+    draw_rows(rows)
+    if y <= height - 40:
+        y += 8
+        draw.text((14, y), mouse_title, font=title_font, fill=(220, 220, 220))
+        y += 24
+        draw_rows(mouse_rows)
     return np.asarray(image)[:, :, ::-1].copy()
 
 

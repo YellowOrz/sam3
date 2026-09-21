@@ -315,15 +315,19 @@ def test_help_panel_ignores_clicks(tmp_path: Path, capsys) -> None:
 
 
 def test_key_help_copy_switches_language() -> None:
-    title, note, rows = qualitative.key_help_copy(True)
+    title, note, rows, mouse_title, mouse_rows = qualitative.key_help_copy(True)
     assert title == "键盘说明"
     assert "暂停" in note
     assert rows[0] == ("P", "刷新当前帧预览")
+    assert mouse_title == "鼠标说明"
+    assert mouse_rows[0][0] == "左键"
 
-    title, note, rows = qualitative.key_help_copy(False)
+    title, note, rows, mouse_title, mouse_rows = qualitative.key_help_copy(False)
     assert title == "Keyboard"
     assert rows[0][0] == "P"
     assert "preview" in rows[0][1]
+    assert mouse_title == "Mouse"
+    assert mouse_rows[0][0] == "L-click"
 
 
 def test_english_help_panel_renders_without_cjk_font() -> None:
