@@ -540,6 +540,14 @@ class Sam3BasePredictor:
         # checkpoint. feature_cache only keeps the current backbone frame.
         excluded = {"input_batch", "constants", "feature_cache"}
         memo = {}
+        # Restore discards these caches and reconnects each tracker to the new
+        # empty feature_cache. Seed memo to exclude nested references too, without
+        # modifying live state or dropping unrelated fields with the same name.
+        for tracker_state in state.get("tracker_inference_states", ()):
+            if isinstance(tracker_state, dict):
+                cached_features = tracker_state.get("cached_features")
+                if isinstance(cached_features, dict):
+                    memo[id(cached_features)] = {}
         return {
             key: _clone_state_to_cpu(value, tensor_cache, memo)
             for key, value in state.items()

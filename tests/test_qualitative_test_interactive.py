@@ -151,6 +151,7 @@ def test_chunk_frames_parser_and_ranges() -> None:
 
 def test_propagation_thread_binds_callers_cuda_device(monkeypatch) -> None:
     calls = []
+    monkeypatch.setattr(qualitative, "cuda_amp_dtype", lambda: torch.float16)
 
     class StreamingPredictor:
         def handle_stream_request(self, request):
@@ -1511,6 +1512,115 @@ def test_clear_all_keeps_propagation_range(tmp_path: Path) -> None:
 
     assert (app.prop_range_left, app.prop_range_right) == (1, 2)
     assert starts == [(0, "forward")]
+
+
+def test_render_cache_tracks_image_and_control_changes(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.cache = {0: {1: np.ones((8, 10), dtype=bool)}}
+    loads = []
+    original_load = qualitative.load_frame_bgr
+
+    def load(*args):
+        loads.append(args)
+        return original_load(*args)
+
+    monkeypatch.setattr(qualitative, "load_frame_bgr", load)
+    rendered = app.render()
+    assert app.render() is rendered
+    assert len(loads) == 1
+
+    def replace_mask():
+        app.cache[0][1] = np.zeros((8, 10), dtype=bool)
+
+    changes = [
+        lambda: setattr(app, "active_obj", 1),
+        lambda: app.draft_points.append(qualitative.PointEdit(1, 0, 1, 3, 4, 1)),
+        lambda: app.draft_points.clear(),
+        lambda: app.stale_frames.add(0),
+        lambda: app.probability_cache.update({0: {1: 0.5}}),
+        replace_mask,
+        lambda: app.cache[0].pop(1),
+        lambda: app.cache.update({1: {}}),
+        lambda: setattr(app, "playing", True),
+        lambda: setattr(app, "playback_direction", -1),
+        lambda: setattr(app, "prop_range_right", 1),
+        lambda: setattr(app, "status", "propagating backward"),
+        lambda: app.confirmed_points.append(qualitative.PointEdit(2, 1, 1, 3, 4, 1)),
+        lambda: setattr(app, "display_index", 1),
+    ]
+    for change in changes:
+        change()
+        updated = app.render()
+        assert updated is not rendered
+        assert app.render() is updated
+        app._render_key = None
+        np.testing.assert_array_equal(updated, app.render())
+        rendered = app.render()
+
+
+def test_cached_window_still_pumps_keyboard_events(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.cache = {0: {}, 1: {}, 2: {}}
+    shown = []
+    waits = []
+    for name in ("namedWindow", "setWindowTitle", "setMouseCallback", "destroyWindow"):
+        monkeypatch.setattr(cv2, name, lambda *args: None)
+    monkeypatch.setattr(cv2, "imshow", lambda *args: shown.append(args))
+
+    def wait(delay):
+        waits.append(delay)
+        return ord("q") if len(waits) == 3 else 255
+
+    monkeypatch.setattr(cv2, "waitKey", wait)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 1)
+    monkeypatch.setattr(app, "finalize", lambda: None)
+    app.run()
+    assert len(shown) == 1
+    assert waits == [15, 15, 15]
+
+
+def test_checkpoints_skip_nested_recomputed_features(tmp_path, monkeypatch):
+    from sam3.model import sam3_base_predictor as base
+
+    predictor = Sam3BasePredictor()
+    feature = torch.ones(25)
+    features = {3: feature}
+    memory = torch.arange(4)
+    state = {
+        "feature_cache": features,
+        "tracker_inference_states": [
+            {"cached_features": features, "memory": memory},
+            {"cached_features": features, "memory": memory},
+        ],
+        "unrelated": {"cached_features": torch.tensor(7)},
+    }
+    original_clone = base._clone_state_to_cpu
+
+    def clone(value, *args):
+        assert value is not feature, "recomputed features must not be copied"
+        return original_clone(value, *args)
+
+    monkeypatch.setattr(base, "_clone_state_to_cpu", clone)
+    predictor._all_inference_states["session"] = {
+        "state": state,
+        "session_id": "session",
+        "last_use_time": 0.0,
+        "checkpoints": {},
+        "checkpoint_tensor_cache": {},
+    }
+    predictor.save_checkpoint("session", 3)
+    assert state["feature_cache"][3] is feature
+    assert state["tracker_inference_states"][0]["cached_features"] is features
+    snapshot = predictor._all_inference_states["session"]["checkpoints"][3]
+    assert snapshot["tracker_inference_states"][0]["cached_features"] == {}
+    predictor.restore_checkpoint("session", 3)
+    first, second = state["tracker_inference_states"]
+    assert (
+        first["cached_features"] is second["cached_features"] is state["feature_cache"]
+    )
+    assert first["memory"] is second["memory"]
+    assert torch.equal(first["memory"], memory)
+    assert state["unrelated"]["cached_features"].item() == 7
 
 
 @pytest.mark.parametrize("stop", [None, "interrupt", "unconfirmed"])

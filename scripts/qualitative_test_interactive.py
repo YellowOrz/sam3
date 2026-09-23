@@ -994,6 +994,9 @@ class InteractiveApp:
         self.timeline_bounds = self.track_span
         self.prop_range_left = 0
         self.prop_range_right = max(0, frame_count - 1)
+        self._render_key = None
+        self._rendered = None
+        self._render_masks = ()
 
     def record_event(self, event_type: str, **payload: Any) -> None:
         self.sequence += 1
@@ -2227,11 +2230,41 @@ class InteractiveApp:
         return "current"
 
     def render(self) -> np.ndarray:
+        masks = self.cache.get(self.display_index, {})
+        probabilities = self.probability_cache.get(self.display_index, {})
+        points = self.current_points_for_display()
+        # Published mask arrays are replaced, never edited in place. Keep strong
+        # references below so their ids cannot be reused while this key is cached.
+        key = (
+            self.display_index,
+            tuple((obj_id, id(mask)) for obj_id, mask in masks.items()),
+            tuple(probabilities.items()),
+            tuple(points),
+            self.active_obj,
+            self.display_frame_status(),
+            self.display_width,
+            self.display_height,
+            self.display_scale,
+            self.playable_frontier(),
+            self.frame_count,
+            self.status,
+            self.editing,
+            self.edit_frame,
+            self.playing,
+            self.playback_direction,
+            self.runner.is_alive,
+            self.propagation_mode,
+            self.prop_range_left,
+            self.prop_range_right,
+            tuple(self.prompt_point_frames()),
+        )
+        if key == self._render_key:
+            return self._rendered
         rendered = render_frame_bgr(
             load_frame_bgr(self.frame_dir, self.display_index),
-            self.cache.get(self.display_index, {}),
-            probabilities_by_obj=self.probability_cache.get(self.display_index, {}),
-            points=self.current_points_for_display(),
+            masks,
+            probabilities_by_obj=probabilities,
+            points=points,
             active_obj=self.active_obj,
             status=None,
         )
@@ -2243,7 +2276,10 @@ class InteractiveApp:
             )
         draw_frame_status_overlay(rendered, self.display_frame_status())
         stacked = np.vstack((rendered, self.render_controls()))
-        return np.hstack((stacked, render_key_help_panel(stacked.shape[0])))
+        self._rendered = np.hstack((stacked, render_key_help_panel(stacked.shape[0])))
+        self._render_masks = tuple(masks.values())
+        self._render_key = key
+        return self._rendered
 
     def advance_playback(self) -> None:
         if not self.playing:
@@ -2332,6 +2368,7 @@ class InteractiveApp:
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
         try:
             running = True
+            displayed = None
             while running:
                 self.drain_events()
                 if self.fatal_error is not None:
@@ -2339,7 +2376,10 @@ class InteractiveApp:
                         "background propagation failed"
                     ) from self.fatal_error
                 self.advance_playback()
-                cv2.imshow(WINDOW_NAME, self.render())
+                rendered = self.render()
+                if rendered is not displayed:
+                    cv2.imshow(WINDOW_NAME, rendered)
+                    displayed = rendered
                 key = cv2.waitKey(15) & 0xFF
                 try:
                     visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
