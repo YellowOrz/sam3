@@ -16,7 +16,20 @@
         --chunk-frames 500 \
         --output-dir ./outputs/interactive/example
 
-如果输出目录中已经存在结果，请增加 ``--overwrite``。
+批量启动示例::
+
+    uv run scripts/qualitative_test_interactive.py \
+        --input-root /path/to/dataset --output-root outputs/interactive \
+        --rgb-name color.mp4 --text-prompt "right hand" --version sam3 --device cuda:1
+
+批量模式按相对路径排序递归查找视频，输出保留目录结构；输入输出根目录不得相同。
+整批只加载一次模型，逐个打开窗口，每个视频（或分块）使用独立 session。
+``Q`` 完成并保存本视频后自动进入下一个；分块模式还需终端 ``ok`` 确认。
+批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整、未确认或
+不匹配的结果作为失败留待最后汇报。单视频模式已有输出仍直接报错。覆盖均需 ``--overwrite``。
+单视频失败后继续处理剩余视频，最后统一列出失败路径和原因，并返回非零退出码。
+关闭编辑窗口或 Ctrl+C 停止整批；已写入磁盘的结果保留，未完成视频不标记为成功。
+CPU tracker 检查点仅存于当前 session 内存，不支持重启恢复。复核回放窗口关闭仍返回终端。
 
 ``--chunk-frames`` 默认为 0，表示不开启分块；启用时必须不少于 100 帧。程序会
 逐段创建独立 tracker session，每段结束时按剩余原 ID 升序紧凑编号为 0、1、2……。
@@ -126,6 +139,11 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 if __package__:
+    from scripts.common.video_cli import (
+        discover_rgb_videos,
+        file_name,
+        validate_input_output,
+    )
     from scripts.common.video_utils import (
         as_numpy,
         color_for_label,
@@ -137,6 +155,7 @@ if __package__:
         utc_now as _utc_now,
     )
 else:
+    from common.video_cli import discover_rgb_videos, file_name, validate_input_output
     from common.video_utils import (  # type: ignore[no-redef]
         as_numpy,
         color_for_label,
@@ -2306,7 +2325,9 @@ class InteractiveApp:
 
     def run(self) -> None:
         cv2.namedWindow(WINDOW_NAME, WINDOW_FLAGS)
-        cv2.setWindowTitle(WINDOW_NAME, f"{WINDOW_NAME} - Text prompt: {self.prompt}")
+        cv2.setWindowTitle(
+            WINDOW_NAME, f"{self.video_path} - Text prompt: {self.prompt}"
+        )
         self.window_open = True
         cv2.setMouseCallback(WINDOW_NAME, self.on_mouse)
         try:
@@ -2320,6 +2341,12 @@ class InteractiveApp:
                 self.advance_playback()
                 cv2.imshow(WINDOW_NAME, self.render())
                 key = cv2.waitKey(15) & 0xFF
+                try:
+                    visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
+                except cv2.error:
+                    visible = 0
+                if visible < 1:
+                    raise KeyboardInterrupt("editor window closed")
                 if key != 255:
                     running = self.handle_key(key)
             self.finalize()
@@ -2327,7 +2354,10 @@ class InteractiveApp:
             if self.runner.is_alive:
                 self.runner.request_stop(cancel_model=False)
                 self.runner.join()
-            cv2.destroyWindow(WINDOW_NAME)
+            try:
+                cv2.destroyWindow(WINDOW_NAME)
+            except cv2.error:
+                pass  # The user may already have closed the native window.
             self.window_open = False
 
 
@@ -3021,7 +3051,12 @@ def run_interactive(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive SAM3 qualitative test")
     parser.add_argument("--version", default="sam3.1", choices=["sam3", "sam3.1"])
-    parser.add_argument("--video", required=True, help="Input video path")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--video", help="Input video path")
+    inputs.add_argument(
+        "--input-root", help="Recursively process videos below this root"
+    )
+    parser.add_argument("--rgb-name", type=file_name, default="color.mp4")
     parser.add_argument(
         "--checkpoint", help="Checkpoint path (auto-downloads if omitted)"
     )
@@ -3035,10 +3070,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="cuda:N",
         help="CUDA device (default: cuda:0)",
     )
-    parser.add_argument(
+    outputs = parser.add_mutually_exclusive_group(required=True)
+    outputs.add_argument(
         "--output-dir",
-        required=True,
         help="Directory for the result video and metadata",
+    )
+    outputs.add_argument(
+        "--output-root", help="Batch output root, preserving input paths"
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="Replace existing interactive outputs"
@@ -3066,20 +3104,89 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    video_path = expand_path(args.video)
+def process_interactive_video(
+    predictor: Any, args: argparse.Namespace, video_path: Path, output_dir: Path
+) -> bool:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        output_dir / "metadata.json",
+        {
+            "status": "processing",
+            "input_video": str(video_path),
+            "prompt": args.text_prompt,
+            "model_version": args.version,
+        },
+    )
+    video_info = probe_video(video_path)
+    with tempfile.TemporaryDirectory(prefix="sam3_interactive_frames_") as temp:
+        workspace = Path(temp)
+        frame_dir = workspace / "frames"
+        frame_count = extract_frames(video_path, frame_dir)
+        video_info = VideoInfo(
+            video_info.width, video_info.height, frame_count, video_info.fps
+        )
+        if args.chunk_frames == 0:
+            run_interactive(
+                predictor,
+                args.version,
+                video_path,
+                video_info,
+                frame_dir,
+                frame_count,
+                args.text_prompt,
+                output_dir,
+                args.window_width,
+                args.checkpoint_interval,
+            )
+        else:
+            chunks = []
+            ranges = frame_ranges(frame_count, args.chunk_frames)
+            for chunk_index, (start, end) in enumerate(ranges, 1):
+                chunk_root = workspace / f"chunk_{chunk_index:04d}"
+                chunk_frame_dir = chunk_root / "frames"
+                chunk_output_dir = chunk_root / "output"
+                make_chunk_frame_dir(frame_dir, chunk_frame_dir, start, end)
+                print(
+                    f"Processing chunk {chunk_index}/{len(ranges)} "
+                    f"(frames {start}-{end - 1})"
+                )
+                run_interactive(
+                    predictor,
+                    args.version,
+                    video_path,
+                    VideoInfo(
+                        video_info.width,
+                        video_info.height,
+                        end - start,
+                        video_info.fps,
+                    ),
+                    chunk_frame_dir,
+                    end - start,
+                    args.text_prompt,
+                    chunk_output_dir,
+                    args.window_width,
+                    args.checkpoint_interval,
+                    frame_offset=start,
+                )
+                chunks.append((start, end, chunk_output_dir))
+            confirmed = review_chunk_outputs(
+                chunks,
+                output_dir,
+                video_path,
+                video_info,
+                args.text_prompt,
+                args.version,
+                args.chunk_frames,
+                frame_dir,
+                args.window_width,
+            )
+            if not confirmed:
+                return False
+    return True
+
+
+def load_predictor(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Any:
     checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
-    output_dir = expand_path(args.output_dir)
-    if not video_path.is_file():
-        parser.error(f"video does not exist: {video_path}")
-    if checkpoint is not None and not checkpoint.is_file():
-        parser.error(f"checkpoint does not exist: {checkpoint}")
-    try:
-        validate_interactive_outputs(output_dir, args.overwrite)
-    except RuntimeError as exc:
-        parser.error(str(exc))
     device_name, device_index = args.device
     if not torch.cuda.is_available():
         parser.error("CUDA is required by the SAM 3 video predictor")
@@ -3102,76 +3209,122 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     build_kwargs = dict(version=args.version, compile=False, async_loading_frames=False)
     if checkpoint is not None:
         build_kwargs["checkpoint_path"] = str(checkpoint)
-    predictor = build_sam3_predictor(**build_kwargs)
+    return build_sam3_predictor(**build_kwargs)
+
+
+def completed_interactive_video(
+    output_dir: Path, video_path: Path, args: argparse.Namespace
+) -> bool:
     try:
-        video_info = probe_video(video_path)
-        with tempfile.TemporaryDirectory(prefix="sam3_interactive_frames_") as temp:
-            workspace = Path(temp)
-            frame_dir = workspace / "frames"
-            frame_count = extract_frames(video_path, frame_dir)
-            video_info = VideoInfo(
-                video_info.width, video_info.height, frame_count, video_info.fps
+        if not all(
+            (output_dir / name).is_file() and (output_dir / name).stat().st_size > 0
+            for name in (
+                "result.mp4",
+                "masks.mkv",
+                "metadata.json",
+                "interactions.json",
             )
-            if args.chunk_frames == 0:
-                run_interactive(
-                    predictor,
-                    args.version,
-                    video_path,
-                    video_info,
-                    frame_dir,
-                    frame_count,
-                    args.text_prompt,
-                    output_dir,
-                    args.window_width,
-                    args.checkpoint_interval,
-                )
-            else:
-                chunks = []
-                ranges = frame_ranges(frame_count, args.chunk_frames)
-                for chunk_index, (start, end) in enumerate(ranges, 1):
-                    chunk_root = workspace / f"chunk_{chunk_index:04d}"
-                    chunk_frame_dir = chunk_root / "frames"
-                    chunk_output_dir = chunk_root / "output"
-                    make_chunk_frame_dir(frame_dir, chunk_frame_dir, start, end)
-                    print(
-                        f"Processing chunk {chunk_index}/{len(ranges)} "
-                        f"(frames {start}-{end - 1})"
-                    )
-                    run_interactive(
-                        predictor,
-                        args.version,
-                        video_path,
-                        VideoInfo(
-                            video_info.width,
-                            video_info.height,
-                            end - start,
-                            video_info.fps,
-                        ),
-                        chunk_frame_dir,
-                        end - start,
-                        args.text_prompt,
-                        chunk_output_dir,
-                        args.window_width,
-                        args.checkpoint_interval,
-                        frame_offset=start,
-                    )
-                    chunks.append((start, end, chunk_output_dir))
-                confirmed = review_chunk_outputs(
-                    chunks,
-                    output_dir,
-                    video_path,
-                    video_info,
-                    args.text_prompt,
-                    args.version,
-                    args.chunk_frames,
-                    frame_dir,
-                    args.window_width,
-                )
-                if not confirmed:
-                    return 1
+        ):
+            return False
+        metadata = json.loads((output_dir / "metadata.json").read_text())
+        interactions = json.loads((output_dir / "interactions.json").read_text())
+        source = probe_video(video_path)
+        if not (
+            metadata.get("status") == interactions.get("status") == "success"
+            and metadata.get("input_video") == str(video_path)
+            and metadata.get("prompt") == args.text_prompt
+            and metadata.get("model_version") == args.version
+            and source.frame_count > 0
+            and metadata.get("frames_processed") == source.frame_count
+            and metadata.get("chunk_frames", 0) == args.chunk_frames
+        ):
+            return False
+        for name in ("result.mp4", "masks.mkv"):
+            info = probe_video(output_dir / name)
+            if (info.width, info.height, info.frame_count) != (
+                source.width,
+                source.height,
+                source.frame_count,
+            ) or not math.isclose(info.fps, source.fps, rel_tol=1e-5):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+        return False
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    batch = args.input_root is not None
+    if batch:
+        if args.output_root is None:
+            parser.error("--input-root requires --output-root")
+        input_root = expand_path(args.input_root)
+        output_root = expand_path(args.output_root)
+        try:
+            validate_input_output(input_root, output_root)
+        except ValueError as exc:
+            parser.error(str(exc))
+        videos = discover_rgb_videos(input_root, args.rgb_name)
+        if not videos:
+            parser.error(f"No files named {args.rgb_name} below {input_root}")
+        jobs = [
+            (video, output_root / video.parent.relative_to(input_root))
+            for video in videos
+        ]
+    else:
+        if args.output_dir is None:
+            parser.error("--video requires --output-dir")
+        video_path = expand_path(args.video)
+        if not video_path.is_file():
+            parser.error(f"video does not exist: {video_path}")
+        output_dir = expand_path(args.output_dir)
+        try:
+            validate_interactive_outputs(output_dir, args.overwrite)
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        jobs = [(video_path, output_dir)]
+    checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
+    if checkpoint is not None and not checkpoint.is_file():
+        parser.error(f"checkpoint does not exist: {checkpoint}")
+    predictor = None
+    failures = []
+    succeeded = skipped = 0
+    interrupted = False
+    try:
+        for index, (video_path, output_dir) in enumerate(jobs, 1):
+            print(f"[{index}/{len(jobs)}] {video_path}")
+            try:
+                if (
+                    batch
+                    and not args.overwrite
+                    and completed_interactive_video(output_dir, video_path, args)
+                ):
+                    skipped += 1
+                    print("Skipping completed video")
+                    continue
+                validate_interactive_outputs(output_dir, args.overwrite)
+                if predictor is None:
+                    predictor = load_predictor(args, parser)
+                if not process_interactive_video(
+                    predictor, args, video_path, output_dir
+                ):
+                    interrupted = True
+                    break
+                succeeded += 1
+            except Exception as exc:
+                failures.append((video_path, f"{type(exc).__name__}: {exc}"))
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
-        predictor.shutdown()
-    return 0
+        if predictor is not None:
+            predictor.shutdown()
+    print(f"Finished: {succeeded} succeeded, {skipped} skipped, {len(failures)} failed")
+    for video_path, error in failures:
+        print(f"FAILED {video_path}: {error}", file=sys.stderr)
+    if interrupted:
+        print("Batch stopped by user; unfinished videos were not marked successful.")
+    return 1 if failures or interrupted else 0
 
 
 if __name__ == "__main__":

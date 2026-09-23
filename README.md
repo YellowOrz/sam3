@@ -458,6 +458,20 @@ Nisha Deo, Peter Park, Phillip Thomas, Raghu Nayani, Rene Martinez Doehner, Robb
 Mitts, Shashank Jain, Spencer Whitehead, Ty Toledano, Valentin Gabeur, Vincent Cho, Vivian Lee, William Ngan,
 Xuehai He, Yael Yungster, Ziqi Pang, Ziyi Dou, Zoe Quake.
 
+## Interactive video batches
+
+The desktop editor can process a directory of videos with one shared model, opening one video at a time (CUDA and a graphical desktop required):
+
+```bash
+uv run scripts/qualitative_test_interactive.py \
+  --input-root /path/to/dataset --output-root outputs/interactive \
+  --rgb-name color.mp4 --text-prompt "right hand" --version sam3 --device cuda:1
+```
+
+Videos are discovered recursively in relative-path order, and outputs preserve that structure. The input and output roots must differ. Each video or chunk gets its own session. Press `Q` after all frames have been processed to save and advance; chunked videos additionally require terminal `ok` confirmation. Close the editor or press `Ctrl+C` to stop the batch. Closing the final review playback still returns to its terminal prompt.
+
+Complete successful outputs matching the input, prompt, model version, and chunk setting are skipped. Existing incomplete or mismatched outputs require `--overwrite`. Individual failures do not stop the batch; their paths and errors are reported at the end with a nonzero exit code. Saved files are retained on interruption; in-memory tracker checkpoints do not support restart recovery. The original `--video INPUT --output-dir OUT` mode remains available and requires `--overwrite` for existing outputs.
+
 ## Citing SAM 3
 
 If you use SAM 3 or the SA-Co dataset in your research, please use the following BibTeX entry.

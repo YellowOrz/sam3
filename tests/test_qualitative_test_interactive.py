@@ -1511,3 +1511,226 @@ def test_clear_all_keeps_propagation_range(tmp_path: Path) -> None:
 
     assert (app.prop_range_left, app.prop_range_right) == (1, 2)
     assert starts == [(0, "forward")]
+
+
+@pytest.mark.parametrize("stop", [None, "interrupt", "unconfirmed"])
+def test_batch_reuses_model_and_reports_failures_at_end(
+    tmp_path, monkeypatch, capsys, stop
+):
+    root, output = tmp_path / "input", tmp_path / "output"
+    for directory in (root, root / "a", root / "b"):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "rgb.mkv").touch()
+    events = []
+
+    class Predictor:
+        def shutdown(self):
+            events.append("shutdown")
+
+    predictor = Predictor()
+
+    def load(*_):
+        events.append("load")
+        return predictor
+
+    def process(model, args, video, destination):
+        assert model is predictor
+        assert destination == output / video.parent.relative_to(root)
+        assert "FAILED" not in capsys.readouterr().err
+        events.append(video.parent.relative_to(root).as_posix())
+        if video.parent == root / "a":
+            if stop == "interrupt":
+                raise KeyboardInterrupt
+            if stop == "unconfirmed":
+                return False
+            raise RuntimeError("broken video")
+        return True
+
+    monkeypatch.setattr(qualitative, "load_predictor", load)
+    monkeypatch.setattr(qualitative, "process_interactive_video", process)
+    assert (
+        qualitative.main(
+            [
+                "--input-root",
+                str(root),
+                "--output-root",
+                str(output),
+                "--rgb-name",
+                "rgb.mkv",
+            ]
+        )
+        == 1
+    )
+    assert events == (
+        ["load", "a", "b", ".", "shutdown"]
+        if stop is None
+        else ["load", "a", "shutdown"]
+    )
+    report = capsys.readouterr()
+    assert ("broken video" in report.err) == (stop is None)
+
+
+def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
+    tmp_path, monkeypatch
+):
+    app = make_app(tmp_path)
+    app.cache = {i: {} for i in range(3)}
+    qualitative.write_interactive_outputs(app)
+    args = qualitative.build_parser().parse_args(
+        [
+            "--input-root",
+            str(app.video_path.parent),
+            "--output-root",
+            str(app.output_dir),
+            "--text-prompt",
+            app.prompt,
+            "--version",
+            app.version,
+        ]
+    )
+    # The test app uses PNG input frames; provide the matching source probe only.
+    probe = qualitative.probe_video
+    monkeypatch.setattr(
+        qualitative,
+        "probe_video",
+        lambda p: app.video_info if p == app.video_path else probe(p),
+    )
+    assert qualitative.completed_interactive_video(app.output_dir, app.video_path, args)
+    monkeypatch.setattr(qualitative, "discover_rgb_videos", lambda *_: [app.video_path])
+    loads = []
+
+    class Predictor:
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *_: loads.append(1) or Predictor()
+    )
+    monkeypatch.setattr(qualitative, "process_interactive_video", lambda *_: True)
+    argv = [
+        "--input-root",
+        str(app.video_path.parent),
+        "--output-root",
+        str(app.output_dir),
+        "--text-prompt",
+        app.prompt,
+        "--version",
+        app.version,
+    ]
+    assert qualitative.main(argv) == 0
+    assert loads == []
+    metadata_path = app.output_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["status"] = "unconfirmed"
+    metadata_path.write_text(json.dumps(metadata))
+    assert qualitative.main(argv) == 1
+    assert loads == []
+    assert qualitative.main([*argv, "--overwrite"]) == 0
+    assert loads == [1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--input-root", "in", "--output-dir", "out"],
+        ["--video", "in.mp4", "--output-root", "out"],
+        ["--input-root", "in", "--output-root", "out", "--rgb-name", "../color.mp4"],
+        ["--input-root", "in", "--output-root", "out", "--max-sequences", "2"],
+    ],
+)
+def test_batch_rejects_invalid_cli(argv):
+    with pytest.raises(SystemExit):
+        qualitative.main(argv)
+
+
+def test_batch_rejects_same_roots_and_empty_input(tmp_path):
+    for output in (tmp_path, tmp_path / "out"):
+        with pytest.raises(SystemExit):
+            qualitative.main(
+                ["--input-root", str(tmp_path), "--output-root", str(output)]
+            )
+
+
+def test_closed_editor_aborts_without_finalizing(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    for name in (
+        "namedWindow",
+        "setWindowTitle",
+        "setMouseCallback",
+        "destroyWindow",
+        "imshow",
+    ):
+        monkeypatch.setattr(cv2, name, lambda *args: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda *_: 255)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 0)
+    monkeypatch.setattr(
+        app, "finalize", lambda: pytest.fail("must not finalize on window close")
+    )
+    with pytest.raises(KeyboardInterrupt):
+        app.run()
+    assert not app.window_open
+
+
+def test_interrupted_overwrite_does_not_leave_success_status(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    app.output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = app.output_dir / "metadata.json"
+    metadata.write_text('{"status": "success"}')
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            str(app.video_path),
+            "--output-dir",
+            str(app.output_dir),
+            "--overwrite",
+        ]
+    )
+    monkeypatch.setattr(qualitative, "probe_video", lambda *_: app.video_info)
+    monkeypatch.setattr(qualitative, "extract_frames", lambda *_: 3)
+
+    def interrupt(*_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(qualitative, "run_interactive", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        qualitative.process_interactive_video(
+            None, args, app.video_path, app.output_dir
+        )
+    assert json.loads(metadata.read_text())["status"] == "processing"
+
+
+def test_each_video_closes_its_own_session_even_on_failure(tmp_path, monkeypatch):
+    events = []
+
+    class Predictor:
+        def handle_request(self, request):
+            events.append(request["type"])
+            return {"session_id": str(len(events)), "outputs": {}}
+
+    class App:
+        def __init__(self, predictor, version, session_id, *args):
+            self.session_id = session_id
+
+        def start(self, outputs):
+            pass
+
+        def run(self):
+            raise RuntimeError("failed interaction")
+
+    monkeypatch.setattr(qualitative, "InteractiveApp", App)
+    predictor = Predictor()
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="failed interaction"):
+            qualitative.run_interactive(
+                predictor,
+                "sam3",
+                tmp_path / "color.mp4",
+                qualitative.VideoInfo(10, 8, 3, 12),
+                tmp_path,
+                3,
+                "hand",
+                tmp_path / "out",
+                1280,
+                20,
+            )
+    assert events == ["start_session", "add_prompt", "close_session"] * 2
