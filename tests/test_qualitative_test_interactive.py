@@ -1645,7 +1645,10 @@ def test_batch_reuses_model_and_reports_failures_at_end(
 
     def process(model, args, video, destination):
         assert model is predictor
-        assert destination == output / video.parent.relative_to(root)
+        assert (
+            destination
+            == output / video.parent.relative_to(root) / "masks_sam3" / "circle"
+        )
         assert "FAILED" not in capsys.readouterr().err
         events.append(video.parent.relative_to(root).as_posix())
         if video.parent == root / "a":
@@ -1684,6 +1687,8 @@ def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
     tmp_path, monkeypatch
 ):
     app = make_app(tmp_path)
+    output_root = app.output_dir
+    app.output_dir = output_root / "masks_sam3" / app.prompt.replace(" ", "_")
     app.cache = {i: {} for i in range(3)}
     qualitative.write_interactive_outputs(app)
     args = qualitative.build_parser().parse_args(
@@ -1691,7 +1696,7 @@ def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
             "--input-root",
             str(app.video_path.parent),
             "--output-root",
-            str(app.output_dir),
+            str(output_root),
             "--text-prompt",
             app.prompt,
             "--version",
@@ -1721,7 +1726,7 @@ def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
         "--input-root",
         str(app.video_path.parent),
         "--output-root",
-        str(app.output_dir),
+        str(output_root),
         "--text-prompt",
         app.prompt,
         "--version",
@@ -1844,3 +1849,85 @@ def test_each_video_closes_its_own_session_even_on_failure(tmp_path, monkeypatch
                 20,
             )
     assert events == ["start_session", "add_prompt", "close_session"] * 2
+
+
+@pytest.mark.parametrize("subdir", [None, "custom_masks"])
+@pytest.mark.parametrize(
+    "prompt", ["left hand", "right hand without arm", "left  hand"]
+)
+def test_batch_output_subdir_removes_only_trailing_raw(
+    tmp_path, monkeypatch, subdir, prompt
+):
+    root, output = tmp_path / "input", tmp_path / "output"
+    paths = ["a/raw/rgb.mkv", "b/rgb.mkv", "raw/c/rgb.mkv"]
+    for name in paths:
+        video = root / name
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.touch()
+
+    class Predictor:
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(qualitative, "load_predictor", lambda *_: Predictor())
+    destinations = []
+    monkeypatch.setattr(
+        qualitative,
+        "process_interactive_video",
+        lambda model, args, video, dest: destinations.append(dest) or True,
+    )
+    argv = [
+        "--input-root",
+        str(root),
+        "--output-root",
+        str(output),
+        "--rgb-name",
+        "rgb.mkv",
+    ]
+    argv += ["--text-prompt", prompt]
+    if subdir:
+        argv += ["--output-subdir", subdir]
+    assert qualitative.main(argv) == 0
+    assert destinations == [
+        output / name / (subdir or "masks_sam3") / prompt.replace(" ", "_")
+        for name in ["a", "b", "raw/c"]
+    ]
+
+
+@pytest.mark.parametrize("subdir", ["", ".", "../out", "/tmp/out", "masks/../../out"])
+def test_output_subdir_rejects_unsafe_paths(subdir):
+    with pytest.raises(SystemExit):
+        qualitative.build_parser().parse_args(
+            ["--input-root", "in", "--output-root", "out", "--output-subdir", subdir]
+        )
+
+
+def test_batch_rejects_output_collisions(tmp_path):
+    root = tmp_path / "input"
+    (root / "raw").mkdir(parents=True)
+    (root / "color.mp4").touch()
+    (root / "raw" / "color.mp4").touch()
+    with pytest.raises(SystemExit):
+        qualitative.main(
+            ["--input-root", str(root), "--output-root", str(tmp_path / "out")]
+        )
+
+
+@pytest.mark.parametrize(
+    "prompt", ["", ".", "..", "../hand", "left/hand", "left\\hand"]
+)
+def test_batch_rejects_prompt_directory_traversal(tmp_path, prompt):
+    root = tmp_path / "input"
+    root.mkdir()
+    (root / "color.mp4").touch()
+    with pytest.raises(SystemExit):
+        qualitative.main(
+            [
+                "--input-root",
+                str(root),
+                "--output-root",
+                str(tmp_path / "out"),
+                "--text-prompt",
+                prompt,
+            ]
+        )

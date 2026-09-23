@@ -22,7 +22,10 @@
         --input-root /path/to/dataset --output-root outputs/interactive \
         --rgb-name color.mp4 --text-prompt "right hand" --version sam3 --device cuda:1
 
-批量模式按相对路径排序递归查找视频，输出保留目录结构；输入输出根目录不得相同。
+批量模式按相对路径排序递归查找视频；输出移除视频父目录末尾的 ``raw`` 层，
+再追加 ``--output-subdir``（默认 ``masks_sam3``）及提示词目录（空格替换为下划线）。
+例如 ``--text-prompt "left hand"`` 输出到 ``masks_sam3/left_hand/``。
+其他目录层级保留，输入输出根目录不得相同；单视频的 ``--output-dir`` 不受此参数影响。
 整批只加载一次模型，逐个打开窗口，每个视频（或分块）使用独立 session。
 ``Q`` 完成并保存本视频后自动进入下一个；分块模式还需终端 ``ok`` 确认。
 批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整、未确认或
@@ -3088,6 +3091,15 @@ def run_interactive(
         predictor.handle_request({"type": "close_session", "session_id": session_id})
 
 
+def output_subdir(value: str) -> Path:
+    path = Path(value)
+    if not value.strip() or path.is_absolute() or not path.parts or ".." in path.parts:
+        raise argparse.ArgumentTypeError(
+            "output subdir must be a nonempty relative path without '..'"
+        )
+    return path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive SAM3 qualitative test")
     parser.add_argument("--version", default="sam3.1", choices=["sam3", "sam3.1"])
@@ -3115,8 +3127,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="Directory for the result video and metadata",
     )
-    outputs.add_argument(
-        "--output-root", help="Batch output root, preserving input paths"
+    outputs.add_argument("--output-root", help="Batch output root")
+    parser.add_argument(
+        "--output-subdir",
+        type=output_subdir,
+        default=Path("masks_sam3"),
+        help="Batch output subdirectory after removing a trailing raw directory "
+        "(default: masks_sam3), followed by the text prompt with spaces replaced "
+        "by underscores; ignored with --video",
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="Replace existing interactive outputs"
@@ -3308,10 +3326,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         videos = discover_rgb_videos(input_root, args.rgb_name)
         if not videos:
             parser.error(f"No files named {args.rgb_name} below {input_root}")
-        jobs = [
-            (video, output_root / video.parent.relative_to(input_root))
-            for video in videos
-        ]
+        try:
+            prompt_dir = file_name(args.text_prompt.replace(" ", "_"))
+            if "\0" in prompt_dir:
+                raise ValueError("prompt contains a null character")
+        except (argparse.ArgumentTypeError, ValueError) as exc:
+            parser.error(f"text prompt cannot be used as an output directory: {exc}")
+        jobs = []
+        destinations = set()
+        for video in videos:
+            relative_dir = video.parent.relative_to(input_root)
+            if relative_dir.name == "raw":
+                relative_dir = relative_dir.parent
+            destination = output_root / relative_dir / args.output_subdir / prompt_dir
+            if destination in destinations:
+                parser.error(
+                    f"multiple input videos map to the same output: {destination}"
+                )
+            destinations.add(destination)
+            jobs.append((video, destination))
     else:
         if args.output_dir is None:
             parser.error("--video requires --output-dir")
@@ -3333,7 +3366,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     interrupted = False
     try:
         for index, (video_path, output_dir) in enumerate(jobs, 1):
-            print(f"[{index}/{len(jobs)}] {video_path}")
+            print(f"[{index}/{len(jobs)}] {video_path} -> {output_dir}")
             try:
                 if (
                     batch
