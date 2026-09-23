@@ -28,8 +28,9 @@
 其他目录层级保留，输入输出根目录不得相同；单视频的 ``--output-dir`` 不受此参数影响。
 整批只加载一次模型，逐个打开窗口，每个视频（或分块）使用独立 session。
 ``Q`` 完成并保存本视频后自动进入下一个；分块模式还需终端 ``ok`` 确认。
-批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整、未确认或
-不匹配的结果作为失败留待最后汇报。单视频模式已有输出仍直接报错。覆盖均需 ``--overwrite``。
+批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整或未确认的
+结果自动重新处理，无需 ``--overwrite``。完整但设置不匹配的结果仍需 ``--overwrite``。
+单视频模式已有输出仍直接报错，覆盖需 ``--overwrite``。
 单视频失败后继续处理剩余视频，最后统一列出失败路径和原因，并返回非零退出码。
 关闭编辑窗口或 Ctrl+C 停止整批；已写入磁盘的结果保留，未完成视频不标记为成功。
 CPU tracker 检查点仅存于当前 session 内存，不支持重启恢复。复核回放窗口关闭仍返回终端。
@@ -3271,7 +3272,11 @@ def load_predictor(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 
 
 def completed_interactive_video(
-    output_dir: Path, video_path: Path, args: argparse.Namespace
+    output_dir: Path,
+    video_path: Path,
+    args: argparse.Namespace,
+    *,
+    check_settings: bool = True,
 ) -> bool:
     try:
         if not all(
@@ -3289,11 +3294,14 @@ def completed_interactive_video(
         source = probe_video(video_path)
         if not (
             metadata.get("status") == interactions.get("status") == "success"
-            and metadata.get("input_video") == str(video_path)
-            and metadata.get("prompt") == args.text_prompt
-            and metadata.get("model_version") == args.version
             and source.frame_count > 0
             and metadata.get("frames_processed") == source.frame_count
+        ):
+            return False
+        if check_settings and not (
+            metadata.get("input_video") == str(video_path)
+            and metadata.get("prompt") == args.text_prompt
+            and metadata.get("model_version") == args.version
             and metadata.get("chunk_frames", 0) == args.chunk_frames
         ):
             return False
@@ -3376,7 +3384,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     skipped += 1
                     print("Skipping completed video")
                     continue
-                validate_interactive_outputs(output_dir, args.overwrite)
+                if not batch or completed_interactive_video(
+                    output_dir, video_path, args, check_settings=False
+                ):
+                    validate_interactive_outputs(output_dir, args.overwrite)
                 if predictor is None:
                     predictor = load_predictor(args, parser)
                 if not process_interactive_video(

@@ -1683,8 +1683,11 @@ def test_batch_reuses_model_and_reports_failures_at_end(
     assert ("broken video" in report.err) == (stop is None)
 
 
+@pytest.mark.parametrize(
+    "incomplete", ["unconfirmed", "metadata_only", "corrupt_video"]
+)
 def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, incomplete
 ):
     app = make_app(tmp_path)
     output_root = app.output_dir
@@ -1736,12 +1739,24 @@ def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
     assert loads == []
     metadata_path = app.output_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata["status"] = "unconfirmed"
+    # Complete outputs with different settings remain protected.
+    metadata["prompt"] = "different prompt"
     metadata_path.write_text(json.dumps(metadata))
     assert qualitative.main(argv) == 1
     assert loads == []
-    assert qualitative.main([*argv, "--overwrite"]) == 0
+    metadata["prompt"] = app.prompt
+    if incomplete == "unconfirmed":
+        metadata["status"] = "unconfirmed"
+    elif incomplete == "metadata_only":
+        for name in ("result.mp4", "masks.mkv", "interactions.json"):
+            (app.output_dir / name).unlink()
+    else:
+        (app.output_dir / "masks.mkv").write_bytes(b"broken")
+    metadata_path.write_text(json.dumps(metadata))
+    assert qualitative.main(argv) == 0
     assert loads == [1]
+    assert qualitative.main([*argv, "--overwrite"]) == 0
+    assert loads == [1, 1]
 
 
 @pytest.mark.parametrize(
