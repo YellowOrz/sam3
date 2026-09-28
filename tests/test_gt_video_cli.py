@@ -37,10 +37,10 @@ def test_shared_gt_arguments(processor, required, capsys):
         defaults.gt_mask_name,
         defaults.compare_skip_frames,
     ) == (False, "masks_sam3", None, 0)
-    if processor is mano:
-        assert defaults.save_detector is False
-    else:
+    if processor is learned:
         assert not hasattr(defaults, "save_detector")
+    else:
+        assert defaults.save_detector is False
     with pytest.raises(SystemExit) as error:
         processor.main([*required, "--compare-gt", "--list-only"])
     assert error.value.code == 2
@@ -85,6 +85,103 @@ def write_video(path, frames, color=False):
             writer.write(frame)
     finally:
         writer.release()
+
+
+def test_dataset_save_detector_is_sam3_only(capsys):
+    with pytest.raises(SystemExit) as error:
+        dataset.main(
+            [
+                "--text-prompt",
+                "hand",
+                "--version",
+                "sam3.1",
+                "--save-detector",
+                "--list-only",
+            ]
+        )
+    assert error.value.code == 2
+    assert "--save-detector requires --version sam3" in capsys.readouterr().err
+
+
+def test_dataset_save_detector_cli_and_cache(tmp_path, monkeypatch):
+    root = tmp_path / "input"
+    output = tmp_path / "out"
+    video = root / "color.mp4"
+    gt = root / "truth" / "custom.mkv"
+    write_video(video, [np.zeros((48, 64, 3), dtype=np.uint8)] * 4, color=True)
+    write_video(
+        gt,
+        [np.zeros((48, 64), dtype=np.uint8)] + [np.ones((48, 64), dtype=np.uint8)] * 3,
+    )
+    checkpoint = tmp_path / "sam3.pt"
+    checkpoint.touch()
+    builds = []
+
+    class Predictor:
+        def handle_request(self, request):
+            return {
+                "session_id": "test",
+                "outputs": {"out_detector_mask": np.ones((48, 64), dtype=bool)},
+            }
+
+        def handle_stream_request(self, request):
+            mask = np.ones((48, 64), dtype=bool)
+            indices = (
+                range(4)
+                if request["propagation_direction"] == "forward"
+                else range(3, -1, -1)
+            )
+            for index in indices:
+                yield {
+                    "frame_index": index,
+                    "outputs": {
+                        **dataset.empty_outputs(),
+                        "out_detector_mask": mask,
+                    },
+                }
+
+        def shutdown(self):
+            return None
+
+    def build(**kwargs):
+        builds.append(kwargs)
+        return Predictor()
+
+    monkeypatch.setitem(
+        sys.modules, "sam3", SimpleNamespace(build_sam3_predictor=build)
+    )
+    monkeypatch.setattr(dataset, "require_cuda", lambda *args: True)
+    base = [
+        "--input-root",
+        str(root),
+        "--output-root",
+        str(output),
+        "--checkpoint",
+        str(checkpoint),
+        "--text-prompt",
+        "hand",
+        "--compare-gt",
+        "--gt-dir-name",
+        "truth",
+        "--gt-mask-name",
+        "custom.mkv",
+        "--compare-skip-frames",
+        "2",
+    ]
+    assert dataset.main(base) == 0
+    assert len(builds) == 1
+    assert not (output / "detector_masks.mkv").exists()
+    assert dataset.probe_video(output / "comparison.mp4")["width"] == 192
+    assert dataset.main([*base, "--save-detector"]) == 0
+    assert len(builds) == 2
+    assert (output / "detector_masks.mkv").is_file()
+    assert (output / "detector_result.mp4").is_file()
+    info = dataset.probe_video(output / "comparison.mp4")
+    assert (info["width"], info["frame_count"]) == (256, 2)
+    summary = json.loads((output / "gt_metrics.json").read_text())
+    assert summary["detector_mean_iou"] == 0.5
+    assert dataset.main([*base, "--save-detector"]) == 0
+    assert len(builds) == 2
 
 
 @pytest.mark.parametrize(

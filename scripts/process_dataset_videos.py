@@ -7,9 +7,13 @@ Each video is decoded to a temporary lossless PNG directory because
 the SAM 3 image-directory loader is substantially more memory efficient than its
 direct OpenCV video loader.
 
-GT evaluation: append --compare-gt --gt-mask-name left_hand.mkv.
-GT directory defaults to masks_sam3; --compare-skip-frames defaults to 0.
+GT evaluation: --compare-gt --gt-mask-name left_hand.mkv.
+--gt-dir-name defaults to masks_sam3; --compare-skip-frames defaults to 0.
 The GT filename must be explicit. Complete predictions can be evaluated on CPU.
+
+--save-detector writes detector_masks.mkv and detector_result.mp4.
+It requires --version sam3. With --compare-gt, comparison.mp4 adds a
+Detector column and gt_metrics include detector_* scores.
 
 --list-only lists discovered input videos without loading the model, running
 segmentation or GT evaluation, or writing output files.
@@ -780,6 +784,7 @@ def run_sequences(
     extra_metadata: Optional[Dict[str, Any]] = None,
     comparison: Optional[GTComparison] = None,
     predictor_factory: Optional[Callable[[], Any]] = None,
+    save_detector: bool = False,
 ) -> Dict[str, int]:
     counts = {"success": 0, "skipped": 0, "failed": 0}
     directions = processing_directions(requested_direction)
@@ -804,6 +809,7 @@ def run_sequences(
                     prompt_request_type=prompt_request_type,
                     extra_metadata=extra_metadata,
                     predictor_factory=predictor_factory,
+                    save_detector=save_detector,
                 )
                 if comparison is not None:
                     comparison.compare(video_path, output_dir, direction)
@@ -827,6 +833,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--text-prompt", dest="prompt", required=True, help="Shared text prompt"
     )
+    parser.add_argument(
+        "--save-detector",
+        action="store_true",
+        help="Save detector masks and detector_result.mp4 (SAM 3 only)",
+    )
     return parser
 
 
@@ -834,6 +845,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_gt_arguments(parser, args)
+    if args.save_detector and args.version != "sam3":
+        parser.error("--save-detector requires --version sam3")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -877,6 +890,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             requested_direction=args.direction,
             comparison=comparison,
             predictor_factory=get_predictor,
+            save_detector=args.save_detector,
         )
     comparison.write_summary(output_root)
 
