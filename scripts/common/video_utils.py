@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -231,3 +232,66 @@ def draw_geometry(overlay: np.ndarray, geometry: Dict[str, Any]) -> None:
             (255, 255, 0),
             2,
         )
+
+
+class H264Writer:
+    """VS Code plays H.264 in mp4. This OpenCV build has no H.264 encoder."""
+
+    def __init__(self, path: Path, fps: float, size: Tuple[int, int]) -> None:
+        width, height = size
+        # ponytail: yuv420p needs even sizes; pad if a frame is odd
+        self.width = width + (width & 1)
+        self.height = height + (height & 1)
+        self.proc: Optional[subprocess.Popen] = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-s",
+                f"{self.width}x{self.height}",
+                "-r",
+                f"{fps}",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+    def isOpened(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.copyMakeBorder(
+                frame,
+                0,
+                self.height - frame.shape[0],
+                0,
+                self.width - frame.shape[1],
+                cv2.BORDER_REPLICATE,
+            )
+        assert self.proc is not None and self.proc.stdin is not None
+        self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+
+    def release(self) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        self.proc = None
+        if proc.stdin is not None:
+            proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while writing video")

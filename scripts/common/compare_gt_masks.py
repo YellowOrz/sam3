@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
-from .video_utils import draw_geometry, MASK_ALPHA, probe_video, write_json
+from .video_utils import draw_geometry, H264Writer, MASK_ALPHA, probe_video, write_json
 
 PREDICTION_COLOR = np.array((60, 220, 60), dtype=np.float64)
 DETECTOR_COLOR = np.array((0, 165, 255), dtype=np.float64)
@@ -154,9 +154,8 @@ def compare_masks(
     try:
         with tempfile.TemporaryDirectory(prefix=".gt_compare_", dir=output_dir) as temp:
             temporary = Path(temp)
-            writer = cv2.VideoWriter(
-                str(temporary / "comparison.mp4"),
-                cv2.VideoWriter_fourcc(*"mp4v"),
+            writer = H264Writer(
+                temporary / "comparison.mp4",
                 source["fps"] / stride,
                 (source["width"] * panel_count, source["height"]),
             )

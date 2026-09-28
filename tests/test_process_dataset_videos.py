@@ -95,6 +95,7 @@ def test_backward_propagation_writes_result_in_forward_playback_order(
     monkeypatch.setattr(
         processor.cv2, "VideoWriter", lambda *args, **kwargs: FakeWriter()
     )
+    monkeypatch.setattr(processor, "H264Writer", lambda *args, **kwargs: FakeWriter())
     monkeypatch.setattr(
         processor,
         "write_frame_outputs",

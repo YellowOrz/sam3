@@ -57,6 +57,7 @@ if __package__:
         draw_geometry,
         expand_path,
         extract_png_frames,
+        H264Writer,
         lighter_color,
         normalize_output_arrays,
         positive_int,
@@ -80,6 +81,7 @@ else:
         draw_geometry,
         expand_path,
         extract_png_frames,
+        H264Writer,
         lighter_color,
         normalize_output_arrays,
         positive_int,
@@ -400,10 +402,7 @@ def propagate_and_write(
     save_detector: bool = False,
     prompt_outputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, int]:
-    result_fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    result_writer = cv2.VideoWriter(
-        str(result_path), result_fourcc, fps, (width, height)
-    )
+    result_writer = H264Writer(result_path, fps, (width, height))
     if not result_writer.isOpened():
         result_writer.release()
         raise RuntimeError(f"cannot create output video: {result_path}")
@@ -427,11 +426,8 @@ def propagate_and_write(
             (width, height),
             isColor=False,
         )
-        detector_result_writer = cv2.VideoWriter(
-            str(result_path.with_name("detector_result.mp4")),
-            result_fourcc,
-            fps,
-            (width, height),
+        detector_result_writer = H264Writer(
+            result_path.with_name("detector_result.mp4"), fps, (width, height)
         )
         if not detector_writer.isOpened() or not detector_result_writer.isOpened():
             result_writer.release()

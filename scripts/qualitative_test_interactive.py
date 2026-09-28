@@ -153,6 +153,7 @@ if __package__:
         color_for_label,
         COLORS,
         expand_path,
+        H264Writer,
         lighter_color,
         parse_device,
         positive_int,
@@ -165,6 +166,7 @@ else:
         color_for_label,
         COLORS,
         expand_path,
+        H264Writer,
         lighter_color,
         parse_device,
         positive_int,
@@ -2462,9 +2464,8 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
     for path in (temporary_result, temporary_masks):
         if path.exists():
             path.unlink()
-    result_writer = cv2.VideoWriter(
-        str(temporary_result),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+    result_writer = H264Writer(
+        temporary_result,
         app.video_info.fps,
         (app.video_info.width, app.video_info.height),
     )
@@ -2860,9 +2861,8 @@ def merge_chunk_outputs(
     temporary_masks = output_dir / ".masks.tmp.mkv"
     for path in (temporary_result, temporary_masks):
         path.unlink(missing_ok=True)
-    result_writer = cv2.VideoWriter(
-        str(temporary_result),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+    result_writer = H264Writer(
+        temporary_result,
         video_info.fps,
         (video_info.width, video_info.height),
     )
