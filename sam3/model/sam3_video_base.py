@@ -259,6 +259,59 @@ def _associate_det_trk_compilable(
         im_mask,
     )
 
+def clip_oversegmented_tracker_masks(
+    det_masks: Tensor,
+    det_scores: Tensor,
+    trk_masks: Tensor,
+    score_thresh: float = 0.8,
+    min_det_coverage: float = 0.9,
+    min_area_ratio: float = 1.25,
+    max_area_ratio: float = 10.0,
+) -> Tensor:
+    """把明显大于、且包住高分检测的轨迹掩码换成该检测。
+
+    纠正候选要求 IoU >= 0.8。检测几乎落在轨迹内部、轨迹又多出一大块时，
+    IoU 落在关联阈值和纠正阈值之间，轨迹会带着多出来的区域写进 memory。
+    只替换一对一的检测；面积比超出 ``max_area_ratio`` 的小块检测不替换。
+    """
+    # ponytail: obj_ptr stays from the pre-clip tracker. Re-decode from this mask
+    # if that pointer alone keeps regrowing the extra region.
+    if det_masks.numel() == 0 or trk_masks.numel() == 0:
+        return trk_masks
+    if det_masks.ndim == 4 and det_masks.size(1) == 1:
+        det_masks = det_masks.squeeze(1)
+    if det_masks.shape[-2:] != trk_masks.shape[-2:]:
+        det_masks = F.interpolate(
+            det_masks.float().unsqueeze(1),
+            size=trk_masks.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+    det_scores = det_scores.to(device=det_masks.device, dtype=torch.float32).reshape(-1)
+    det_bin = det_masks > 0
+    trk_bin = trk_masks > 0
+    det_area = det_bin.flatten(1).sum(1).float()
+    trk_area = trk_bin.flatten(1).sum(1).float()
+    intersection = torch.mm(det_bin.flatten(1).float(), trk_bin.flatten(1).float().t())
+    coverage = intersection / det_area.clamp(min=1).unsqueeze(1)
+    ratio = trk_area.unsqueeze(0) / det_area.clamp(min=1).unsqueeze(1)
+    eligible = (
+        (det_scores.unsqueeze(1) >= score_thresh)
+        & (det_area.unsqueeze(1) > 0)
+        & (trk_area.unsqueeze(0) > 0)
+        & (coverage >= min_det_coverage)
+        & (ratio >= min_area_ratio)
+        & (ratio <= max_area_ratio)
+    )
+    one_det = eligible.sum(dim=1, keepdim=True) == 1
+    one_trk = eligible.sum(dim=0, keepdim=True) == 1
+    unique = eligible & one_det & one_trk
+    has_det = unique.any(dim=0)
+    det_index = unique.float().argmax(dim=0)
+    if has_det.any():
+        trk_masks[has_det] = det_masks[det_index[has_det]].to(dtype=trk_masks.dtype)
+    return trk_masks
+
 
 class Sam3VideoBase(nn.Module):
     """! @brief 将逐帧开放词汇检测与 SAM 2 masklet 跟踪拼接的核心模型。
@@ -375,6 +428,7 @@ class Sam3VideoBase(nn.Module):
             masklet_confirmation_consecutive_det_thresh
         )
         self.reconstruction_bbox_iou_thresh = reconstruction_bbox_iou_thresh
+        self.clip_overseg = False
         self.reconstruction_bbox_det_score = reconstruction_bbox_det_score
 
     @property
@@ -1074,6 +1128,12 @@ class Sam3VideoBase(nn.Module):
                         )
                     )
 
+            if self.clip_overseg:
+                clip_oversegmented_tracker_masks(
+                    det_masks=det_out["mask"],
+                    det_scores=det_out["scores"],
+                    trk_masks=tracker_low_res_masks_global,
+                )
             self._tracker_update_memories(
                 tracker_states_local,
                 frame_idx,

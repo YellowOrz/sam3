@@ -63,6 +63,15 @@ def add_video_arguments(
         metavar="cuda:N",
         help="CUDA device to use (default: cuda:0)",
     )
+    model.add_argument(
+        "--clip-overseg",
+        action="store_true",
+        help=(
+            "SAM 3 only. Before writing tracker memory, replace a tracker mask "
+            "with a high-score detection when that detection sits inside it and "
+            "the tracker is substantially larger"
+        ),
+    )
     add_gt_arguments(parser.add_argument_group("GT evaluation"))
 
 

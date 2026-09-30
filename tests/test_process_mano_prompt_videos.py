@@ -43,6 +43,11 @@ def sample_npz(path, **overrides):
     return path
 
 
+def test_clip_overseg_is_opt_in():
+    assert arguments().clip_overseg is False
+    assert arguments("--clip-overseg").clip_overseg is True
+
+
 def arguments(*extra):
     return mano.build_parser().parse_args(
         [

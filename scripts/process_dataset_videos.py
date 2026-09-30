@@ -11,6 +11,9 @@ GT evaluation: --compare-gt --gt-mask-name left_hand.mkv.
 --gt-dir-name defaults to masks_sam3; --compare-skip-frames defaults to 0.
 The GT filename must be explicit. Complete predictions can be evaluated on CPU.
 
+--clip-overseg (SAM 3 only, off by default) replaces a tracker mask with a
+high-score detection when that detection sits inside a substantially larger tracker.
+
 --save-detector writes detector_masks.mkv and detector_result.mp4.
 It requires --version sam3. With --compare-gt, comparison.mp4 adds a
 Detector column and gt_metrics include detector_* scores.
@@ -148,6 +151,7 @@ def is_complete(
     extra_metadata: Optional[Dict[str, Any]] = None,
     save_detector: bool = False,
     detector_only: bool = False,
+    clip_overseg: bool = False,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
@@ -166,6 +170,7 @@ def is_complete(
         and metadata.get("model_version") == model_version
         and metadata.get("detector_only", False) == detector_only
         and metadata.get("propagation_direction", "forward") == direction
+        and metadata.get("clip_overseg", False) == clip_overseg
         and metadata.get("frames_processed") == expected_frames
         and all(
             metadata.get(key) == value for key, value in (extra_metadata or {}).items()
@@ -578,6 +583,7 @@ def process_video(
     predictor_factory: Optional[Callable[[], Any]] = None,
     save_detector: bool = False,
     detector_only: bool = False,
+    clip_overseg: bool = False,
 ) -> str:
     if detector_only and (model_version != "sam3" or geometry_prompts is None):
         raise ValueError("detector-only requires SAM3 geometry prompts")
@@ -593,6 +599,7 @@ def process_video(
         extra_metadata if geometry_prompts is not None else None,
         save_detector,
         detector_only,
+        clip_overseg,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -610,6 +617,7 @@ def process_video(
         "model_version": model_version,
         "detector_only": detector_only,
         "propagation_direction": direction,
+        "clip_overseg": clip_overseg,
         "source": video_info,
         "started_at": utc_now(),
         "frames_processed": 0,
@@ -755,8 +763,11 @@ def lazy_predictor(args: argparse.Namespace) -> Iterator[Callable[[], Any]]:
             )
             if args.checkpoint:
                 kwargs["checkpoint_path"] = str(expand_path(args.checkpoint))
+            if args.clip_overseg and args.version != "sam3":
+                raise RuntimeError("--clip-overseg requires --version sam3")
             LOGGER.info("Loading %s on %s", args.version, args.device[0])
             predictor = build_sam3_predictor(**kwargs)
+            predictor.model.clip_overseg = args.clip_overseg
         return predictor
 
     try:
@@ -781,6 +792,7 @@ def run_sequences(
     comparison: Optional[GTComparison] = None,
     predictor_factory: Optional[Callable[[], Any]] = None,
     save_detector: bool = False,
+    clip_overseg: bool = False,
 ) -> Dict[str, int]:
     counts = {"success": 0, "skipped": 0, "failed": 0}
     directions = processing_directions(requested_direction)
@@ -806,6 +818,7 @@ def run_sequences(
                     extra_metadata=extra_metadata,
                     predictor_factory=predictor_factory,
                     save_detector=save_detector,
+                    clip_overseg=clip_overseg,
                 )
                 if comparison is not None:
                     comparison.compare(video_path, output_dir, direction)
@@ -843,6 +856,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     validate_gt_arguments(parser, args)
     if args.save_detector and args.version != "sam3":
         parser.error("--save-detector requires --version sam3")
+    if args.clip_overseg and args.version != "sam3":
+        parser.error("--clip-overseg requires --version sam3")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -887,6 +902,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             comparison=comparison,
             predictor_factory=get_predictor,
             save_detector=args.save_detector,
+            clip_overseg=args.clip_overseg,
         )
     comparison.write_summary(output_root)
 

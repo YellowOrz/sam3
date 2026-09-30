@@ -41,6 +41,16 @@ def test_both_directions_get_independent_output_directories(tmp_path: Path) -> N
     )
 
 
+def test_clip_overseg_is_opt_in() -> None:
+    parser = processor.build_parser()
+    assert parser.parse_args(["--text-prompt", "hand"]).clip_overseg is False
+    assert parser.parse_args(["--text-prompt", "hand", "--clip-overseg"]).clip_overseg
+    with pytest.raises(SystemExit):
+        processor.main(
+            ["--text-prompt", "hand", "--version", "sam3.1", "--clip-overseg"]
+        )
+
+
 def test_direction_choices_and_expansion() -> None:
     parser = processor.build_parser()
     args = parser.parse_args(["--text-prompt", "hand", "--direction", "both"])

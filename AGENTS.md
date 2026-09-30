@@ -6,7 +6,7 @@
 
 ## 自定义视频脚本
 
-共用代码位于 `scripts/common/`：`video_cli.py` 集中三个批量入口的数据输入输出、批量运行、模型加载和 GT 参数组，以及递归视频发现和目录校验；三者均用 `--rgb-name`（默认 `color.mp4`）递归查找根目录及所有子目录，输入输出根目录不得相同（含 `--list-only`）。`video_utils.py` 提供视频工具，`compare_gt_masks.py` 提供 GT 参数、评测和批次汇总。`process_learned_prompt_videos.py`、`process_mano_prompt_videos.py`、`process_dataset_videos.py` 统一通过 `--compare-gt --gt-mask-name NAME` 启用评测；`--gt-dir-name` 默认 `masks_sam3`，`--compare-skip-frames` 默认 `0`，GT 文件名不从提示词、目标 ID 或手侧推导。
+共用代码位于 `scripts/common/`：`video_cli.py` 集中三个批量入口的数据输入输出、批量运行、模型加载和 GT 参数组，以及递归视频发现和目录校验；三者均用 `--rgb-name`（默认 `color.mp4`）递归查找根目录及所有子目录，输入输出根目录不得相同（含 `--list-only`）。`--clip-overseg` 默认关闭，仅 SAM 3：高分检测几乎落在轨迹内部且轨迹明显更大时，用该检测替换轨迹掩码再写 memory；已有结果不含该标记时视为关闭。`video_utils.py` 提供视频工具，`compare_gt_masks.py` 提供 GT 参数、评测和批次汇总。`process_learned_prompt_videos.py`、`process_mano_prompt_videos.py`、`process_dataset_videos.py` 统一通过 `--compare-gt --gt-mask-name NAME` 启用评测；`--gt-dir-name` 默认 `masks_sam3`，`--compare-skip-frames` 默认 `0`，GT 文件名不从提示词、目标 ID 或手侧推导。
 
 - `process_dataset_videos.py`：递归查找 `color.mp4`，用统一文本提示执行 SAM 3/3.1 分割并保留目录结构。`--save-detector` 仅 `sam3`，另写 `detector_masks.mkv` 和 `detector_result.mp4`；与 `--compare-gt` 同开时对比视频增加 Detector 列和 `detector_*` 指标。先用 `--list-only` 核对输入；示例：`python scripts/process_dataset_videos.py --input-root DATA --output-root OUT --version sam3.1 --text-prompt hand --device cuda:0`。
 - `process_mano_prompt_videos.py`：同一目录约定，用 `<mano-dir-name>/<left|right>_hand/*.npz` 的全部 MANO 几何做 SAM 3 分割。多个 NPZ 的框/点按帧合并进一次检测；`--save-detector` 另写 `detector_masks.mkv` 和 `detector_result.mp4`。示例：`python scripts/process_mano_prompt_videos.py --input-root DATA --output-root OUT --text-prompt "left hand" --hand-side left --device cuda:0`。

@@ -232,6 +232,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         "sam3",
                         expected_frame_count(probe_video(video_path), args.max_frames),
                         direction,
+                        clip_overseg=args.clip_overseg,
                     )
                     if complete:
                         status = "skipped"
@@ -249,6 +250,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                                 compile=False,
                                 async_loading_frames=True,
                             )
+                            if args.clip_overseg or hasattr(predictor, "model"):
+                                predictor.model.clip_overseg = args.clip_overseg
                         status = process_video(
                             predictor=predictor,
                             video_path=video_path,
@@ -259,6 +262,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             max_frames=args.max_frames,
                             overwrite=args.overwrite,
                             direction=direction,
+                            clip_overseg=args.clip_overseg,
                             prompt_request_type="learned",
                             extra_metadata={
                                 "prompt_mode": "learned",

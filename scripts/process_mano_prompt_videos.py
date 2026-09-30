@@ -37,6 +37,8 @@ result.mp4 与 comparison 第一列在任一 NPZ 有手的帧上画全部在屏�
       生成 comparison.mp4、gt_metrics.csv/json 和根目录 gt_summary.json
       comparison.mp4 最左侧 RGB 列叠加该帧实际使用的黄色点／青色框，以及 MANO 骨架。
       完整预测可免 GPU 补评测，仍校验 MANO 和缓存配置；GT 失败保留预测并继续批次。
+  --clip-overseg：默认关闭。高分检测几乎落在轨迹内部且轨迹明显更大时，
+      用该检测替换轨迹掩码再写 memory。
   --save-detector：另存 detector_masks.mkv（阈值后的原始 det_out 并集，FFV1 gray8）
       和 detector_result.mp4（detector 着色叠加与实际 prompts，不含骨架）。
       与 --compare-gt 同时开启时，comparison.mp4 为 RGB／Detector／Prediction／GT，
@@ -501,6 +503,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             predictor_factory=get_predictor,
                             save_detector=args.save_detector,
                             detector_only=args.detector_only,
+                            clip_overseg=args.clip_overseg,
                         )
                         comparison.compare(video, destination, direction, visualization)
                     except Exception as exc:
