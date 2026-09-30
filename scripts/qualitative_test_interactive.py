@@ -31,6 +31,10 @@
 批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整或未确认的
 结果自动重新处理，无需 ``--overwrite``。完整但设置不匹配的结果仍需 ``--overwrite``。
 单视频模式已有输出仍直接报错，覆盖需 ``--overwrite``。
+
+``--clip-overseg`` 默认关闭，且仅基础 SAM 3。高分检测几乎落在轨迹内部、轨迹又明显更大时，
+用该检测替换轨迹掩码再写入 memory。``metadata.json`` 记录 ``clip_overseg``；旧结果没有该字段时
+视为关闭，不会因此重跑。批量模式下该开关与已有成功结果不一致时重新推理，无需 ``--overwrite``。
 单视频失败后继续处理剩余视频，最后统一列出失败路径和原因，并返回非零退出码。
 关闭编辑窗口或 Ctrl+C 停止整批；已写入磁盘的结果保留，未完成视频不标记为成功。
 CPU tracker 检查点仅存于当前 session 内存，不支持重启恢复。复核回放窗口关闭仍返回终端。
@@ -940,9 +944,11 @@ class InteractiveApp:
         window_width: int,
         checkpoint_interval: int = 20,
         frame_offset: int = 0,
+        clip_overseg: bool = False,
     ):
         self.predictor = predictor
         self.version = version
+        self.clip_overseg = clip_overseg
         self.session_id = session_id
         self.frame_dir = frame_dir
         self.video_path = video_path
@@ -2550,6 +2556,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "input_video": str(app.video_path),
             "prompt": app.prompt,
             "model_version": app.version,
+            "clip_overseg": app.clip_overseg,
             "source": source,
             "frames_processed": app.frame_count,
             "original_object_id_to_object_id": id_mapping,
@@ -2750,6 +2757,7 @@ def review_chunk_outputs(
     chunk_frames: int,
     frame_dir: Path,
     window_width: int,
+    clip_overseg: bool = False,
 ) -> bool:
     mappings = []
     for _, _, directory in chunks:
@@ -2770,6 +2778,7 @@ def review_chunk_outputs(
             frame_dir,
             current,
             confirmed,
+            clip_overseg=clip_overseg,
         )
 
     def show() -> None:
@@ -2839,6 +2848,7 @@ def merge_chunk_outputs(
     frame_dir: Path,
     mappings: Optional[Sequence[Dict[int, int]]] = None,
     confirmed: bool = False,
+    clip_overseg: bool = False,
 ) -> None:
     metadata_by_chunk = [
         json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
@@ -3009,6 +3019,7 @@ def merge_chunk_outputs(
         "object_id_to_label": global_labels,
         "input_video": str(video_path),
         "model_version": version,
+        "clip_overseg": clip_overseg,
         "source": source,
         "chunk_frames": chunk_frames,
         "chunks": chunk_metadata,
@@ -3050,6 +3061,7 @@ def run_interactive(
     window_width: int,
     checkpoint_interval: int,
     frame_offset: int = 0,
+    clip_overseg: bool = False,
 ) -> None:
     response = predictor.handle_request(
         {
@@ -3083,6 +3095,7 @@ def run_interactive(
             window_width,
             checkpoint_interval,
             frame_offset,
+            clip_overseg=clip_overseg,
         )
         app.start(response.get("outputs", {}))
         app.run()
@@ -3160,6 +3173,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FRAMES",
         help="Frames per independent chunk; 0 disables chunking (default: 0, min: 100)",
     )
+    parser.add_argument(
+        "--clip-overseg",
+        action="store_true",
+        help=(
+            "SAM 3 only, off by default. Before writing tracker memory, replace a "
+            "tracker mask with a high-score detection when that detection sits "
+            "inside it and the tracker is substantially larger"
+        ),
+    )
     return parser
 
 
@@ -3174,6 +3196,7 @@ def process_interactive_video(
             "input_video": str(video_path),
             "prompt": args.text_prompt,
             "model_version": args.version,
+            "clip_overseg": args.clip_overseg,
         },
     )
     video_info = probe_video(video_path)
@@ -3196,6 +3219,7 @@ def process_interactive_video(
                 output_dir,
                 args.window_width,
                 args.checkpoint_interval,
+                clip_overseg=args.clip_overseg,
             )
         else:
             chunks = []
@@ -3226,6 +3250,7 @@ def process_interactive_video(
                     args.window_width,
                     args.checkpoint_interval,
                     frame_offset=start,
+                    clip_overseg=args.clip_overseg,
                 )
                 chunks.append((start, end, chunk_output_dir))
             confirmed = review_chunk_outputs(
@@ -3238,6 +3263,7 @@ def process_interactive_video(
                 args.chunk_frames,
                 frame_dir,
                 args.window_width,
+                args.clip_overseg,
             )
             if not confirmed:
                 return False
@@ -3268,7 +3294,9 @@ def load_predictor(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     build_kwargs = dict(version=args.version, compile=False, async_loading_frames=False)
     if checkpoint is not None:
         build_kwargs["checkpoint_path"] = str(checkpoint)
-    return build_sam3_predictor(**build_kwargs)
+    predictor = build_sam3_predictor(**build_kwargs)
+    predictor.model.clip_overseg = args.clip_overseg
+    return predictor
 
 
 def completed_interactive_video(
@@ -3303,6 +3331,7 @@ def completed_interactive_video(
             and metadata.get("prompt") == args.text_prompt
             and metadata.get("model_version") == args.version
             and metadata.get("chunk_frames", 0) == args.chunk_frames
+            and metadata.get("clip_overseg", False) == args.clip_overseg
         ):
             return False
         for name in ("result.mp4", "masks.mkv"):
@@ -3318,9 +3347,50 @@ def completed_interactive_video(
         return False
 
 
+def _clip_overseg_only_mismatch(
+    output_dir: Path, video_path: Path, args: argparse.Namespace
+) -> bool:
+    """True when a finished result matches every setting except clip_overseg."""
+    try:
+        metadata = json.loads(
+            (output_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False
+    settings_match = (
+        metadata.get("input_video") == str(video_path)
+        and metadata.get("prompt") == args.text_prompt
+        and metadata.get("model_version") == args.version
+        and metadata.get("chunk_frames", 0) == args.chunk_frames
+    )
+    return settings_match and metadata.get("clip_overseg", False) != args.clip_overseg
+
+
+def _interactive_output_is_protected(
+    output_dir: Path,
+    video_path: Path,
+    args: argparse.Namespace,
+    batch: bool,
+) -> bool:
+    """Whether existing files must be cleared with --overwrite before rerunning.
+
+    A batch result that only differs by ``clip_overseg`` is rerun in place.
+    Missing ``clip_overseg`` in old metadata counts as off.
+    """
+    if not batch:
+        return True
+    if not completed_interactive_video(
+        output_dir, video_path, args, check_settings=False
+    ):
+        return False
+    return not _clip_overseg_only_mismatch(output_dir, video_path, args)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.clip_overseg and args.version != "sam3":
+        parser.error("--clip-overseg requires --version sam3")
     batch = args.input_root is not None
     if batch:
         if args.output_root is None:
@@ -3384,8 +3454,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     skipped += 1
                     print("Skipping completed video")
                     continue
-                if not batch or completed_interactive_video(
-                    output_dir, video_path, args, check_settings=False
+                if _interactive_output_is_protected(
+                    output_dir, video_path, args, batch
                 ):
                     validate_interactive_outputs(output_dir, args.overwrite)
                 if predictor is None:

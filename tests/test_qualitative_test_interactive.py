@@ -116,7 +116,27 @@ def test_parser_has_no_interactive_switch() -> None:
     assert not hasattr(args, "propagation_direction")
     assert args.checkpoint_interval == 20
     assert args.chunk_frames == 0
+    assert args.clip_overseg is False
     assert qualitative.WINDOW_FLAGS & cv2.WINDOW_GUI_NORMAL
+
+
+def test_clip_overseg_requires_base_sam3() -> None:
+    enabled = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            "input.mp4",
+            "--output-dir",
+            "output",
+            "--version",
+            "sam3",
+            "--clip-overseg",
+        ]
+    )
+    assert enabled.clip_overseg is True
+    with pytest.raises(SystemExit):
+        qualitative.main(
+            ["--video", "input.mp4", "--output-dir", "output", "--clip-overseg"]
+        )
 
 
 def test_chunk_frames_parser_and_ranges() -> None:
@@ -1306,6 +1326,7 @@ def test_interactive_outputs_write_mask_video_and_metadata(tmp_path: Path) -> No
     assert metadata["object_id_to_label"] == {"0": 1}
     assert metadata["original_object_id_to_object_id"] == {"1": 0}
     assert metadata["outputs"]["instance_masks_codec"] == "FFV1"
+    assert metadata["clip_overseg"] is False
     interactions = json.loads(interactions_path.read_text(encoding="utf-8"))
     assert interactions["propagation_direction"] == "forward"
     assert interactions["confirmed_points"][0]["frame_index"] == 1
@@ -1366,6 +1387,7 @@ def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
         capture.release()
     metadata = json.loads((output_dir / "metadata.json").read_text())
     assert metadata["frames_processed"] == 3
+    assert metadata["clip_overseg"] is False
     assert [
         (chunk["start_frame"], chunk["end_frame_exclusive"])
         for chunk in metadata["chunks"]
@@ -1759,6 +1781,58 @@ def test_batch_skips_only_complete_outputs_and_overwrite_reprocesses(
     assert loads == [1, 1]
 
 
+def test_batch_reruns_only_when_clip_overseg_changes(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    output_root = app.output_dir
+    app.output_dir = output_root / "masks_sam3" / app.prompt.replace(" ", "_")
+    app.version = "sam3"
+    app.cache = {i: {} for i in range(3)}
+    qualitative.write_interactive_outputs(app)
+    metadata_path = app.output_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("clip_overseg")
+    metadata_path.write_text(json.dumps(metadata))
+    probe = qualitative.probe_video
+    monkeypatch.setattr(
+        qualitative,
+        "probe_video",
+        lambda p: app.video_info if p == app.video_path else probe(p),
+    )
+    monkeypatch.setattr(qualitative, "discover_rgb_videos", lambda *_: [app.video_path])
+    loads = []
+
+    class Predictor:
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *_: loads.append(1) or Predictor()
+    )
+    monkeypatch.setattr(qualitative, "process_interactive_video", lambda *_: True)
+    argv = [
+        "--input-root",
+        str(app.video_path.parent),
+        "--output-root",
+        str(output_root),
+        "--text-prompt",
+        app.prompt,
+        "--version",
+        "sam3",
+    ]
+    assert qualitative.main(argv) == 0
+    assert loads == []
+    assert qualitative.main([*argv, "--clip-overseg"]) == 0
+    assert loads == [1]
+    metadata["clip_overseg"] = True
+    metadata_path.write_text(json.dumps(metadata))
+    assert qualitative.main([*argv, "--clip-overseg"]) == 0
+    assert loads == [1]
+    metadata["prompt"] = "different prompt"
+    metadata_path.write_text(json.dumps(metadata))
+    assert qualitative.main(argv) == 1
+    assert loads == [1]
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -1818,7 +1892,7 @@ def test_interrupted_overwrite_does_not_leave_success_status(tmp_path, monkeypat
     monkeypatch.setattr(qualitative, "probe_video", lambda *_: app.video_info)
     monkeypatch.setattr(qualitative, "extract_frames", lambda *_: 3)
 
-    def interrupt(*_):
+    def interrupt(*_, **__):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(qualitative, "run_interactive", interrupt)
@@ -1838,7 +1912,7 @@ def test_each_video_closes_its_own_session_even_on_failure(tmp_path, monkeypatch
             return {"session_id": str(len(events)), "outputs": {}}
 
     class App:
-        def __init__(self, predictor, version, session_id, *args):
+        def __init__(self, predictor, version, session_id, *args, **kwargs):
             self.session_id = session_id
 
         def start(self, outputs):
