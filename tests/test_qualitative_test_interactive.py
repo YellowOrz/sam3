@@ -457,6 +457,84 @@ def test_mouse_hitbox_uses_canvas_coordinates_below_video(tmp_path: Path) -> Non
     assert app.playback_direction == 1
 
 
+def test_frame_mutation_rate_uses_max_one_minus_iou() -> None:
+    hand = np.zeros((4, 4), dtype=bool)
+    hand[:2, :2] = True
+    grown = np.ones((4, 4), dtype=bool)
+    other = np.zeros((4, 4), dtype=bool)
+    other[2:, 2:] = True
+    empty = np.zeros((4, 4), dtype=bool)
+
+    assert qualitative.frame_mutation_rate({1: hand}, {1: hand}) == 0.0
+    assert qualitative.frame_mutation_rate({1: hand}, {1: grown}) == pytest.approx(0.75)
+    assert qualitative.frame_mutation_rate({1: hand}, {2: other}) == 1.0
+    assert qualitative.frame_mutation_rate({1: hand}, {}) == 1.0
+    assert qualitative.frame_mutation_rate({}, {}) is None
+    assert qualitative.frame_mutation_rate({1: empty}, {1: empty}) is None
+    assert (
+        qualitative.frame_mutation_rate({1: hand, 2: hand}, {1: hand, 2: other}) == 1.0
+    )
+
+
+def test_mutation_series_breaks_when_a_frame_is_missing() -> None:
+    mask = np.ones((2, 2), dtype=bool)
+    series = qualitative.mutation_series(
+        {0: {1: mask}, 1: {1: mask}, 3: {1: mask}, 4: {1: mask}},
+        5,
+    )
+
+    assert series == [(1, 0.0), (4, 0.0)]
+
+
+def test_mutation_chart_click_seeks_without_pausing(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[0, 0] = True
+    app.cache = {0: {1: mask}, 1: {1: mask}, 2: {1: mask}}
+    app.display_index = 0
+    app.playing = True
+    app.playback_direction = -1
+    app.last_play_time = 0.0
+    app.active_obj = 7
+    draft = qualitative.PointEdit(1, 0, 7, 4, 3, 1)
+    app.draft_points = [draft]
+    y = app.display_height + qualitative.TIMELINE_HEIGHT + 4
+
+    app.on_mouse(cv2.EVENT_LBUTTONDOWN, app.track_x_for_frame(2), y, 0, None)
+
+    assert app.display_index == 2
+    assert app.playing
+    assert app.playback_direction == -1
+    assert app.active_obj == 7
+    assert app.draft_points == [draft]
+    assert app.last_play_time > 0
+
+    app.playing = False
+    app.on_mouse(cv2.EVENT_LBUTTONDOWN, app.track_x_for_frame(1), y, 0, None)
+    assert app.display_index == 1
+    assert not app.playing
+
+    app.cache = {0: {1: mask}}
+    app.display_index = 0
+    app.on_mouse(cv2.EVENT_LBUTTONDOWN, app.track_x_for_frame(2), y, 0, None)
+    assert app.display_index == 0
+
+
+def test_mutation_chart_draws_a_spike(tmp_path: Path) -> None:
+    app = make_app(tmp_path)
+    small = np.zeros((8, 10), dtype=bool)
+    small[0, 0] = True
+    app.cache = {0: {1: small}, 1: {1: np.ones((8, 10), dtype=bool)}}
+
+    panel = app.render_controls()
+    band = panel[
+        qualitative.TIMELINE_HEIGHT : qualitative.TIMELINE_HEIGHT
+        + qualitative.MUTATION_HEIGHT
+    ]
+
+    assert int(band[:, :, 1].max()) > 150
+
+
 def test_enter_and_space_do_not_commit_when_paused(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     app.active_obj = 2

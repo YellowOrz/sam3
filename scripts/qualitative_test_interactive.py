@@ -76,7 +76,11 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
   ``[`` / ``]`` 把当前帧设为左/右界，若交叉则另一侧跟着移到当前帧。起始帧
   在窗口外时该方向只更新起始帧。``C`` 清点不会重置窗口。播放不受窗口限制。
   进度条下方每个 ▴ 对应一帧上的已确认或未提交提示点，点击可跳到该帧（仅限
-  可播放范围）。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
+  可播放范围）。▴ 下方是突变率曲线：横轴与进度条拇指使用同一帧号映射，纵轴
+  固定 0 到 1。帧 t 的值是各对象相对第 t-1 帧 ``1 - IoU`` 的最大值；对象只在
+  一侧有掩码时该对象记为 1，两侧都空则该帧留空并断开曲线。单击曲线跳到对应
+  已处理帧；正在播放时不暂停，沿原方向继续，超出已处理范围不跳转。曲线读取
+  当前缓存，包含未提交预览。帧一旦处理过就保持可播放，即使后来因编辑被标记为待重新传播。
   播放画面右上角会标记当前帧 mask 状态：CURRENT 表示本次传播已更新，
   STALE 表示仍显示旧结果、等待重新传播，PREVIEW 表示当前帧正在预览未提交点。
 * 播放按钮依次为倒放、上一帧、暂停、下一帧、正放；传播按钮依次为暂停、反向、
@@ -188,8 +192,9 @@ EDGE_COLOR_THICKNESS = 1
 SELECTED_HALO_THICKNESS = 4
 SELECTED_EDGE_THICKNESS = 2
 TIMELINE_HEIGHT = 72
+MUTATION_HEIGHT = 48
 BUTTON_ROW_HEIGHT = 82
-CONTROL_HEIGHT = TIMELINE_HEIGHT + BUTTON_ROW_HEIGHT
+CONTROL_HEIGHT = TIMELINE_HEIGHT + MUTATION_HEIGHT + BUTTON_ROW_HEIGHT
 HELP_PANEL_WIDTH = 268
 KEY_HELP = (
     ("P", "刷新当前帧预览", "preview current frame"),
@@ -207,6 +212,7 @@ MOUSE_HELP = (
     ("右键", "负点（红叉）", "R-click", "negative point"),
     ("中键·mask", "选中，重叠循环", "Mid·mask", "select / cycle"),
     ("中键·空白", "取消选择", "Mid·empty", "deselect"),
+    ("曲线", "跳到该帧", "curve", "seek frame"),
 )
 _CJK_FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -531,6 +537,40 @@ def normalize_masks(outputs: Optional[Dict[str, Any]]) -> Dict[int, np.ndarray]:
         int(obj_id): np.asarray(mask, dtype=bool).copy()
         for obj_id, mask in zip(obj_ids, masks)
     }
+
+
+def frame_mutation_rate(
+    previous: Dict[int, np.ndarray], current: Dict[int, np.ndarray]
+) -> Optional[float]:
+    scores: List[float] = []
+    for obj_id in set(previous) | set(current):
+        prev = previous.get(obj_id)
+        curr = current.get(obj_id)
+        prev_empty = prev is None or not np.any(prev)
+        curr_empty = curr is None or not np.any(curr)
+        if prev_empty and curr_empty:
+            continue
+        if prev_empty or curr_empty:
+            scores.append(1.0)
+            continue
+        union = int(np.logical_or(prev, curr).sum())
+        scores.append(1.0 - int(np.logical_and(prev, curr).sum()) / union)
+    if not scores:
+        return None
+    return max(scores)
+
+
+def mutation_series(
+    cache: Dict[int, Dict[int, np.ndarray]], frame_count: int
+) -> List[Tuple[int, float]]:
+    series: List[Tuple[int, float]] = []
+    for frame_index in range(1, frame_count):
+        if frame_index not in cache or frame_index - 1 not in cache:
+            continue
+        rate = frame_mutation_rate(cache[frame_index - 1], cache[frame_index])
+        if rate is not None:
+            series.append((frame_index, rate))
+    return series
 
 
 def normalize_frame_outputs(
@@ -968,6 +1008,9 @@ class InteractiveApp:
         self.generation = 0
         self.propagation_complete = False
         self.cache: Dict[int, Dict[int, np.ndarray]] = {}
+        self._mask_revision = 0
+        self._mutation_key: Optional[int] = None
+        self._mutation_cached: List[Tuple[int, float]] = []
         self.probability_cache: Dict[int, Dict[int, float]] = {}
         self.stale_frames: set[int] = set()
         self.display_index = 0
@@ -1037,14 +1080,29 @@ class InteractiveApp:
             file=sys.stderr,
         )
 
-    def store_frame_outputs(
-        self, frame_index: int, outputs: Optional[Dict[str, Any]]
+    def store_masks(
+        self,
+        frame_index: int,
+        masks: Dict[int, np.ndarray],
+        probabilities: Dict[int, float],
     ) -> None:
-        masks, probabilities = normalize_frame_outputs(outputs)
         self.cache[frame_index] = masks
         self.probability_cache[frame_index] = probabilities
         if masks:
             self.next_obj_id = max(self.next_obj_id, max(masks) + 1)
+        self._mask_revision += 1
+
+    def store_frame_outputs(
+        self, frame_index: int, outputs: Optional[Dict[str, Any]]
+    ) -> None:
+        masks, probabilities = normalize_frame_outputs(outputs)
+        self.store_masks(frame_index, masks, probabilities)
+
+    def cached_mutation_series(self) -> List[Tuple[int, float]]:
+        if self._mutation_key != self._mask_revision:
+            self._mutation_cached = mutation_series(self.cache, self.frame_count)
+            self._mutation_key = self._mask_revision
+        return self._mutation_cached
 
     def start(self, initial_outputs: Optional[Dict[str, Any]]) -> None:
         self.store_frame_outputs(0, initial_outputs)
@@ -1138,10 +1196,7 @@ class InteractiveApp:
             if event_type == "frame":
                 frame_index = int(value)
                 masks, probabilities = extra
-                self.cache[frame_index] = masks
-                self.probability_cache[frame_index] = probabilities
-                if masks:
-                    self.next_obj_id = max(self.next_obj_id, max(masks) + 1)
+                self.store_masks(frame_index, masks, probabilities)
                 self.stale_frames.discard(frame_index)
             elif event_type == "done":
                 stopped = bool(value)
@@ -1234,6 +1289,18 @@ class InteractiveApp:
             return
         self.playing = False
         self.set_display_index(frame_index)
+        self.status = f"frame {self.display_index}"
+
+    def seek_mutation_chart(self, x: int) -> None:
+        frontier = self.playable_frontier()
+        if frontier < 0:
+            return
+        frame_index = self.frame_for_track_x(x)
+        if frame_index > frontier:
+            return
+        self.set_display_index(frame_index)
+        if self.playing:
+            self.last_play_time = time.monotonic()
         self.status = f"frame {self.display_index}"
 
     def marker_frame_at(self, x: int, y: int) -> Optional[int]:
@@ -1349,6 +1416,7 @@ class InteractiveApp:
             masks.pop(obj_id, None)
         for probs in self.probability_cache.values():
             probs.pop(obj_id, None)
+        self._mask_revision += 1
         self.clear_object_selection(update_status=False)
         self.predictor.handle_request(
             {"type": "clear_checkpoints", "session_id": self.session_id}
@@ -1537,6 +1605,12 @@ class InteractiveApp:
             self.log_input("timeline", display_x=x)
             self.timeline_dragging = True
             self.seek_timeline(x)
+            return
+        chart_top = self.display_height + TIMELINE_HEIGHT
+        chart_bottom = chart_top + MUTATION_HEIGHT
+        if event == cv2.EVENT_LBUTTONDOWN and chart_top <= y < chart_bottom:
+            self.log_input("mutation", display_x=x)
+            self.seek_mutation_chart(x)
             return
         if event == cv2.EVENT_LBUTTONDOWN:
             for name, rect in self.hitboxes.items():
@@ -2011,6 +2085,42 @@ class InteractiveApp:
                 (frame_index, (x - 10, track_y + 6, x + 10, TIMELINE_HEIGHT - 1))
             )
 
+    def draw_mutation_chart(self, image: np.ndarray) -> None:
+        top = TIMELINE_HEIGHT
+        bottom = top + MUTATION_HEIGHT - 1
+        track_left, track_right = self.track_span
+        plot_top = top + 5
+        plot_bottom = bottom - 4
+        span = max(1, plot_bottom - plot_top)
+        guide = (48, 48, 48)
+        cv2.line(image, (track_left, plot_top), (track_right, plot_top), guide, 1)
+        cv2.line(image, (track_left, plot_bottom), (track_right, plot_bottom), guide, 1)
+        run: List[Tuple[int, int]] = []
+        previous: Optional[int] = None
+
+        def flush() -> None:
+            if len(run) >= 2:
+                cv2.polylines(
+                    image,
+                    [np.array(run, dtype=np.int32)],
+                    False,
+                    (90, 210, 140),
+                    1,
+                    cv2.LINE_AA,
+                )
+            elif len(run) == 1:
+                cv2.circle(image, run[0], 2, (90, 210, 140), cv2.FILLED, cv2.LINE_AA)
+            run.clear()
+
+        for frame_index, rate in self.cached_mutation_series():
+            if previous is not None and frame_index != previous + 1:
+                flush()
+            x = self.track_x_for_frame(frame_index)
+            y = plot_bottom - round(min(1.0, max(0.0, rate)) * span)
+            run.append((x, y))
+            previous = frame_index
+        flush()
+
     def draw_button(
         self,
         image: np.ndarray,
@@ -2133,15 +2243,17 @@ class InteractiveApp:
             cv2.circle(panel, (thumb_x, track_y), 9, (255, 200, 80), cv2.FILLED)
         self.draw_range_markers(panel, track_y)
         self.draw_prompt_markers(panel, track_y)
+        self.draw_mutation_chart(panel)
+        chart_bottom = TIMELINE_HEIGHT + MUTATION_HEIGHT
         cv2.line(
             panel,
-            (0, TIMELINE_HEIGHT),
-            (width, TIMELINE_HEIGHT),
+            (0, chart_bottom),
+            (width, chart_bottom),
             (55, 55, 55),
             1,
         )
 
-        row_top = TIMELINE_HEIGHT
+        row_top = chart_bottom
         button_top = row_top + 17
         button_bottom = row_top + BUTTON_ROW_HEIGHT - 15
         play_right = round(width * 0.46)
@@ -2269,6 +2381,7 @@ class InteractiveApp:
             self.prop_range_left,
             self.prop_range_right,
             tuple(self.prompt_point_frames()),
+            self._mask_revision,
         )
         if key == self._render_key:
             return self._rendered
