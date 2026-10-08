@@ -34,6 +34,17 @@ logger = get_logger(__name__)
 _CLEAR_CACHE_THRESHOLD = 80
 
 
+def _replay_crosses_span(frame, target, spans) -> bool:
+    """True if replaying from frame to target enters a span that excludes target."""
+    lo, hi = (frame, target) if frame <= target else (target, frame)
+    for span in spans:
+        if span[0] <= target <= span[1]:
+            continue
+        if span[1] > lo and span[0] < hi:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class _CpuTensorSnapshot:
     tensor: torch.Tensor
@@ -233,6 +244,17 @@ class Sam3BasePredictor:
                 propagation_direction=request.get("propagation_direction"),
                 exact_frame=request.get("exact_frame", False),
             )
+        elif request_type == "update_frame_checkpoints":
+            return self.update_frame_checkpoints(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+            )
+        elif request_type == "limit_checkpoint_spans":
+            return self.limit_checkpoint_spans(
+                session_id=request["session_id"],
+                frame_indexes=request["frame_indexes"],
+                valid_span=request["valid_span"],
+            )
         elif request_type == "restore_checkpoint":
             return self.restore_checkpoint(
                 session_id=request["session_id"],
@@ -330,6 +352,9 @@ class Sam3BasePredictor:
             "start_time": time.time(),
             "last_use_time": time.time(),
             "checkpoints": {},
+            "checkpoint_spans": {},
+            "checkpoint_priors": {},
+            "checkpoint_prior_spans": {},
             "checkpoint_tensor_cache": {},
         }
         logger.info(f"started new session {session_id}")
@@ -595,15 +620,86 @@ class Sam3BasePredictor:
             "created": created,
         }
 
+    def update_frame_checkpoints(self, session_id, frame_idx):
+        """Replace every checkpoint saved at ``frame_idx`` with the live state."""
+        session = self._get_session(session_id)
+        self._extend_expiration_time(session)
+        frame_idx = int(frame_idx)
+        checkpoints = session["checkpoints"]
+        keys = [
+            key
+            for key in checkpoints
+            if int(key[1] if isinstance(key, tuple) else key) == frame_idx
+        ]
+        if not keys:
+            return {"is_success": True, "updated": 0, "frame_index": frame_idx}
+        tensor_cache = session["checkpoint_tensor_cache"]
+        dead_keys = [
+            key for key, entry in tensor_cache.items() if entry.source() is None
+        ]
+        for key in dead_keys:
+            tensor_cache.pop(key, None)
+        spans = session.setdefault("checkpoint_spans", {})
+        priors = session.setdefault("checkpoint_priors", {})
+        prior_spans = session.setdefault("checkpoint_prior_spans", {})
+        state = session["state"]
+        for key in keys:
+            # A span means an earlier pass already published this snapshot.
+            # Keep it for targets outside the span this pass is about to set.
+            if key in spans and key not in priors:
+                priors[key] = checkpoints[key]
+                prior_spans[key] = spans[key]
+            checkpoints[key] = self._checkpoint_mutable_state(state, tensor_cache)
+        return {
+            "is_success": True,
+            "updated": len(keys),
+            "frame_index": frame_idx,
+        }
+
+    def limit_checkpoint_spans(self, session_id, frame_indexes, valid_span):
+        """Restrict checkpoints at these frames to targets inside ``valid_span``."""
+        session = self._get_session(session_id)
+        self._extend_expiration_time(session)
+        lo, hi = int(valid_span[0]), int(valid_span[1])
+        if lo > hi:
+            lo, hi = hi, lo
+        frames = {int(frame) for frame in frame_indexes}
+        spans = session.setdefault("checkpoint_spans", {})
+        updated = 0
+        for key in session["checkpoints"]:
+            frame = int(key[1] if isinstance(key, tuple) else key)
+            if frame in frames:
+                spans[key] = (lo, hi)
+                updated += 1
+        return {"is_success": True, "updated": updated}
+
     def restore_checkpoint(self, session_id, target_frame_idx):
         """Restore the nearest checkpoint that can propagate toward the target."""
         session = self._get_session(session_id)
         self._extend_expiration_time(session)
         checkpoints = session["checkpoints"]
+        spans = session.get("checkpoint_spans") or {}
+        priors = session.get("checkpoint_priors") or {}
+        prior_spans = session.get("checkpoint_prior_spans") or {}
         target_frame_idx = int(target_frame_idx)
+        current_spans = list(spans.values())
         candidates = []
-        for order, key in enumerate(checkpoints):
+        entries = [(key, False) for key in checkpoints]
+        entries.extend((key, True) for key in priors)
+        for order, (key, is_prior) in enumerate(entries):
             direction, frame = key if isinstance(key, tuple) else ("forward", key)
+            span = (prior_spans if is_prior else spans).get(key)
+            if is_prior:
+                current = spans.get(key)
+                if (
+                    current is not None
+                    and current[0] <= target_frame_idx <= current[1]
+                ):
+                    continue
+            if span is not None and not span[0] <= target_frame_idx <= span[1]:
+                continue
+            if _replay_crosses_span(frame, target_frame_idx, current_spans):
+                continue
             if (
                 direction == "both"
                 or direction == "forward"
@@ -612,18 +708,28 @@ class Sam3BasePredictor:
                 and frame >= target_frame_idx
             ):
                 candidates.append(
-                    (abs(frame - target_frame_idx), -order, key, direction, frame)
+                    (
+                        abs(frame - target_frame_idx),
+                        -order,
+                        key,
+                        direction,
+                        frame,
+                        is_prior,
+                    )
                 )
         if not candidates:
             return {"is_success": False, "frame_index": None}
-        _, _, checkpoint_key, checkpoint_direction, checkpoint_frame = min(candidates)
+        _, _, checkpoint_key, checkpoint_direction, checkpoint_frame, is_prior = min(
+            candidates
+        )
         state = session["state"]
         immutable = {
             key: state[key] for key in ("input_batch", "constants") if key in state
         }
         state.clear()
         gc.collect()
-        restored = _restore_state_from_cpu(checkpoints[checkpoint_key], {})
+        snapshot = priors[checkpoint_key] if is_prior else checkpoints[checkpoint_key]
+        restored = _restore_state_from_cpu(snapshot, {})
         state.update(immutable)
         state.update(restored)
         # Backbone features are valid for only the frame that produced them and
@@ -648,6 +754,9 @@ class Sam3BasePredictor:
         session = self._get_session(session_id)
         self._extend_expiration_time(session)
         session["checkpoints"].clear()
+        session.get("checkpoint_spans", {}).clear()
+        session.get("checkpoint_priors", {}).clear()
+        session.get("checkpoint_prior_spans", {}).clear()
         session["checkpoint_tensor_cache"].clear()
         return {"is_success": True}
 

@@ -213,10 +213,13 @@ def test_propagation_thread_reports_backward_phase(monkeypatch) -> None:
                 yield {"frame_index": frame_index, "outputs": {}}
 
         def handle_request(self, request):
+            if "frame_index" not in request:
+                return {"is_success": True, "updated": 0}
             return {
                 "is_success": True,
                 "frame_index": request["frame_index"],
                 "created": True,
+                "updated": 0,
             }
 
     monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: False)
@@ -245,11 +248,14 @@ def test_backward_propagation_saves_directional_cpu_checkpoints(monkeypatch) -> 
 
         def handle_request(self, request):
             saved.append(request)
+            if "frame_index" not in request:
+                return {"is_success": True, "updated": 0}
             return {
                 "is_success": True,
                 "frame_index": request["frame_index"],
-                "propagation_direction": request["propagation_direction"],
-                "created": True,
+                "propagation_direction": request.get("propagation_direction"),
+                "created": request.get("type") == "save_checkpoint",
+                "updated": 0,
             }
 
     monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: False)
@@ -261,9 +267,10 @@ def test_backward_propagation_saves_directional_cpu_checkpoints(monkeypatch) -> 
     runner.start("session", start_frame_index=100, generation=1, mode="backward")
     runner.join()
 
-    assert [request["frame_index"] for request in saved] == [100, 80, 60, 40, 20, 0]
-    assert all(request["propagation_direction"] == "backward" for request in saved)
-    assert all(request["exact_frame"] for request in saved)
+    saves = [request for request in saved if request.get("type") == "save_checkpoint"]
+    assert [request["frame_index"] for request in saves] == [100, 80, 60, 40, 20, 0]
+    assert all(request["propagation_direction"] == "backward" for request in saves)
+    assert all(request["exact_frame"] for request in saves)
 
 
 def make_app(tmp_path: Path) -> qualitative.InteractiveApp:
@@ -963,9 +970,7 @@ def test_preview_rollback_restores_checkpoint_without_reloading_frames(
     assert not app.editing
 
 
-def test_preview_rebuilds_when_editing_before_the_only_checkpoint(
-    tmp_path: Path,
-) -> None:
+def test_confirm_keeps_checkpoints_outside_the_edit(tmp_path: Path) -> None:
     app = make_app(tmp_path)
     app.cache = {0: {}, 1: {}, 2: {}}
     app.stale_frames = set()
@@ -975,9 +980,31 @@ def test_preview_rebuilds_when_editing_before_the_only_checkpoint(
 
     app.add_point(4, 2, 1)
     app.confirm_and_propagate("forward")
-    assert app.predictor.checkpoint_frames == {2}
 
+    assert app.predictor.checkpoint_frames == {0, 2}
+    assert "clear_checkpoints" not in [
+        request["type"] for request in app.predictor.requests
+    ]
     app.display_index = 1
+    app.add_point(5, 3, 0)
+    app.preview()
+    assert app.status == "preview"
+    assert not any(
+        event["type"] == "preview_baseline_rebuilt" for event in app.events
+    )
+
+
+def test_preview_rebuilds_when_no_checkpoint_can_reach_the_edit(
+    tmp_path: Path,
+) -> None:
+    app = make_app(tmp_path)
+    app.predictor.checkpoint_frames = {2}
+    app.cache = {0: {}, 1: {}, 2: {}}
+    app.stale_frames = set()
+    app.display_index = 1
+    app.active_obj = 1
+    app.stop_propagation = lambda: None
+
     app.add_point(5, 3, 0)
     app.preview()
 
@@ -1159,6 +1186,118 @@ def test_cpu_checkpoint_restore_uses_nearest_compatible_direction() -> None:
     exact = predictor.restore_checkpoint("session", 80)
     assert exact["propagation_direction"] == "backward"
     assert predictor._all_inference_states["session"]["state"]["marker"].item() == 80
+
+
+def test_updated_checkpoint_keeps_the_previous_snapshot_outside_its_span() -> None:
+    predictor = Sam3BasePredictor()
+    state = {
+        "previous_stages_out": ["done"] * 301,
+        "marker": torch.tensor(1),
+        "action_history": [],
+    }
+    predictor._all_inference_states["session"] = {
+        "state": state,
+        "session_id": "session",
+        "last_use_time": 0.0,
+        "checkpoints": {},
+        "checkpoint_tensor_cache": {},
+    }
+    for frame in (0, 80, 260, 280):
+        predictor.save_checkpoint(
+            "session", frame, propagation_direction="forward", exact_frame=True
+        )
+    predictor.limit_checkpoint_spans("session", [0, 80, 260, 280], (0, 300))
+    state["marker"] = torch.tensor(999)
+    predictor.update_frame_checkpoints("session", 260)
+    predictor.limit_checkpoint_spans("session", [260], (250, 260))
+    state["marker"] = torch.tensor(250)
+    predictor.save_checkpoint(
+        "session", 250, propagation_direction="both", exact_frame=True
+    )
+    predictor.limit_checkpoint_spans("session", [250], (250, 260))
+
+    assert predictor.restore_checkpoint("session", 90)["frame_index"] == 80
+    assert predictor.restore_checkpoint("session", 255)["frame_index"] == 250
+    outside = predictor.restore_checkpoint("session", 270)
+    assert outside["frame_index"] == 260
+    assert predictor._all_inference_states["session"]["state"]["marker"].item() == 1
+
+    state = predictor._all_inference_states["session"]["state"]
+    state["marker"] = torch.tensor(7)
+    predictor.save_checkpoint(
+        "session", 40, propagation_direction="both", exact_frame=True
+    )
+    predictor.update_frame_checkpoints("session", 40)
+    predictor.limit_checkpoint_spans("session", [40], (40, 40))
+    assert predictor.restore_checkpoint("session", 30)["frame_index"] == 0
+
+
+def test_propagation_segments_reprompt_before_the_confirmed_frame() -> None:
+    assert qualitative.propagation_segments(90, 260, "forward", [250]) == [
+        ("propagate", 90, 159),
+        ("reprompt", 250, 0),
+        ("propagate", 250, 10),
+    ]
+    assert qualitative.propagation_segments(250, 0, "backward", [90]) == [
+        ("propagate", 250, 159),
+        ("reprompt", 90, 0),
+        ("propagate", 91, 91),
+    ]
+    assert qualitative.propagation_segments(0, 20, "forward", []) == [
+        ("propagate", 0, 20)
+    ]
+
+
+def test_runner_reprompts_before_crossing_a_confirmed_frame(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(qualitative.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(qualitative.torch, "autocast", lambda **kwargs: nullcontext())
+
+    class StreamingPredictor:
+        def handle_stream_request(self, request):
+            calls.append(request)
+            start = request["start_frame_index"]
+            limit = request.get("max_frame_num_to_track", 0)
+            for frame_index in range(start, start + limit + 1):
+                yield {"frame_index": frame_index, "outputs": {}}
+
+        def handle_request(self, request):
+            calls.append(request)
+            frame = request.get("frame_index")
+            return {
+                "is_success": True,
+                "updated": 1 if frame == 10 else 0,
+                "created": request["type"] == "save_checkpoint" and frame == 0,
+            }
+
+    prompted = []
+    runner = qualitative.PropagationRunner(
+        StreamingPredictor(), qualitative.queue.Queue(), checkpoint_interval=100
+    )
+    runner.start(
+        "session",
+        start_frame_index=0,
+        generation=1,
+        mode="forward",
+        max_forward_track=10,
+        frame_count=30,
+        reprompt_frames=(5,),
+        reprompt=prompted.append,
+    )
+    runner.join()
+
+    propagated = [
+        (request["start_frame_index"], request.get("max_frame_num_to_track"))
+        for request in calls
+        if request.get("type") == "propagate_in_video"
+    ]
+    assert propagated == [(0, 4), (5, 5)]
+    assert prompted == [5]
+    limits = [
+        request for request in calls if request["type"] == "limit_checkpoint_spans"
+    ]
+    assert limits[-1]["frame_indexes"] == [0, 10]
+    assert limits[-1]["valid_span"] == [0, 10]
 
 
 def test_unchanged_preview_does_not_run_model_twice(tmp_path: Path) -> None:
@@ -1549,7 +1688,9 @@ def test_propagation_stops_at_range_bounds(tmp_path: Path) -> None:
         mode,
         max_forward_track=None,
         max_backward_track=None,
+        **kwargs,
     ):
+        del kwargs
         del session_id, generation
         captured.update(
             {

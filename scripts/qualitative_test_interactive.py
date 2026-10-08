@@ -102,9 +102,11 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
 * 每个对象在每一帧最多使用 16 个点，窗口状态会显示当前数量；达到上限后
   不再接受更多点，本轮未确认的点可用 ``Backspace`` 撤销。
 * ``P`` 根据当前编辑点刷新当前帧 mask，仅作为预览。
-  每次预览都会恢复到最近的 CPU 检查点，并按对应方向重放到编辑帧，因此
-  相同点集使用相同的 tracker 基础状态。正向和反向传播都会保存带方向的 CPU 检查点；
-  ``--checkpoint-interval`` 控制检查点间隔，默认每 20 帧保存一次。
+  每次预览都会恢复到最近的、且覆盖该帧的 CPU 检查点，并按对应方向重放到编辑帧，
+  因此相同点集使用相同的 tracker 基础状态。确认编辑不会清空已有检查点。
+  局部传播只覆盖经过的帧上的检查点，这些检查点之后只用于这次改写过的帧；
+  范围外的旧检查点保持不变。``--checkpoint-interval`` 控制新建检查点的间隔，
+  默认每 20 帧一次。
 * ``Backspace`` 撤销最近一次点击，``Esc`` 放弃当前未确认的编辑。
 * ``C`` 清除所有已确认和未确认的点，恢复文本提示并从第 0 帧重新传播。
 * 未提交点始终绑定创建它们的编辑帧；播放或拖动时间轴不会提交或丢弃它们。
@@ -800,6 +802,46 @@ def normalize_propagation_mode(mode: str) -> str:
     return "forward_backward" if mode == "both" else mode.replace("-", "_")
 
 
+def propagation_segments(
+    start: int,
+    end: int,
+    direction: str,
+    prompt_frames: Iterable[int],
+) -> List[Tuple[str, int, int]]:
+    """Split one leg so a confirmed prompt is applied before that frame is visited.
+
+    Forward visits ``start`` through ``end``. Backward visits ``start - 1``
+    through ``end``. Each step is ``("propagate", segment_start, max_track)``
+    or ``("reprompt", frame, 0)``.
+    """
+    if direction == "forward":
+        prompts = sorted(frame for frame in prompt_frames if start < frame <= end)
+        steps: List[Tuple[str, int, int]] = []
+        pos = start
+        for frame in prompts:
+            if frame - 1 >= pos:
+                steps.append(("propagate", pos, frame - 1 - pos))
+            steps.append(("reprompt", frame, 0))
+            pos = frame
+        if end >= pos:
+            steps.append(("propagate", pos, end - pos))
+        return steps
+    prompts = sorted(
+        (frame for frame in prompt_frames if end <= frame < start), reverse=True
+    )
+    steps = []
+    pos = start
+    for frame in prompts:
+        last = frame + 1
+        if pos - 1 >= last:
+            steps.append(("propagate", pos, pos - last))
+        steps.append(("reprompt", frame, 0))
+        pos = last
+    if pos - 1 >= end:
+        steps.append(("propagate", pos, pos - end))
+    return steps
+
+
 class PropagationRunner:
     def __init__(
         self,
@@ -827,6 +869,9 @@ class PropagationRunner:
         mode: str,
         max_forward_track: Optional[int] = None,
         max_backward_track: Optional[int] = None,
+        frame_count: Optional[int] = None,
+        reprompt_frames: Sequence[int] = (),
+        reprompt: Optional[Any] = None,
     ) -> None:
         if self.is_alive:
             raise RuntimeError("propagation is already running")
@@ -850,101 +895,140 @@ class PropagationRunner:
                     next_checkpoint_frame = start_frame_index
                     max_forward_frame = start_frame_index - 1
                     min_backward_frame = start_frame_index
-                    if direction == "backward":
-                        checkpoint = self.predictor.handle_request(
+                    touched: set[int] = set()
+                    reached: List[int] = []
+
+                    def note(frame_index: int, save: bool) -> None:
+                        reached.append(frame_index)
+                        updated = self.predictor.handle_request(
                             {
-                                "type": "save_checkpoint",
+                                "type": "update_frame_checkpoints",
                                 "session_id": session_id,
-                                "frame_index": start_frame_index,
-                                "propagation_direction": direction,
-                                "exact_frame": True,
+                                "frame_index": frame_index,
                             }
                         )
+                        if int(updated.get("updated", 0) or 0):
+                            touched.add(frame_index)
+                        if not save:
+                            return
+                        request = {
+                            "type": "save_checkpoint",
+                            "session_id": session_id,
+                            "frame_index": frame_index,
+                        }
+                        if direction == "backward":
+                            request["propagation_direction"] = direction
+                            request["exact_frame"] = True
+                        checkpoint = self.predictor.handle_request(request)
+                        if checkpoint.get("created", True):
+                            touched.add(frame_index)
                         self.event_queue.put(
                             ("checkpoint", generation, checkpoint, None)
                         )
+
+                    if direction == "backward":
+                        note(start_frame_index, True)
                         next_checkpoint_frame -= self.checkpoint_interval
-                    request = {
-                        "type": "propagate_in_video",
-                        "session_id": session_id,
-                        "propagation_direction": direction,
-                        "start_frame_index": start_frame_index,
-                    }
                     track_limit = (
                         max_forward_track
                         if direction == "forward"
                         else max_backward_track
                     )
-                    if track_limit is not None:
-                        request["max_frame_num_to_track"] = track_limit
-                    with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
-                        for response in self.predictor.handle_stream_request(request):
-                            if self.stop_event.is_set():
-                                stopped = True
-                                break
-                            frame_index = int(response["frame_index"])
-                            self.event_queue.put(
-                                (
-                                    "frame",
-                                    generation,
-                                    frame_index,
-                                    normalize_frame_outputs(
-                                        response.get("outputs", {})
-                                    ),
-                                )
+                    if reprompt_frames and not (
+                        direction == "forward"
+                        and track_limit is None
+                        and frame_count is None
+                    ):
+                        if direction == "forward":
+                            end = (
+                                frame_count - 1
+                                if track_limit is None
+                                else start_frame_index + track_limit
                             )
-                            if (
-                                direction == "forward"
-                                and frame_index > max_forward_frame
-                            ):
-                                max_forward_frame = frame_index
-                                if frame_index >= next_checkpoint_frame:
-                                    checkpoint = self.predictor.handle_request(
-                                        {
-                                            "type": "save_checkpoint",
-                                            "session_id": session_id,
-                                            "frame_index": frame_index,
-                                        }
-                                    )
-                                    self.event_queue.put(
-                                        (
-                                            "checkpoint",
-                                            generation,
-                                            checkpoint,
-                                            None,
-                                        )
-                                    )
-                                    next_checkpoint_frame = (
-                                        frame_index + self.checkpoint_interval
-                                    )
-                            elif (
-                                direction == "backward"
-                                and frame_index < min_backward_frame
-                            ):
-                                min_backward_frame = frame_index
-                                if frame_index <= next_checkpoint_frame:
-                                    checkpoint = self.predictor.handle_request(
-                                        {
-                                            "type": "save_checkpoint",
-                                            "session_id": session_id,
-                                            "frame_index": frame_index,
-                                            "propagation_direction": direction,
-                                            "exact_frame": True,
-                                        }
-                                    )
-                                    self.event_queue.put(
-                                        (
-                                            "checkpoint",
-                                            generation,
-                                            checkpoint,
-                                            None,
-                                        )
-                                    )
-                                    next_checkpoint_frame = (
-                                        frame_index - self.checkpoint_interval
-                                    )
-                        if stopped:
+                        else:
+                            end = (
+                                0
+                                if track_limit is None
+                                else max(0, start_frame_index - track_limit)
+                            )
+                        segments = propagation_segments(
+                            start_frame_index, end, direction, reprompt_frames
+                        )
+                    else:
+                        segments = [("propagate", start_frame_index, track_limit)]
+                    for step, seg_start, seg_limit in segments:
+                        if self.stop_event.is_set():
+                            stopped = True
                             break
+                        if step == "reprompt":
+                            if reprompt is not None:
+                                reprompt(seg_start)
+                            note(seg_start, False)
+                            continue
+                        request = {
+                            "type": "propagate_in_video",
+                            "session_id": session_id,
+                            "propagation_direction": direction,
+                            "start_frame_index": seg_start,
+                        }
+                        if seg_limit is not None:
+                            request["max_frame_num_to_track"] = seg_limit
+                        with torch.autocast(
+                            device_type="cuda", dtype=cuda_amp_dtype()
+                        ):
+                            for response in self.predictor.handle_stream_request(
+                                request
+                            ):
+                                if self.stop_event.is_set():
+                                    stopped = True
+                                    break
+                                frame_index = int(response["frame_index"])
+                                self.event_queue.put(
+                                    (
+                                        "frame",
+                                        generation,
+                                        frame_index,
+                                        normalize_frame_outputs(
+                                            response.get("outputs", {})
+                                        ),
+                                    )
+                                )
+                                save = False
+                                if (
+                                    direction == "forward"
+                                    and frame_index > max_forward_frame
+                                ):
+                                    max_forward_frame = frame_index
+                                    if frame_index >= next_checkpoint_frame:
+                                        save = True
+                                        next_checkpoint_frame = (
+                                            frame_index + self.checkpoint_interval
+                                        )
+                                elif (
+                                    direction == "backward"
+                                    and frame_index < min_backward_frame
+                                ):
+                                    min_backward_frame = frame_index
+                                    if frame_index <= next_checkpoint_frame:
+                                        save = True
+                                        next_checkpoint_frame = (
+                                            frame_index - self.checkpoint_interval
+                                        )
+                                note(frame_index, save)
+                            if stopped:
+                                break
+                    if touched:
+                        bounds = [start_frame_index, *reached]
+                        self.predictor.handle_request(
+                            {
+                                "type": "limit_checkpoint_spans",
+                                "session_id": session_id,
+                                "frame_indexes": sorted(touched),
+                                "valid_span": [min(bounds), max(bounds)],
+                            }
+                        )
+                    if stopped:
+                        break
                 stopped = stopped or self.stop_event.is_set()
                 self.event_queue.put(("done", generation, stopped, None))
             except BaseException as exc:
@@ -1169,6 +1253,17 @@ class InteractiveApp:
             mode,
             max_forward_track=self.propagation_track_limit(frame_index, "forward"),
             max_backward_track=self.propagation_track_limit(frame_index, "backward"),
+            frame_count=self.frame_count,
+            reprompt_frames=tuple(
+                sorted(
+                    {
+                        point.frame_index
+                        for point in self.confirmed_points
+                        if point.frame_index != frame_index
+                    }
+                )
+            ),
+            reprompt=self.reprompt_confirmed,
         )
         self.status = f"propagating {mode.replace('_', '-')}"
         self.record_event(
@@ -1677,6 +1772,34 @@ class InteractiveApp:
             for point in points
         ]
 
+    def reprompt_confirmed(self, frame_index: int) -> Dict[str, Any]:
+        outputs: Dict[str, Any] = {}
+        keys = sorted(
+            {
+                (point.frame_index, point.obj_id)
+                for point in self.confirmed_points
+                if point.frame_index == frame_index
+            }
+        )
+        for key in keys:
+            points = self.points_for_key(key, include_draft=False)
+            if not points:
+                continue
+            response = self.predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": self.session_id,
+                    "frame_index": frame_index,
+                    "points": self.relative_point_coordinates(points),
+                    "point_labels": [point.label for point in points],
+                    "clear_old_points": True,
+                    "obj_id": key[1],
+                    "rel_coordinates": True,
+                }
+            )
+            outputs = response.get("outputs", {}) or {}
+        return outputs
+
     def apply_points(self, keys: Iterable[Tuple[int, int]]) -> None:
         for frame_index, obj_id in sorted(set(keys)):
             points = self.points_for_key((frame_index, obj_id), include_draft=True)
@@ -1754,9 +1877,6 @@ class InteractiveApp:
             "confirm", frame_index=frame_index, point_sequences=list(committed_now)
         )
         self.reset_edit_state()
-        self.predictor.handle_request(
-            {"type": "clear_checkpoints", "session_id": self.session_id}
-        )
         self.save_checkpoint(frame_index)
         return frame_index
 
