@@ -4,17 +4,17 @@ initial_feature: /data0/xuzhefeng/Datasets/uni-hoi-dataset/right_hand_initial.pt
 target_id: right_hand
 kind: hand_right
 category_id: 1
-output_dir: outputs/learned_right_hand
+output_dir: outputs/train/learned_right_hand_text4_dice5_presence5_lr1e4_20260914
 dataset_root: /data0/xuzhefeng/Datasets/uni-hoi-dataset
 # Physical GPU ids. One id is single-process; several ids spawn DDP.
 device: cuda:1,2,3
-epochs: 20
+epochs: 30
 # Keep numbered resumable snapshots every N epochs; 0 disables snapshots.
 # last.pt / learned_prompt.pt still update every epoch; best.pt tracks validation.
-save_every_n_epochs: 5
+save_every_n_epochs: 1
 batch_size: 8
 num_workers: 16
-lr: 0.0003
+lr: 0.0001
 max_grad_norm: 1.0
 amp: true
 seed: 0
@@ -31,8 +31,8 @@ val:
   split: val
 loss:
   mask: 20.0
-  dice: 1.0
+  dice: 5.0
   box: 5.0
   giou: 2.0
   classification: 20.0
-  presence: 20.0
+  presence: 5.0
