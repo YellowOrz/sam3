@@ -32,6 +32,18 @@
 结果自动重新处理，无需 ``--overwrite``。完整但设置不匹配的结果仍需 ``--overwrite``。
 单视频模式已有输出仍直接报错，覆盖需 ``--overwrite``。
 
+``--load-existing`` 在单视频和批量模式下加载完整、设置匹配的已有结果，
+与 ``--overwrite`` 互斥；无结果的视频仍正常推理，有残缺或不匹配结果则报错保护文件。
+加载时暂停播放、不启动模型或传播，进度条下显示从全视频标签掩码重算的突变曲线。
+首次编辑只在编辑帧初始化 tracker；手动传播严格遵守当前范围（默认全视频），
+双向各自从同一修正帧初始化，经过其他已确认修正帧时使用其掩码作为新条件。
+这条路径仅推进已有实例的 tracker，不重新执行文本检测，也不恢复旧 session 的 memory；
+保存文件不含原始概率或重叠实例信息。原先分块生成的结果按合并后的全视频编辑，
+全视频掩码会载入内存，长视频需要足够 RAM。
+仅浏览后按 ``Q`` 退出不改写文件；修改后 ``Q`` 保存，未确认草稿会取消。
+加载模式的 ``C`` 仅清除点约束，保留掩码且不自动重传；保存时保留已有标签编号。
+
+
 ``--clip-overseg`` 默认关闭，且仅基础 SAM 3。高分检测几乎落在轨迹内部、轨迹又明显更大时，
 用该检测替换轨迹掩码再写入 memory。``metadata.json`` 记录 ``clip_overseg``；旧结果没有该字段时
 视为关闭，不会因此重跑。批量模式下该开关与已有成功结果不一致时重新推理，无需 ``--overwrite``。
@@ -205,7 +217,7 @@ KEY_HELP = (
     ("D", "删除选中对象", "delete selected object"),
     ("[", "当前帧设为传播左界", "set prop window left at frame"),
     ("]", "当前帧设为传播右界", "set prop window right at frame"),
-    ("C", "清点并从第 0 帧重传", "clear points and re-propagate"),
+    ("C", "清点（加载模式不重传）", "clear points; loaded: no propagation"),
     ("Q", "全部处理完后退出写出", "quit after all frames processed"),
     ("Enter/Space", "无操作", "no action"),
 )
@@ -973,9 +985,7 @@ class PropagationRunner:
                         }
                         if seg_limit is not None:
                             request["max_frame_num_to_track"] = seg_limit
-                        with torch.autocast(
-                            device_type="cuda", dtype=cuda_amp_dtype()
-                        ):
+                        with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
                             for response in self.predictor.handle_stream_request(
                                 request
                             ):
@@ -1260,6 +1270,7 @@ class InteractiveApp:
                         point.frame_index
                         for point in self.confirmed_points
                         if point.frame_index != frame_index
+                        and not isinstance(self.predictor, LoadedMaskPredictor)
                     }
                 )
             ),
@@ -2509,6 +2520,7 @@ class InteractiveApp:
             load_frame_bgr(self.frame_dir, self.display_index),
             masks,
             probabilities_by_obj=probabilities,
+            object_to_label=getattr(self, "loaded_labels", None),
             points=points,
             active_obj=self.active_obj,
             status=None,
@@ -2646,6 +2658,328 @@ class InteractiveApp:
             self.window_open = False
 
 
+class LoadedMaskPredictor:
+    """Tracker-only editing; never call the detector's video prefetch path."""
+
+    def __init__(self, app: Any, get_predictor: Any):
+        self.app = app
+        self.get_predictor = get_predictor
+        self.model = None
+        self.state = None
+        self.features: Dict[int, Any] = {}
+        self.seed_frame: Optional[int] = None
+        self.seed_masks: Dict[int, np.ndarray] = {}
+
+    def reset(self, frame: int, masks: Dict[int, np.ndarray]) -> None:
+        self.state = None
+        self.features.clear()
+        self.seed_frame = frame
+        self.seed_masks = {obj: mask.copy() for obj, mask in masks.items()}
+        for point in self.app.confirmed_points:
+            if point.frame_index == frame:
+                self.seed_masks.setdefault(
+                    point.obj_id,
+                    np.zeros(
+                        (self.app.video_info.height, self.app.video_info.width),
+                        dtype=bool,
+                    ),
+                )
+
+    @torch.inference_mode()
+    def prepare_features(self, frame: int) -> None:
+        if self.model is None:
+            self.model = self.get_predictor().model
+        if self.model.device.type == "cuda":
+            torch.cuda.set_device(self.model.device)
+        if frame in self.features:
+            return
+        from sam3.model.utils.sam2_utils import _load_img_as_tensor
+
+        image, _, _ = _load_img_as_tensor(
+            str(self.app.frame_dir / f"{frame:05d}.jpg"), self.model.image_size
+        )
+        image = image.to(self.model.device, dtype=torch.float32)
+        mean = image.new_tensor(self.model.image_mean)[:, None, None]
+        std = image.new_tensor(self.model.image_std)[:, None, None]
+        image = ((image - mean) / std).unsqueeze(0)
+        tracker = self.model.tracker
+        if self.app.version == "sam3":
+            backbone = self.model.detector.backbone.forward_image(image)[
+                "sam2_backbone_out"
+            ]
+            backbone["backbone_fpn"][0] = tracker.sam_mask_decoder.conv_s0(
+                backbone["backbone_fpn"][0]
+            )
+            backbone["backbone_fpn"][1] = tracker.sam_mask_decoder.conv_s1(
+                backbone["backbone_fpn"][1]
+            )
+        else:
+            from sam3.model.data_misc import NestedTensor
+
+            backbone = self.model.detector.backbone.forward_image(
+                NestedTensor(image, None),
+                need_sam3_out=False,
+                need_interactive_out=True,
+                need_propagation_out=True,
+            )
+            for key, decoder in (
+                ("interactive", tracker.interactive_sam_mask_decoder),
+                ("sam2_backbone_out", tracker.sam_mask_decoder),
+            ):
+                fpn = backbone[key]["backbone_fpn"]
+                fpn[0].tensors = decoder.conv_s0(fpn[0].tensors)
+                fpn[1].tensors = decoder.conv_s1(fpn[1].tensors)
+        self.features.clear()
+        self.features[frame] = (image, backbone)
+
+    @torch.inference_mode()
+    def initialize(self) -> None:
+        frame = int(self.seed_frame)
+        self.prepare_features(frame)
+        tracker = self.model.tracker
+        self.state = tracker.init_state(
+            video_height=self.app.video_info.height,
+            video_width=self.app.video_info.width,
+            num_frames=self.app.frame_count,
+            cached_features=self.features,
+        )
+        ids = sorted(self.seed_masks)
+        if not ids:
+            return
+        masks = torch.as_tensor(
+            np.stack([self.seed_masks[obj] for obj in ids]), device=self.model.device
+        )
+        if self.app.version == "sam3":
+            for obj, mask in zip(ids, masks):
+                tracker.add_new_mask(self.state, frame, obj, mask)
+        else:
+            tracker.add_new_masks(self.state, frame, ids, masks.float())
+        tracker.propagate_in_video_preflight(self.state, run_mem_encoder=True)
+        # Consolidate the seed into tracked outputs so clicks refine its mask,
+        # rather than treating the first click as a fresh segmentation.
+        self.track_frame(frame, reverse=False)
+        if self.app.version == "sam3.1":
+            self.state["user_refined_frames_per_obj"] = {obj: {frame} for obj in ids}
+
+    @torch.inference_mode()
+    def track_frame(self, frame: int, reverse: bool) -> Dict[str, Any]:
+        self.prepare_features(frame)
+        outputs = list(
+            self.model.tracker.propagate_in_video(
+                self.state,
+                start_frame_idx=frame,
+                max_frame_num_to_track=0,
+                reverse=reverse,
+                tqdm_disable=True,
+                run_mem_encoder=True,
+            )
+        )
+        if len(outputs) != 1 or int(outputs[0][0]) != frame:
+            raise RuntimeError("tracker did not respect the requested single frame")
+        _, ids, _, masks, scores = outputs[0]
+        tracked = dict(zip(ids, as_numpy(masks[:, 0] > 0)))
+        untracked = {
+            obj: mask
+            for obj, mask in self.app.cache[frame].items()
+            if obj not in tracked
+        }
+        tracked.update(untracked)
+        result = {
+            "out_obj_ids": np.asarray(list(tracked)),
+            "out_binary_masks": np.stack(list(tracked.values())),
+        }
+        if not untracked:
+            result["out_probs"] = as_numpy(scores.float().sigmoid()).reshape(-1)
+        return result
+
+    @torch.inference_mode()
+    def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        kind = request["type"]
+        if kind == "add_prompt":
+            frame = int(request["frame_index"])
+            obj_id = int(request["obj_id"])
+            if self.state is not None and obj_id not in self.state["obj_ids"]:
+                self.reset(frame, self.app.cache[frame])
+            if self.state is None:
+                # Register a new object before preflight locks the object slots.
+                self.seed_masks.setdefault(
+                    obj_id,
+                    np.zeros(
+                        (self.app.video_info.height, self.app.video_info.width),
+                        dtype=bool,
+                    ),
+                )
+                self.initialize()
+            self.prepare_features(frame)
+            tracker = self.model.tracker
+            points = torch.tensor(request["points"], dtype=torch.float32)
+            labels = torch.tensor(request["point_labels"], dtype=torch.int32)
+            out = tracker.add_new_points_or_box(
+                self.state,
+                frame,
+                request["obj_id"],
+                points=points,
+                labels=labels,
+                rel_coordinates=True,
+                clear_old_points=True,
+            )
+            ids, masks = out[1], out[3]
+            return {
+                "outputs": {
+                    "out_obj_ids": np.asarray(ids),
+                    "out_binary_masks": as_numpy(masks[:, 0] > 0),
+                }
+            }
+        if kind in ("remove_object", "clear_checkpoints"):
+            self.state = None
+            self.features.clear()
+        # The loaded branch rebuilds only its seed frame, not old checkpoints.
+        if kind not in {
+            "remove_object",
+            "clear_checkpoints",
+            "cancel_propagation",
+            "save_checkpoint",
+            "update_frame_checkpoints",
+            "limit_checkpoint_spans",
+        }:
+            raise ValueError(f"unsupported loaded-result request: {kind}")
+        return {"is_success": True, "created": False, "updated": 0}
+
+    def handle_stream_request(
+        self, request: Dict[str, Any]
+    ) -> Iterable[Dict[str, Any]]:
+        start = int(request["start_frame_index"])
+        limit = int(request["max_frame_num_to_track"])
+        reverse = request["propagation_direction"] == "backward"
+        end = start + (-limit if reverse else limit)
+        if (
+            limit < 0
+            or not 0 <= min(start, end) <= max(start, end) < self.app.frame_count
+        ):
+            raise ValueError("invalid propagation interval")
+        if limit == 0:
+            return
+        self.reset(start, self.app.cache[start])
+        self.initialize()
+        step = -1 if reverse else 1
+        end = start + step * limit
+        for frame in range(start + step, end + step, step):
+            if frame in self.app.loaded_anchor_frames:
+                self.reset(frame, self.app.cache[frame])
+                self.initialize()
+                # Keep the manually confirmed masks exactly, including the seed.
+                masks = self.app.cache[frame]
+                yield {
+                    "frame_index": frame,
+                    "outputs": {
+                        "out_obj_ids": np.asarray(sorted(masks)),
+                        "out_binary_masks": np.stack(
+                            [masks[obj] for obj in sorted(masks)]
+                        )
+                        if masks
+                        else np.empty(
+                            (0, self.app.video_info.height, self.app.video_info.width),
+                            dtype=bool,
+                        ),
+                    },
+                }
+                continue
+            if not self.state["obj_ids"]:
+                raise RuntimeError(
+                    "no objects at propagation seed; add a positive point first"
+                )
+            yield {"frame_index": frame, "outputs": self.track_frame(frame, reverse)}
+
+
+class LoadedInteractiveApp(InteractiveApp):
+    def __init__(self, *args: Any, get_predictor: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.predictor = LoadedMaskPredictor(self, get_predictor)
+        self.runner.predictor = self.predictor
+        self.loaded_metadata: Dict[str, Any] = {}
+        self.loaded_labels: Dict[int, int] = {}
+        self.loaded_points: Dict[int, Dict[str, Any]] = {}
+        self.loaded_anchor_frames: set[int] = set()
+        self.edit_baselines: Dict[int, Dict[int, np.ndarray]] = {}
+        self.dirty = False
+        self.playing = False
+
+    def restore_preview_baseline(self, target_frame_index: int) -> None:
+        self.stop_propagation()
+        baseline = self.edit_baselines.setdefault(
+            target_frame_index,
+            {obj: mask.copy() for obj, mask in self.cache[target_frame_index].items()},
+        )
+        self.store_masks(target_frame_index, dict(baseline), {})
+        self.predictor.reset(target_frame_index, baseline)
+        self.set_display_index(target_frame_index)
+
+    def apply_points(self, keys: Iterable[Tuple[int, int]]) -> None:
+        self.predictor.get_predictor()  # Bind the requested GPU before selecting AMP.
+        with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
+            super().apply_points(keys)
+
+    def commit_draft(self) -> Optional[int]:
+        changed = bool(self.draft_points)
+        frame = super().commit_draft()
+        if frame is not None:
+            self.edit_baselines.pop(frame, None)
+            if changed:
+                self.loaded_anchor_frames.add(frame)
+                self.dirty = True
+        return frame
+
+    def cancel_edit(self) -> None:
+        frame = self.edit_frame
+        super().cancel_edit()
+        if frame is not None:
+            self.edit_baselines.pop(frame, None)
+
+    def start_propagation(self, frame_index: int, mode: str) -> None:
+        if not self.prop_range_left <= frame_index <= self.prop_range_right:
+            self.status = "start frame is outside the propagation range"
+            return
+        if not any(
+            self.propagation_track_limit(frame_index, direction) > 0
+            for direction in propagation_legs(normalize_propagation_mode(mode))
+        ):
+            self.status = "no frames to propagate in this direction/range"
+            return
+        if (
+            not self.cache.get(frame_index)
+            and frame_index not in self.loaded_anchor_frames
+        ):
+            self.status = "no seed objects; add a positive point before propagating"
+            return
+        self.predictor.get_predictor()  # CUDA device and AMP are thread-local.
+        self.dirty = True
+        super().start_propagation(frame_index, mode)
+
+    def clear_all_interactions(self) -> None:
+        self.stop_propagation()
+        self.cancel_edit()
+        self.confirmed_points = []
+        self.commits = []
+        self.loaded_anchor_frames.clear()
+        self.dirty = True
+        self.status = "points cleared; loaded masks retained (no propagation)"
+        self.record_event("clear_all_interactions")
+
+    def remove_selected_object(self) -> None:
+        revision = self._mask_revision
+        super().remove_selected_object()
+        self.dirty |= self._mask_revision != revision
+        self.loaded_anchor_frames = set(self.prompt_point_frames())
+
+    def finalize(self) -> None:
+        self.stop_propagation()
+        self.cancel_edit()
+        if self.dirty:
+            super().finalize()
+        else:
+            print("Loaded result inspected; existing files left unchanged.")
+
+
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     with temporary_path.open("w", encoding="utf-8") as handle:
@@ -2685,16 +3019,32 @@ def remap_interaction(item: Dict[str, Any], mapping: Dict[int, int]) -> Dict[str
     for key in ("obj_id", "active_obj"):
         if key in result and result[key] is not None:
             original = int(result[key])
-            result[f"original_{key}"] = original
+            result.setdefault(f"original_{key}", original)
             result[key] = mapping.get(original)
     return result
 
 
 def write_interactive_outputs(app: InteractiveApp) -> None:
     original_ids = sorted({obj_id for masks in app.cache.values() for obj_id in masks})
-    id_mapping = {obj_id: index for index, obj_id in enumerate(original_ids)}
+    id_mapping = (
+        {obj_id: obj_id for obj_id in original_ids}
+        if isinstance(app, LoadedInteractiveApp)
+        else {obj_id: index for index, obj_id in enumerate(original_ids)}
+    )
     if len(id_mapping) > 255:
         raise RuntimeError("more than 255 tracked instances; uint8 labels overflow")
+    # ponytail: reserve old labels; compact via full re-export if 255 are exhausted.
+    object_to_label = (
+        dict(app.loaded_labels)
+        if isinstance(app, LoadedInteractiveApp)
+        else {obj_id: obj_id + 1 for obj_id in id_mapping.values()}
+    )
+    for obj_id in id_mapping.values():
+        if obj_id not in object_to_label:
+            available = set(range(1, 256)) - set(object_to_label.values())
+            if not available:
+                raise RuntimeError("more than 255 instance labels; uint8 overflow")
+            object_to_label[obj_id] = min(available)
     app.output_dir.mkdir(parents=True, exist_ok=True)
     result_path = app.output_dir / "result.mp4"
     masks_path = app.output_dir / "masks.mkv"
@@ -2725,7 +3075,6 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
         raise RuntimeError(f"cannot create lossless mask video: {temporary_masks}")
-    object_to_label = {obj_id: obj_id + 1 for obj_id in id_mapping.values()}
     try:
         for frame_index in range(app.frame_count):
             masks_by_obj = {
@@ -2784,6 +3133,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
     atomic_write_json(
         app.output_dir / "metadata.json",
         {
+            **(app.loaded_metadata if isinstance(app, LoadedInteractiveApp) else {}),
             "status": "success",
             "completed_at": utc_now(),
             "input_video": str(app.video_path),
@@ -2811,7 +3161,13 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "source": source,
             "outputs": outputs,
             "confirmed_points": [
-                remap_interaction(p.as_json(), id_mapping)
+                remap_interaction(
+                    {
+                        **getattr(app, "loaded_points", {}).get(p.sequence, {}),
+                        **p.as_json(),
+                    },
+                    id_mapping,
+                )
                 for p in sorted(app.confirmed_points, key=lambda point: point.sequence)
             ],
             "events": [remap_interaction(event, id_mapping) for event in app.events],
@@ -3383,8 +3739,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: masks_sam3), followed by the text prompt with spaces replaced "
         "by underscores; ignored with --video",
     )
-    parser.add_argument(
+    existing = parser.add_mutually_exclusive_group()
+    existing.add_argument(
         "--overwrite", action="store_true", help="Replace existing interactive outputs"
+    )
+    existing.add_argument(
+        "--load-existing",
+        action="store_true",
+        help="Open saved masks without automatic propagation (single or batch)",
     )
     parser.add_argument(
         "--window-width",
@@ -3416,6 +3778,129 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def load_interactive_result(app: LoadedInteractiveApp) -> None:
+    """Decode every label frame before any model initialization or output writes."""
+    metadata = json.loads((app.output_dir / "metadata.json").read_text())
+    interactions = json.loads((app.output_dir / "interactions.json").read_text())
+    labels = {
+        int(obj): int(label) for obj, label in metadata["object_id_to_label"].items()
+    }
+    if any(obj < 0 or not 1 <= label <= 255 for obj, label in labels.items()) or len(
+        set(labels.values())
+    ) != len(labels):
+        raise ValueError("invalid or duplicate instance label mapping")
+    capture = cv2.VideoCapture(str(app.output_dir / "masks.mkv"))
+    # ponytail: full-video mask cache; use a disk-backed cache if long clips exceed RAM.
+    cache = {}
+    try:
+        if not capture.isOpened():
+            raise RuntimeError("cannot open saved masks.mkv")
+        for frame in range(app.frame_count):
+            ok, image = capture.read()
+            if not ok:
+                raise RuntimeError(f"cannot decode saved mask frame {frame}")
+            if image.dtype != np.uint8 or image.shape[:2] != (
+                app.video_info.height,
+                app.video_info.width,
+            ):
+                raise ValueError(f"invalid saved mask dimensions/type at frame {frame}")
+            if image.ndim == 3:
+                if not np.all(image == image[:, :, :1]):
+                    raise ValueError(f"saved mask frame {frame} is not grayscale")
+                image = image[:, :, 0]
+            present = set(int(label) for label in np.unique(image)) - {0}
+            if present - set(labels.values()):
+                raise ValueError(f"unknown instance labels at frame {frame}")
+            cache[frame] = {
+                obj: image == label for obj, label in labels.items() if label in present
+            }
+        if capture.read()[0]:
+            raise ValueError("saved mask video has extra frames")
+    finally:
+        capture.release()
+    points = []
+    for item in interactions.get("confirmed_points", []):
+        if item.get("obj_id") is None:
+            continue  # Deleted objects remain in the audit log, not live prompts.
+        point = PointEdit(
+            **{
+                key: int(item[key])
+                for key in ("sequence", "frame_index", "obj_id", "x", "y", "label")
+            }
+        )
+        if (
+            point.obj_id not in labels
+            or not 0 <= point.frame_index < app.frame_count
+            or not 0 <= point.x < app.video_info.width
+            or not 0 <= point.y < app.video_info.height
+            or point.label not in (0, 1)
+        ):
+            raise ValueError("invalid saved interaction point")
+        points.append(point)
+    app.loaded_metadata = metadata
+    app.loaded_labels = labels
+    app.confirmed_points = points
+    app.loaded_points = {
+        int(item["sequence"]): item
+        for item in interactions.get("confirmed_points", [])
+        if item.get("obj_id") is not None
+    }
+    app.events = interactions.get("events", [])
+    app.sequence = max(
+        [
+            0,
+            *[p.sequence for p in points],
+            *[int(event.get("sequence", 0)) for event in app.events],
+        ]
+    )
+    app.loaded_anchor_frames = {point.frame_index for point in points}
+    app.next_obj_id = max(labels, default=-1) + 1
+    for frame, masks in cache.items():
+        app.store_masks(frame, masks, {})
+    app.propagation_complete = True
+    app.status = "loaded result - paused (no propagation)"
+    app.cached_mutation_series()
+
+
+def process_loaded_interactive_video(
+    get_predictor: Any, args: argparse.Namespace, video_path: Path, output_dir: Path
+) -> bool:
+    if not completed_interactive_video(output_dir, video_path, args):
+        raise RuntimeError(
+            "saved result is incomplete, invalid, or settings do not match; "
+            "files left unchanged (use --overwrite separately to rerun)"
+        )
+    info = probe_video(video_path)
+    with tempfile.TemporaryDirectory(prefix="sam3_loaded_frames_") as temp:
+        frame_dir = Path(temp) / "frames"
+        count = extract_frames(video_path, frame_dir)
+        if count != info.frame_count:
+            raise RuntimeError("source video frame count changed while extracting")
+        app = LoadedInteractiveApp(
+            None,
+            args.version,
+            "loaded",
+            frame_dir,
+            video_path,
+            info,
+            count,
+            args.text_prompt,
+            output_dir,
+            args.window_width,
+            args.checkpoint_interval,
+            clip_overseg=args.clip_overseg,
+            get_predictor=get_predictor,
+        )
+        load_interactive_result(app)
+        try:
+            app.run()
+        finally:
+            app.stop_propagation()
+            app.predictor.reset(0, {})
+            app.predictor.app = None  # Release frame/mask buffers between batch jobs.
+    return True
 
 
 def process_interactive_video(
@@ -3664,7 +4149,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error(f"video does not exist: {video_path}")
         output_dir = expand_path(args.output_dir)
         try:
-            validate_interactive_outputs(output_dir, args.overwrite)
+            if not args.load_existing:
+                validate_interactive_outputs(output_dir, args.overwrite)
         except RuntimeError as exc:
             parser.error(str(exc))
         jobs = [(video_path, output_dir)]
@@ -3672,6 +4158,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if checkpoint is not None and not checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {checkpoint}")
     predictor = None
+
+    def get_predictor() -> Any:
+        nonlocal predictor
+        if predictor is None:
+            predictor = load_predictor(args, parser)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(args.device[1])
+        return predictor
+
     failures = []
     succeeded = skipped = 0
     interrupted = False
@@ -3679,6 +4174,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for index, (video_path, output_dir) in enumerate(jobs, 1):
             print(f"[{index}/{len(jobs)}] {video_path} -> {output_dir}")
             try:
+                if args.load_existing and any(
+                    (output_dir / name).exists()
+                    for name in (
+                        "result.mp4",
+                        "masks.mkv",
+                        "metadata.json",
+                        "interactions.json",
+                    )
+                ):
+                    if not process_loaded_interactive_video(
+                        get_predictor, args, video_path, output_dir
+                    ):
+                        interrupted = True
+                        break
+                    succeeded += 1
+                    continue
                 if (
                     batch
                     and not args.overwrite
@@ -3691,10 +4202,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     output_dir, video_path, args, batch
                 ):
                     validate_interactive_outputs(output_dir, args.overwrite)
-                if predictor is None:
-                    predictor = load_predictor(args, parser)
                 if not process_interactive_video(
-                    predictor, args, video_path, output_dir
+                    get_predictor(), args, video_path, output_dir
                 ):
                     interrupted = True
                     break

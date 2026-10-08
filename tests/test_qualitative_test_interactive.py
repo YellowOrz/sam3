@@ -989,9 +989,7 @@ def test_confirm_keeps_checkpoints_outside_the_edit(tmp_path: Path) -> None:
     app.add_point(5, 3, 0)
     app.preview()
     assert app.status == "preview"
-    assert not any(
-        event["type"] == "preview_baseline_rebuilt" for event in app.events
-    )
+    assert not any(event["type"] == "preview_baseline_rebuilt" for event in app.events)
 
 
 def test_preview_rebuilds_when_no_checkpoint_can_reach_the_edit(
@@ -2239,3 +2237,369 @@ def test_batch_rejects_prompt_directory_traversal(tmp_path, prompt):
                 prompt,
             ]
         )
+
+
+def make_loaded_app(tmp_path, get_predictor=None, version="sam3"):
+    return qualitative.LoadedInteractiveApp(
+        predictor=None,
+        version=version,
+        session_id="loaded",
+        frame_dir=tmp_path / "frames",
+        video_path=tmp_path / "input.mp4",
+        video_info=qualitative.VideoInfo(10, 8, 100, 12.0),
+        frame_count=100,
+        prompt="hand",
+        output_dir=tmp_path / "output",
+        window_width=640,
+        get_predictor=get_predictor or (lambda: pytest.fail("unexpected model load")),
+    )
+
+
+def test_load_existing_parser_conflicts_with_overwrite():
+    argv = ["--video", "in.mp4", "--output-dir", "out", "--load-existing"]
+    assert qualitative.build_parser().parse_args(argv).load_existing
+    with pytest.raises(SystemExit):
+        qualitative.build_parser().parse_args([*argv, "--overwrite"])
+
+
+def test_load_masks_restores_curve_and_read_only_exit(tmp_path, monkeypatch):
+    original = make_app(tmp_path)
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[1:4, 1:4] = True
+    original.cache = {0: {7: mask}, 1: {7: mask}, 2: {7: ~mask}}
+    original.confirmed_points = [qualitative.PointEdit(1, 1, 7, 2, 2, 1)]
+    qualitative.write_interactive_outputs(original)
+    before = {path.name: path.read_bytes() for path in original.output_dir.iterdir()}
+    app = make_loaded_app(tmp_path, version=original.version)
+    app.frame_count = 3
+    app.video_info = original.video_info
+    qualitative.load_interactive_result(app)
+    assert app.playing is False
+    assert app.runner.is_alive is False
+    assert app.cached_mutation_series() == [(1, 0.0), (2, 1.0)]
+    assert app.loaded_anchor_frames == {1}
+    assert app.confirmed_points[0].obj_id == 0
+    assert app.next_obj_id == 1
+    app.render_controls()  # The existing curve renderer receives the loaded cache.
+    app.finalize()
+    assert before == {
+        path.name: path.read_bytes() for path in original.output_dir.iterdir()
+    }
+
+
+def test_loaded_edit_rollback_and_save_preserves_label_ids(tmp_path, monkeypatch):
+    original = make_app(tmp_path)
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[:, :4] = True
+    original.cache = {index: {4: mask, 8: ~mask} for index in range(3)}
+    original.confirmed_points = [qualitative.PointEdit(1, 0, 8, 7, 3, 1)]
+    original.events = [{"sequence": 2, "type": "select_object", "obj_id": 8}]
+    qualitative.write_interactive_outputs(original)
+    app = make_loaded_app(tmp_path, version=original.version)
+    app.frame_count = 3
+    app.video_info = original.video_info
+    qualitative.load_interactive_result(app)
+    # A deleted ID must not cause renumbering of the untouched surviving object.
+    app.active_obj = 0
+    app.remove_selected_object()
+    app.dirty = True
+    app.finalize()
+    metadata = json.loads((app.output_dir / "metadata.json").read_text())
+    assert metadata["object_id_to_label"]["1"] == 2
+    interactions = json.loads((app.output_dir / "interactions.json").read_text())
+    assert interactions["confirmed_points"][0]["original_obj_id"] == 8
+    assert interactions["events"][0]["original_obj_id"] == 8
+    cap = cv2.VideoCapture(str(app.output_dir / "masks.mkv"))
+    try:
+        ok, image = cap.read()
+        assert ok
+        assert np.all(image[:, 4:] == 2)
+    finally:
+        cap.release()
+
+
+@pytest.mark.parametrize("mode", ["forward", "forward_backward", "backward_forward"])
+def test_loaded_propagation_hard_bounds_and_anchors(tmp_path, monkeypatch, mode):
+    app = make_loaded_app(tmp_path, lambda: None)
+    mask = np.ones((8, 10), dtype=bool)
+    app.cache = {frame: {0: mask.copy()} for frame in range(100)}
+    before = {frame: app.cache[frame][0].copy() for frame in range(100)}
+    app.loaded_anchor_frames = {40, 50, 60}
+    app.confirmed_points = [qualitative.PointEdit(1, 40, 0, 3, 3, 1)]
+    app.prop_range_left, app.prop_range_right = (30, 70)
+    calls = []
+    seeds = []
+    backend = app.predictor
+
+    def initialize():
+        seeds.append((backend.seed_frame, backend.seed_masks[0].copy()))
+        backend.state = {"obj_ids": [0]}
+
+    def track(frame, reverse):
+        calls.append((frame, reverse))
+        return {
+            "out_obj_ids": np.array([0]),
+            "out_binary_masks": np.zeros((1, 8, 10), dtype=bool),
+        }
+
+    monkeypatch.setattr(backend, "initialize", initialize)
+    monkeypatch.setattr(backend, "track_frame", track)
+    app.start_propagation(50, mode)
+    app.runner.join()
+    app.drain_events()
+    assert app.fatal_error is None
+    forward = list(range(51, 60)) + list(range(61, 71))
+    backward = list(range(49, 40, -1)) + list(range(39, 29, -1))
+    expected = {
+        "forward": [(frame, False) for frame in forward],
+        "forward_backward": [(frame, False) for frame in forward]
+        + [(frame, True) for frame in backward],
+        "backward_forward": [(frame, True) for frame in backward]
+        + [(frame, False) for frame in forward],
+    }
+    assert calls == expected[mode]
+    for frame in [*range(30), *range(71, 100), 40, 50, 60]:
+        assert np.array_equal(app.cache[frame][0], before[frame])
+    assert all(np.array_equal(seed, before[frame]) for frame, seed in seeds)
+    assert all(30 <= frame <= 70 for frame, _ in seeds)
+    assert app.confirmed_points[0].frame_index == 40
+
+
+def test_loaded_default_range_both_directions_and_empty_leg(tmp_path, monkeypatch):
+    app = make_loaded_app(tmp_path)
+    app.cache = {frame: {0: np.ones((8, 10), dtype=bool)} for frame in range(100)}
+    backend = app.predictor
+    calls = []
+    monkeypatch.setattr(
+        backend, "initialize", lambda: setattr(backend, "state", {"obj_ids": [0]})
+    )
+    monkeypatch.setattr(
+        backend, "track_frame", lambda frame, reverse: calls.append(frame) or {}
+    )
+    for direction in ("forward", "backward"):
+        list(
+            backend.handle_stream_request(
+                {
+                    "start_frame_index": 50,
+                    "max_frame_num_to_track": app.propagation_track_limit(
+                        50, direction
+                    ),
+                    "propagation_direction": direction,
+                }
+            )
+        )
+    assert calls == [*range(51, 100), *range(49, -1, -1)]
+    calls.clear()
+    app.prop_range_left, app.prop_range_right = 50, 70
+    list(
+        backend.handle_stream_request(
+            {
+                "start_frame_index": 50,
+                "max_frame_num_to_track": 0,
+                "propagation_direction": "backward",
+            }
+        )
+    )
+    assert calls == []
+    app.start_propagation(49, "forward")
+    assert not app.runner.is_alive
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_load_existing_routes_before_model_loading(tmp_path, monkeypatch, batch):
+    input_dir = tmp_path / "data"
+    input_dir.mkdir()
+    video = input_dir / "color.mp4"
+    video.touch()
+    root = tmp_path / "out"
+    destination = root / "masks_sam3" / "hand" if batch else root
+    destination.mkdir(parents=True)
+    (destination / "metadata.json").write_text("{}")
+    visited = []
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *args: pytest.fail("model loaded")
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_loaded_interactive_video",
+        lambda get_predictor, args, path, out: visited.append((path, out)) or True,
+    )
+    inputs = (
+        ["--input-root", str(input_dir), "--output-root", str(root)]
+        if batch
+        else ["--video", str(video), "--output-dir", str(root)]
+    )
+    assert qualitative.main([*inputs, "--text-prompt", "hand", "--load-existing"]) == 0
+    assert visited == [(video.resolve(), destination.resolve())]
+
+
+def test_load_existing_rejects_invalid_without_writes(tmp_path, monkeypatch):
+    app = make_loaded_app(tmp_path)
+    app.output_dir.mkdir()
+    saved = app.output_dir / "metadata.json"
+    saved.write_text('{"status": "success"}')
+    monkeypatch.setattr(
+        qualitative, "extract_frames", lambda *args: pytest.fail("extracted frames")
+    )
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            str(app.video_path),
+            "--output-dir",
+            str(app.output_dir),
+            "--load-existing",
+        ]
+    )
+    with pytest.raises(RuntimeError, match="files left unchanged"):
+        qualitative.process_loaded_interactive_video(
+            lambda: pytest.fail("model loaded"), args, app.video_path, app.output_dir
+        )
+    assert saved.read_text() == '{"status": "success"}'
+
+
+@pytest.mark.parametrize("version", ["sam3", "sam3.1"])
+def test_loaded_backend_initializes_only_edit_frame_and_registers_new_id(
+    tmp_path, version
+):
+    from types import SimpleNamespace
+
+    from sam3.model.data_misc import NestedTensor
+
+    frame_dir = tmp_path / "frames"
+    frame_dir.mkdir()
+    cv2.imwrite(str(frame_dir / "00050.jpg"), np.zeros((8, 10, 3), dtype=np.uint8))
+    calls = []
+
+    class Backbone:
+        def forward_image(self, image, **kwargs):
+            tensor = image if version == "sam3" else image.tensors
+            calls.append(("image", tensor.dtype, tuple(tensor.shape)))
+            fpn = [tensor.clone(), tensor.clone(), tensor.clone()]
+            if version == "sam3":
+                return {"sam2_backbone_out": {"backbone_fpn": fpn}}
+            assert kwargs == {
+                "need_sam3_out": False,
+                "need_interactive_out": True,
+                "need_propagation_out": True,
+            }
+            return {
+                key: {"backbone_fpn": [NestedTensor(x.clone(), None) for x in fpn]}
+                for key in ("interactive", "sam2_backbone_out")
+            }
+
+    class Tracker:
+        sam_mask_decoder = SimpleNamespace(conv_s0=lambda x: x, conv_s1=lambda x: x)
+        interactive_sam_mask_decoder = sam_mask_decoder
+
+        def init_state(self, **kwargs):
+            assert set(kwargs["cached_features"]) == {50}
+            return {"obj_ids": [], "masks": {}, "locked": False}
+
+        def add_new_mask(self, state, frame, obj, mask):
+            assert not state["locked"]
+            state["obj_ids"].append(obj)
+            state["masks"][obj] = mask
+            calls.append(("mask", frame, obj))
+
+        def add_new_masks(self, state, frame, ids, masks):
+            for obj, mask in zip(ids, masks):
+                self.add_new_mask(state, frame, obj, mask)
+
+        def propagate_in_video_preflight(self, state, **kwargs):
+            state["locked"] = True
+            calls.append(("memory", 50))
+
+        def propagate_in_video(
+            self, state, start_frame_idx, max_frame_num_to_track, **kwargs
+        ):
+            assert start_frame_idx == 50
+            assert max_frame_num_to_track == 0
+            masks = torch.stack([state["masks"][obj] for obj in state["obj_ids"]])[
+                :, None
+            ]
+            calls.append(("track", start_frame_idx))
+            yield (
+                start_frame_idx,
+                state["obj_ids"],
+                None,
+                masks.float() * 2 - 1,
+                torch.ones(len(masks)),
+            )
+
+        def add_new_points_or_box(self, state, frame, obj, **kwargs):
+            assert obj in state["obj_ids"]  # Must register before tracking locks IDs.
+            if version == "sam3.1":
+                assert state["user_refined_frames_per_obj"][obj] == {50}
+            assert kwargs["rel_coordinates"]
+            masks = torch.stack([state["masks"][obj] for obj in state["obj_ids"]])[
+                :, None
+            ]
+            calls.append(("points", frame, obj))
+            return frame, state["obj_ids"], None, masks.float() * 2 - 1
+
+    model = SimpleNamespace(
+        image_size=16,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        device=torch.device("cpu"),
+        tracker=Tracker(),
+        detector=SimpleNamespace(backbone=Backbone()),
+    )
+    app = make_loaded_app(tmp_path, lambda: SimpleNamespace(model=model), version)
+    app.cache[50] = {0: np.ones((8, 10), dtype=bool)}
+    backend = app.predictor
+    backend.reset(50, app.cache[50])
+    response = backend.handle_request(
+        {
+            "type": "add_prompt",
+            "frame_index": 50,
+            "obj_id": 1,
+            "points": [[0.5, 0.5]],
+            "point_labels": [1],
+        }
+    )
+    assert response["outputs"]["out_obj_ids"].tolist() == [0, 1]
+    assert calls.count(("image", torch.float32, (1, 3, 16, 16))) == 1
+    assert ("mask", 50, 1) in calls
+    assert ("points", 50, 1) in calls
+    assert set(backend.features) == {50}
+
+
+def test_loaded_preview_cancel_never_rebuilds_prefix(tmp_path, monkeypatch):
+    app = make_loaded_app(tmp_path)
+    mask = np.ones((8, 10), dtype=bool)
+    app.cache = {frame: {0: mask.copy()} for frame in range(100)}
+    original = app.cache[50][0].copy()
+    app.edit_frame, app.editing = 50, True
+    app.draft_points = [qualitative.PointEdit(1, 50, 0, 4, 3, 1)]
+    resets = []
+    monkeypatch.setattr(
+        app.predictor, "reset", lambda frame, masks: resets.append(frame)
+    )
+    monkeypatch.setattr(
+        app, "apply_points", lambda keys: app.store_masks(50, {0: ~mask}, {})
+    )
+    app.preview()
+    assert not np.array_equal(app.cache[50][0], original)
+    app.cancel_edit()
+    assert resets == [50, 50]
+    assert np.array_equal(app.cache[50][0], original)
+    assert not app.dirty
+
+
+def test_loaded_result_rejects_unknown_mask_label_without_writes(tmp_path):
+    original = make_app(tmp_path)
+    original.cache = {frame: {0: np.ones((8, 10), dtype=bool)} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    path = original.output_dir / "metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["object_id_to_label"] = {"0": 2}
+    path.write_text(json.dumps(metadata))
+    before = {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+    app = make_loaded_app(tmp_path)
+    app.frame_count = 3
+    app.video_info = original.video_info
+    with pytest.raises(ValueError, match="unknown instance labels"):
+        qualitative.load_interactive_result(app)
+    assert not app.cache
+    assert before == {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
