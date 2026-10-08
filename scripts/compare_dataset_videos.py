@@ -26,9 +26,9 @@ import cv2
 import numpy as np
 
 if __package__:
-    from scripts.common.video_utils import expand_path
+    from scripts.common.video_utils import expand_path, H264Writer
 else:
-    from common.video_utils import expand_path  # type: ignore[no-redef]
+    from common.video_utils import expand_path, H264Writer  # type: ignore[no-redef]
 
 
 LOGGER = logging.getLogger("sam3_video_comparison")
@@ -269,12 +269,7 @@ def compose_sequence(
     temporary_path = output_path.with_name(f".{output_path.stem}.tmp.mp4")
     if temporary_path.exists():
         temporary_path.unlink()
-    writer = cv2.VideoWriter(
-        str(temporary_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        sequence.info.fps,
-        frame_size,
-    )
+    writer = H264Writer(temporary_path, sequence.info.fps, frame_size)
     if not writer.isOpened():
         writer.release()
         raise RuntimeError(f"cannot create output video: {temporary_path}")

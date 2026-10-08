@@ -55,6 +55,7 @@ if __package__:
         color_for_label,
         expand_path,
         extract_png_frames,
+        H264Writer,
         lighter_color,
         MASK_ALPHA,
         normalize_output_arrays as normalize_outputs,
@@ -68,6 +69,7 @@ else:  # Direct execution adds scripts/, not the repo root.
         color_for_label,
         expand_path,
         extract_png_frames,
+        H264Writer,
         lighter_color,
         MASK_ALPHA,
         normalize_output_arrays as normalize_outputs,
@@ -772,9 +774,11 @@ def write_outputs(
     final_writer = open_video_writer(
         output_dir / "masks.mkv", "FFV1", fps, (width, height), False
     )
-    result_writer = open_video_writer(
-        output_dir / "result.mp4", "mp4v", fps, (width * 3, height), True
-    )
+    result_path = output_dir / "result.mp4"
+    result_writer = H264Writer(result_path, fps, (width * 3, height))
+    if not result_writer.isOpened():
+        result_writer.release()
+        raise RuntimeError(f"cannot create output video: {result_path}")
     try:
         for frame_index, candidates in enumerate(candidates_by_frame):
             frame = cv2.imread(

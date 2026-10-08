@@ -199,6 +199,7 @@ def test_result_video_is_two_by_two(tmp_path: Path) -> None:
         assert int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) == 24
     finally:
         capture.release()
+    assert b"avc1" in output.read_bytes()
 
 
 def entry(frame, direction, *, quality=0.9, conditioning=False, object_id=7):

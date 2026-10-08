@@ -98,3 +98,4 @@ def test_main_writes_and_overwrites_comparison_video(tmp_path: Path) -> None:
         assert capture.get(cv2.CAP_PROP_FPS) == pytest.approx(12.0, abs=1e-3)
     finally:
         capture.release()
+    assert b"avc1" in output_path.read_bytes()

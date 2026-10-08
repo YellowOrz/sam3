@@ -39,6 +39,7 @@ if __package__:
         as_numpy,
         expand_path,
         extract_png_frames,
+        H264Writer,
         normalize_output_arrays,
         parse_device,
         positive_int,
@@ -52,6 +53,7 @@ else:
         as_numpy,
         expand_path,
         extract_png_frames,
+        H264Writer,
         normalize_output_arrays,
         parse_device,
         positive_int,
@@ -406,10 +408,9 @@ def write_result_video(
     fps: float,
 ) -> None:
     height, width = forward_masks[0].shape
-    writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width * 2, height * 2)
-    )
+    writer = H264Writer(path, fps, (width * 2, height * 2))
     if not writer.isOpened():
+        writer.release()
         raise RuntimeError(f"cannot create result video: {path}")
     try:
         for index, (forward, backward, fused) in enumerate(

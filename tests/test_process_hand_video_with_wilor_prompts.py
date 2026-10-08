@@ -376,5 +376,7 @@ def test_iterative_process_writes_outputs_and_normalized_points(
             [12 / 16, 8 / 12],
         ]
         assert point_requests[0]["point_labels"] == [1, 0]
-    result_info = processor.probe_video(output_dir / "result.mp4")
+    result_path = output_dir / "result.mp4"
+    result_info = processor.probe_video(result_path)
     assert (result_info["width"], result_info["height"]) == (48, 12)
+    assert b"avc1" in result_path.read_bytes()
