@@ -174,10 +174,17 @@ def _associate_det_trk_compilable(
     iom_thresh_recondition,
     iou_thresh_recondition,
 ):
+    """按掩码重合把本帧检测和已有轨迹分成新对象、失配轨迹和纠正候选。
+
+    重合矩阵形状为 ``(N, M)``，N 是检测数，M 是轨迹数。新建和失配用清零前的
+    原始重合；纠正候选和 ``im_mask`` 用清掉歧义匹配之后的矩阵。
+    """
+    # logits > 0 得到二值掩码；被丢弃的检测整张清零，避免参与重合。
     det_masks_binary = det_masks > 0
     det_masks_binary[~det_keep] = 0
     trk_masks_binary = trk_masks > 0
     intersection_metric = None
+    # 纠正可用交并比 IoU，或交集占较小掩码的比例 IoM。
     if use_iom_recondition:
         intersection_metric = mask_iom(det_masks_binary, trk_masks_binary)  # (N, M)
     else:
@@ -186,6 +193,7 @@ def _associate_det_trk_compilable(
     assert not o2o_matching_masklets_enable, "Temporarily disabled support for o2o_matching_masklets_enable, due to optimizations."
 
     if o2o_matching_masklets_enable:
+        # 匈牙利算法强制检测与轨迹一对一；当前默认关闭。
         intersection_metric_np = intersection_metric.cpu().numpy()
         from scipy.optimize import linear_sum_assignment
 
@@ -198,13 +206,14 @@ def _associate_det_trk_compilable(
         trk_is_matched = torch.from_numpy(trk_is_matched)
         trk_is_matched = trk_is_matched.to(device=intersection_metric.device)
     else:
+        # 默认多对一：任一检测达到较严的轨迹关联阈值，该轨迹即算匹配。
         trk_is_matched = (intersection_metric >= iou_threshold_trk).any(dim=0)
-    # Non-empty tracks not matched by Hungarian assignment above threshold are unmatched
+    # 空掩码不算失配；只有非空且未被匹配的轨迹才进入后续淘汰。
     trk_is_nonempty = trk_masks_binary.any(dim=(1, 2))
     trk_is_unmatched = torch.logical_and(trk_is_nonempty, ~trk_is_matched)
 
-    # For detections: allow many tracks to match to the same detection (many-to-one)
-    # So, a detection is 'new' if it does not match any track above threshold
+    # 新建用更松的 iou_threshold：与任何轨迹都不达标，且分数够高，才是新对象。
+    # 因此 IoU 落在两道门槛之间时，既不新建，也不算轨迹已匹配。
     is_new_det = torch.logical_and(
         torch.logical_and((det_scores >= new_det_thresh), (det_keep)),
         torch.logical_not(torch.any(intersection_metric >= iou_threshold, dim=1)),
@@ -213,22 +222,23 @@ def _associate_det_trk_compilable(
     intersection_thresh_recond = (
         iom_thresh_recondition if use_iom_recondition else iou_thresh_recondition
     )
-    # if a detection matches to many tracks with high IoU or vice versa, we do not consider it for reconditioning as it might be ambiguous
+    # 一个高重合检测对应多条轨迹，或一条轨迹对应多个高重合检测，视为歧义。
     det_match_to_many_trk = (intersection_metric >= intersection_thresh_recond).sum(
         dim=1
     ) > 1
     trk_match_to_many_det = (intersection_metric >= intersection_thresh_recond).sum(
         dim=0
     ) > 1
-    # # zero out these ambiguous matches
+    # # 清零这些歧义匹配
     # intersection_metric[:, trk_match_to_many_det] = (
-    #     0.0  # only consider unique matches
+    #     0.0  # 只保留唯一匹配
     # )
 
     # intersection_metric[det_match_to_many_trk, :] = (
-    #     0.0  # only consider unique matches
+    #     0.0  # 只保留唯一匹配
     # )
 
+    # 原地索引赋值不利于编译，改用 where 把歧义行、列整段置零。
     intersection_metric = torch.where(
         trk_match_to_many_det.unsqueeze(0),
         torch.zeros_like(intersection_metric),
@@ -241,11 +251,14 @@ def _associate_det_trk_compilable(
         intersection_metric,
     )
 
+    # 每个检测在去歧义后的矩阵里，重合最高的那条轨迹。
     det_to_max_iou_trk_idx = torch.argmax(intersection_metric, dim=1)
+    # 高分、被保留、且已经匹配到旧对象，才可能纠正；新检测不走纠正。
     det_is_high_conf = ((det_scores >= HIGH_CONF_THRESH) & det_keep) & ~is_new_det
     det_is_high_iou = (
         torch.amax(intersection_metric, dim=1) >= intersection_thresh_recond
     )
+    # 供后续“一个检测覆盖哪些轨迹”使用；歧义匹配已被置零，不会出现在这里。
     im_mask = intersection_metric >= iou_threshold
 
     return (
@@ -258,6 +271,7 @@ def _associate_det_trk_compilable(
         det_keep,
         im_mask,
     )
+
 
 def clip_oversegmented_tracker_masks(
     det_masks: Tensor,
@@ -863,14 +877,14 @@ class Sam3VideoBase(nn.Module):
         计划包含新检测应分配的对象 ID/GPU、失配对象、重新条件化对象和对象上限
         导致的丢弃信息；执行阶段不再重新做决策，以避免各 rank 分歧。
         """
-        # initialize new metadata from previous metadata (its values will be updated later)
+        # 从上帧元数据复制一份，后续再更新其中的值。
         tracker_metadata_new = self._create_planning_metadata(tracker_metadata_prev)
 
-        # Initialize reconditioned_obj_ids early to avoid UnboundLocalError
+        # 提前初始化，避免后面分支未赋值时触发 UnboundLocalError。
         reconditioned_obj_ids = set()
 
         # 只有 rank 0 决策，随后广播 Python 对象计划，避免各卡因浮点细节产生不同 ID。
-        det_mask_preds: Tensor = det_out["mask"]  # low-res mask logits
+        det_mask_preds: Tensor = det_out["mask"]  # 低分辨率 mask logits
         det_scores_np: npt.NDArray = det_out["scores"].float().cpu().numpy()
         det_bbox_xyxy: Tensor = det_out["bbox"]
         if self.rank == 0:
@@ -893,7 +907,7 @@ class Sam3VideoBase(nn.Module):
                 )
                 new_det_fa_inds = new_det_fa_inds[keep.cpu().numpy()]
 
-            # check whether we've hit the maximum number of objects we can track (and if so, drop some detections)
+            # 若对象数将超过上限，则按分数丢掉一部分新检测。
             prev_obj_num = np.sum(tracker_metadata_prev["num_obj_per_gpu"])
             new_det_num = len(new_det_fa_inds)
             num_obj_dropped_due_to_limit = 0
@@ -909,7 +923,7 @@ class Sam3VideoBase(nn.Module):
                 assert len(new_det_fa_inds) == new_det_num_to_keep
                 new_det_num = len(new_det_fa_inds)
 
-            # assign object IDs to new detections and decide which GPU to place them
+            # 给新检测分配对象 ID，并决定放到哪块 GPU。
             new_det_start_obj_id = tracker_metadata_prev["max_obj_id"] + 1
             new_det_obj_ids = new_det_start_obj_id + np.arange(new_det_num)
             prev_workload_per_gpu = tracker_metadata_prev["num_obj_per_gpu"]
@@ -919,9 +933,7 @@ class Sam3VideoBase(nn.Module):
             )
 
             # 热启动记录短时间内的失配/重复，推迟输出前先淘汰不稳定对象。
-            # here `rank0_metadata` contains metadata stored on (and only accessible to) GPU 0;
-            # we avoid broadcasting them to other GPUs to save communication cost, assuming
-            # that `rank0_metadata` is not needed by other GPUs
+            # `rank0_metadata` 只存在于 GPU 0，其他 rank 用不到，因此不广播以省通信。
             rank0_metadata_new = deepcopy(tracker_metadata_prev["rank0_metadata"])
             if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 obj_ids_newly_removed, rank0_metadata_new = self._process_hotstart(
@@ -938,15 +950,15 @@ class Sam3VideoBase(nn.Module):
                     tracker_metadata=tracker_metadata_prev,
                 )
             else:
-                # if warm-up is not complete, we don't remove any objects
+                # 预热未完成时不删除任何对象。
                 obj_ids_newly_removed = set()
             tracker_metadata_new["rank0_metadata"] = rank0_metadata_new
 
         # 所有 rank 必须收到完全一致的计划，否则后续集体通信的对象维度会失配。
         NUM_BROADCAST_ITEMS = 9
         if self.rank == 0 and self.world_size > 1:
-            # `num_obj_per_gpu_on_rank0` is used for metadata consistency check on other GPUs
-            # (it's a small array with length==self.world_size, so broadcasting it is cheap)
+            # `num_obj_per_gpu_on_rank0` 供其他 GPU 核对元数据是否一致；
+            # 长度等于 world_size，广播开销很小。
             num_obj_per_gpu_on_rank0 = tracker_metadata_prev["num_obj_per_gpu"]
             update_plan = [
                 # pyre-fixme[61]: `new_det_fa_inds` is undefined, or not always defined.
@@ -979,7 +991,7 @@ class Sam3VideoBase(nn.Module):
         elif self.rank > 0 and self.world_size > 1:
             update_plan = [
                 None
-            ] * NUM_BROADCAST_ITEMS  # other ranks receive the plan from rank 0
+            ] * NUM_BROADCAST_ITEMS  # 其他 rank 从 rank 0 接收计划
             self.broadcast_python_obj_cpu(update_plan, src=0)
             (
                 new_det_fa_inds,
@@ -992,8 +1004,8 @@ class Sam3VideoBase(nn.Module):
                 num_obj_dropped_due_to_limit,
                 trk_id_to_max_iou_high_conf_det,
             ) = update_plan
-            # metadata consistency check: verify that the received `num_obj_per_gpu_on_rank0` is consistent with the local metadata
-            # it's critical that all GPUs agree on the previous number of objects (otherwise the inference might hang or fail silently)
+            # 核对收到的 `num_obj_per_gpu_on_rank0` 与本地元数据一致。
+            # 各 GPU 必须对上一帧对象数达成一致，否则推理可能挂起或静默失败。
             if not np.all(
                 num_obj_per_gpu_on_rank0 == tracker_metadata_prev["num_obj_per_gpu"]
             ):
@@ -1002,7 +1014,7 @@ class Sam3VideoBase(nn.Module):
                     f"{tracker_metadata_prev['num_obj_per_gpu']=}. There's likely a bug in update planning or execution."
                 )
 
-        # `tracker_update_plan` should be identical on all GPUs after broadcasting
+        # 广播之后，各 GPU 上的 `tracker_update_plan` 必须完全相同。
         tracker_update_plan = {
             # pyre-fixme[61]: `new_det_fa_inds` is undefined, or not always defined.
             "new_det_fa_inds": new_det_fa_inds,  # npt.NDArray
@@ -1028,11 +1040,11 @@ class Sam3VideoBase(nn.Module):
             "reconditioned_obj_ids": reconditioned_obj_ids,  # set
         }
 
-        # Step 3 (optional): recondition masklets based on high-confidence detections before memory encoding
-        # NOTE: Running this in execution phase (after memory encoding) can lead to suboptimal results
+        # 可选步骤：在编码 memory 之前，用高置信检测重条件化 masklet。
+        # 若放到执行阶段（memory 已编码之后）再做，效果会变差。
         should_recondition_iou = False
 
-        # Evaluate tracklets for reconditioning based on bbox IoU mismatch with detections
+        # 用检测框与轨迹框的 IoU 偏差判断是否需要重条件化。
         if (
             self.reconstruction_bbox_iou_thresh > 0
             # pyre-fixme[61]: `trk_id_to_max_iou_high_conf_det` is undefined, or not
@@ -1049,16 +1061,16 @@ class Sam3VideoBase(nn.Module):
                         trk_obj_id
                     )
                 except ValueError:
-                    continue  # Skip if tracklet not found
+                    continue  # 找不到该轨迹则跳过
 
                 tracker_mask = tracker_low_res_masks_global[trk_idx]
                 mask_binary = tracker_mask > 0
                 mask_area = mask_binary.sum().item()
 
                 if mask_area == 0:
-                    continue  # Skip tracklets with zero mask area
+                    continue  # 掩码面积为零的轨迹跳过
 
-                # Get bounding box from SAM2 mask and convert to normalized coordinates
+                # 从 SAM2 掩码得到包围框，并换成归一化坐标。
                 tracker_box_pixels = (
                     mask_to_box(mask_binary.unsqueeze(0).unsqueeze(0))
                     .squeeze(0)
@@ -1075,7 +1087,7 @@ class Sam3VideoBase(nn.Module):
                     device=tracker_box_pixels.device,
                 )
 
-                # Compute IoU between detection and SAM2 tracklet bounding boxes
+                # 计算检测框与 SAM2 轨迹框的 IoU。
                 det_box_batch = det_box.unsqueeze(0)
                 tracker_box_batch = tracker_box_normalized.unsqueeze(0)
                 iou = fast_diag_box_iou(det_box_batch, tracker_box_batch)[0]
@@ -1095,7 +1107,7 @@ class Sam3VideoBase(nn.Module):
             and len(trk_id_to_max_iou_high_conf_det) > 0
         )
 
-        # Recondition if periodic or IoU condition met
+        # 满足周期条件或框 IoU 条件时执行重条件化。
         if should_recondition_periodic or should_recondition_iou:
             self._recondition_masklets(
                 frame_idx,
@@ -1108,13 +1120,12 @@ class Sam3VideoBase(nn.Module):
                 tracker_obj_scores_global,
             )
 
-        # Step 4: Run SAM2 memory encoder on the current frame's prediction masks
-        # This is done on all GPUs
+        # 用本帧预测掩码在所有 GPU 上运行 SAM2 memory encoder。
         batch_size = tracker_low_res_masks_global.size(0)
         if batch_size > 0:
             if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 if self.suppress_overlapping_based_on_recent_occlusion_threshold > 0.0:
-                    # NOTE: tracker_low_res_masks_global is updated in-place then returned
+                    # `tracker_low_res_masks_global` 会原地更新后再返回。
                     tracker_low_res_masks_global = (
                         self._suppress_overlapping_based_on_recent_occlusion(
                             frame_idx,
@@ -1141,9 +1152,9 @@ class Sam3VideoBase(nn.Module):
                 low_res_masks=tracker_low_res_masks_global,
             )
 
-        # Step 4: update the SAM2 metadata based on the update plan
-        # note: except for "rank0_metadata" (that is only available on GPU 0),
-        # the updated `tracker_metadata_new` should be identical on all GPUs
+        # 按更新计划改写 SAM2 元数据。
+        # 除仅 GPU 0 持有的 `rank0_metadata` 外，更新后的
+        # `tracker_metadata_new` 在各 GPU 上应完全相同。
         for rank in range(self.world_size):
             # pyre-fixme[61]: `new_det_obj_ids` is undefined, or not always defined.
             # pyre-fixme[61]: `new_det_gpu_ids` is undefined, or not always defined.
@@ -1172,7 +1183,7 @@ class Sam3VideoBase(nn.Module):
         tracker_metadata_new["obj_ids_all_gpu"] = np.concatenate(
             tracker_metadata_new["obj_ids_per_gpu"]
         )
-        # update object scores and the maximum object ID assigned so far
+        # 更新对象分数，以及迄今分配过的最大对象 ID。
         # pyre-fixme[61]: `new_det_obj_ids` is undefined, or not always defined.
         if len(new_det_obj_ids) > 0:
             tracker_metadata_new["obj_id_to_score"].update(
@@ -1180,7 +1191,7 @@ class Sam3VideoBase(nn.Module):
                 # pyre-fixme[61]: `new_det_fa_inds` is undefined, or not always defined.
                 zip(new_det_obj_ids, det_scores_np[new_det_fa_inds])
             )
-            # tracker scores are not available for new objects, use det score instead.
+            # 新对象还没有 tracker 分数，暂用检测分数代替。
             tracker_metadata_new["obj_id_to_tracker_score_frame_wise"][
                 frame_idx
                 # pyre-fixme[61]: `new_det_obj_ids` is undefined, or not always defined.
@@ -1191,8 +1202,7 @@ class Sam3VideoBase(nn.Module):
                 # pyre-fixme[61]: `new_det_obj_ids` is undefined, or not always defined.
                 np.max(new_det_obj_ids),
             )
-        # for removed objects, we set their scores to a very low value (-1e4) but still
-        # keep them in "obj_id_to_score" (it's easier to handle outputs this way)
+        # 被删除对象的分数设为极低值 -1e4，但仍留在 `obj_id_to_score` 里，便于后续组装输出。
         # pyrefly: ignore [not-iterable]
         for obj_id in obj_ids_newly_removed:
             tracker_metadata_new["obj_id_to_score"][obj_id] = -1e4
@@ -1200,7 +1210,7 @@ class Sam3VideoBase(nn.Module):
                 obj_id
             ] = -1e4
             tracker_metadata_new["obj_id_to_last_occluded"].pop(obj_id, None)
-        # check that "rank0_metadata" is in tracker_metadata_new if and only if it's GPU 0
+        # `rank0_metadata` 当且仅当在 GPU 0 的 `tracker_metadata_new` 中。
         assert ("rank0_metadata" in tracker_metadata_new) == (self.rank == 0)
         if self.rank == 0 and self.masklet_confirmation_enable:
             rank0_metadata = self.update_masklet_confirmation_status(
