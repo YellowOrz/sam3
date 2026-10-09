@@ -28,6 +28,7 @@
 其他目录层级保留，输入输出根目录不得相同；单视频的 ``--output-dir`` 不受此参数影响。
 整批只加载一次模型，逐个打开窗口，每个视频（或分块）使用独立 session。
 ``Q`` 完成并保存本视频后自动进入下一个；分块模式还需终端 ``ok`` 确认。
+``S`` 跳过当前整条视频且不保存本次修改，批量模式继续下一个，单视频模式直接结束。
 批量模式跳过与当前输入、提示、版本、分块设置匹配的完整成功结果；不完整或未确认的
 结果自动重新处理，无需 ``--overwrite``。完整但设置不匹配的结果仍需 ``--overwrite``。
 单视频模式已有输出仍直接报错，覆盖需 ``--overwrite``。
@@ -104,7 +105,7 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
   当前帧）启动传播。
 * 画面右侧显示键盘和鼠标按键的中文说明。
 * 只有播放和传播都暂停后才能操作视频画面或使用编辑快捷键；运行期间除
-  ``Q`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
+  ``Q``、``S`` 外的键盘输入以及视频区域鼠标输入都会被忽略。
 * 鼠标中键点击 mask 可选择对象；重叠区域从小到大循环，循环末尾取消选择；
   点击空白处也会取消选择。选中 mask 使用高亮填充和细青色轮廓。
 * ``D`` 删除当前选中的对象：从 tracker 和所有已缓存帧中去掉该实例，其他对象
@@ -127,6 +128,8 @@ CUDA 推理使用 AMP：优先 ``bfloat16``，当前 GPU 不支持时回退到 `
 * ``Q`` 只检查所有帧是否都至少处理过一次：仍有未处理帧时提示并保持窗口
   打开；全部处理过才退出并写出结果。退出不会确认未提交点或自动补传播，
   终端会打印已处理帧数和可播放范围。
+* ``S`` 可在播放或传播期间跳过当前整条视频，不检查未处理帧、不保存或复制结果；
+  加载的已有结果保持不变，新推理留下的 processing 元数据不视为完成，下次仍会重跑。
 * 每次鼠标按键点击和键盘输入都会以 ``INTERACTION`` 开头输出一行日志。
 
 输出文件
@@ -219,6 +222,7 @@ KEY_HELP = (
     ("]", "当前帧设为传播右界", "set prop window right at frame"),
     ("C", "清点（加载模式不重传）", "clear points; loaded: no propagation"),
     ("Q", "全部处理完后退出写出", "quit after all frames processed"),
+    ("S", "跳过本视频，不保存", "skip video without saving"),
     ("Enter/Space", "无操作", "no action"),
 )
 MOUSE_HELP = (
@@ -264,6 +268,10 @@ PROPAGATION_MODES = (
     "forward_backward",
     "backward_forward",
 )
+
+
+class SkipVideo(Exception):
+    """Leave the current video without publishing results."""
 
 
 @dataclass(frozen=True)
@@ -395,13 +403,13 @@ def key_help_copy(
         use_cjk = cjk_font_path() is not None
     if use_cjk:
         title = "键盘说明"
-        note = "编辑需暂停播放和传播（Q 除外）"
+        note = "编辑需暂停播放和传播（Q/S 除外）"
         rows = tuple((key, zh) for key, zh, _en in KEY_HELP)
         mouse_title = "鼠标说明"
         mouse_rows = tuple((zh_key, zh) for zh_key, zh, _en_key, _en in MOUSE_HELP)
     else:
         title = "Keyboard"
-        note = "Pause play and prop to edit (except Q)"
+        note = "Pause play and prop to edit (except Q/S)"
         rows = tuple((key, en) for key, _zh, en in KEY_HELP)
         mouse_title = "Mouse"
         mouse_rows = tuple((en_key, en) for _zh_key, _zh, en_key, en in MOUSE_HELP)
@@ -2564,6 +2572,8 @@ class InteractiveApp:
         if key_name is None:
             key_name = chr(key) if 32 <= key <= 126 else f"code-{key}"
         self.log_input("keyboard", key=key_name, key_code=key)
+        if key in (ord("s"), ord("S")):
+            raise SkipVideo
         if key in (ord("q"), ord("Q")):
             missing = self.unprocessed_frames()
             if missing:
@@ -4208,6 +4218,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     interrupted = True
                     break
                 succeeded += 1
+            except SkipVideo:
+                skipped += 1
+                print(
+                    "Skipped current video; current edits were not saved.", flush=True
+                )
             except Exception as exc:
                 failures.append((video_path, f"{type(exc).__name__}: {exc}"))
     except KeyboardInterrupt:

@@ -1862,7 +1862,7 @@ def test_checkpoints_skip_nested_recomputed_features(tmp_path, monkeypatch):
     assert state["unrelated"]["cached_features"].item() == 7
 
 
-@pytest.mark.parametrize("stop", [None, "interrupt", "unconfirmed"])
+@pytest.mark.parametrize("stop", [None, "interrupt", "unconfirmed", "skip"])
 def test_batch_reuses_model_and_reports_failures_at_end(
     tmp_path, monkeypatch, capsys, stop
 ):
@@ -1895,31 +1895,32 @@ def test_batch_reuses_model_and_reports_failures_at_end(
                 raise KeyboardInterrupt
             if stop == "unconfirmed":
                 return False
+            if stop == "skip":
+                raise qualitative.SkipVideo
             raise RuntimeError("broken video")
         return True
 
     monkeypatch.setattr(qualitative, "load_predictor", load)
     monkeypatch.setattr(qualitative, "process_interactive_video", process)
-    assert (
-        qualitative.main(
-            [
-                "--input-root",
-                str(root),
-                "--output-root",
-                str(output),
-                "--rgb-name",
-                "rgb.mkv",
-            ]
-        )
-        == 1
-    )
+    assert qualitative.main(
+        [
+            "--input-root",
+            str(root),
+            "--output-root",
+            str(output),
+            "--rgb-name",
+            "rgb.mkv",
+        ]
+    ) == (0 if stop == "skip" else 1)
     assert events == (
         ["load", "a", "b", ".", "shutdown"]
-        if stop is None
+        if stop in (None, "skip")
         else ["load", "a", "shutdown"]
     )
     report = capsys.readouterr()
     assert ("broken video" in report.err) == (stop is None)
+    if stop == "skip":
+        assert "2 succeeded, 1 skipped, 0 failed" in report.out
 
 
 @pytest.mark.parametrize(
@@ -2120,7 +2121,10 @@ def test_interrupted_overwrite_does_not_leave_success_status(tmp_path, monkeypat
     assert json.loads(metadata.read_text())["status"] == "processing"
 
 
-def test_each_video_closes_its_own_session_even_on_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError, qualitative.SkipVideo])
+def test_each_video_closes_its_own_session_even_on_failure(
+    tmp_path, monkeypatch, error
+):
     events = []
 
     class Predictor:
@@ -2136,12 +2140,12 @@ def test_each_video_closes_its_own_session_even_on_failure(tmp_path, monkeypatch
             pass
 
         def run(self):
-            raise RuntimeError("failed interaction")
+            raise error("failed interaction")
 
     monkeypatch.setattr(qualitative, "InteractiveApp", App)
     predictor = Predictor()
     for _ in range(2):
-        with pytest.raises(RuntimeError, match="failed interaction"):
+        with pytest.raises(error, match="failed interaction"):
             qualitative.run_interactive(
                 predictor,
                 "sam3",
@@ -2603,3 +2607,93 @@ def test_loaded_result_rejects_unknown_mask_label_without_writes(tmp_path):
         qualitative.load_interactive_result(app)
     assert not app.cache
     assert before == {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+
+
+@pytest.mark.parametrize("key", ["s", "S"])
+@pytest.mark.parametrize("playing", [False, True])
+def test_skip_editor_without_finalizing(tmp_path, monkeypatch, key, playing):
+    app = make_app(tmp_path)
+    app.playing = playing
+    for name in (
+        "namedWindow",
+        "setWindowTitle",
+        "setMouseCallback",
+        "destroyWindow",
+        "imshow",
+    ):
+        monkeypatch.setattr(cv2, name, lambda *args: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda *_: ord(key))
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 1)
+    monkeypatch.setattr(
+        app, "finalize", lambda: pytest.fail("must not finalize on skip")
+    )
+    with pytest.raises(qualitative.SkipVideo):
+        app.run()
+    assert not app.window_open
+    assert not app.output_dir.exists()
+
+
+@pytest.mark.parametrize("chunk_frames", [0, 100])
+def test_skip_video_does_not_publish_results(tmp_path, monkeypatch, chunk_frames):
+    app = make_app(tmp_path)
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            str(app.video_path),
+            "--output-dir",
+            str(app.output_dir),
+            "--chunk-frames",
+            str(chunk_frames),
+        ]
+    )
+    monkeypatch.setattr(qualitative, "probe_video", lambda *_: app.video_info)
+    monkeypatch.setattr(qualitative, "extract_frames", lambda *_: 203)
+    monkeypatch.setattr(qualitative, "make_chunk_frame_dir", lambda *_: None)
+    calls = []
+
+    def skip(*args, **kwargs):
+        calls.append(args)
+        raise qualitative.SkipVideo
+
+    monkeypatch.setattr(qualitative, "run_interactive", skip)
+    with pytest.raises(qualitative.SkipVideo):
+        qualitative.process_interactive_video(
+            None, args, app.video_path, app.output_dir
+        )
+    assert len(calls) == 1
+    assert (
+        json.loads((app.output_dir / "metadata.json").read_text())["status"]
+        == "processing"
+    )
+    assert not (app.output_dir / "result.mp4").exists()
+    assert not (app.output_dir / "masks.mkv").exists()
+
+
+def test_skip_stops_active_propagation(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    events = []
+
+    class Runner:
+        is_alive = True
+
+        def request_stop(self, cancel_model):
+            assert cancel_model is False
+            events.append("stop")
+
+        def join(self):
+            events.append("join")
+
+    app.runner = Runner()
+    for name in (
+        "namedWindow",
+        "setWindowTitle",
+        "setMouseCallback",
+        "imshow",
+    ):
+        monkeypatch.setattr(cv2, name, lambda *args: None)
+    monkeypatch.setattr(cv2, "destroyWindow", lambda *_: events.append("close"))
+    monkeypatch.setattr(cv2, "waitKey", lambda *_: ord("s"))
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 1)
+    with pytest.raises(qualitative.SkipVideo):
+        app.run()
+    assert events == ["stop", "join", "close"]

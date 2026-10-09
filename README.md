@@ -487,6 +487,8 @@ Complete successful outputs matching the input, prompt, model version, and chunk
 
 Add `--load-existing` in either single-video or batch mode to open complete, settings-matching saved results instead of rejecting/skipping them. It is mutually exclusive with `--overwrite`; absent results are processed normally, while incomplete or mismatched results are reported without overwriting. Loaded videos open paused, with the full-video mask-change curve and no model initialization or automatic propagation. Editing initializes the tracker at the edited frame; manual propagation stays strictly within the UI range (default: all frames), starts each direction from the same corrected mask, and preserves confirmed edit frames as conditioning anchors. This uses tracker-only inference, not fresh text detection or restored session memory. Previously chunked outputs are edited as one merged video; the full mask cache is held in RAM, so long videos require sufficient memory. Browsing and pressing `Q` leaves files unchanged; after edits, `Q` saves while discarding unconfirmed drafts. Existing instance labels are preserved. In loaded mode, `C` clears point constraints without rerunning segmentation. Saved results do not retain original probabilities or overlapping instance masks.
 
+Pressing `S` skips the entire current video without saving edits, then continues to the next batch video (or exits in single-video mode); existing loaded files remain unchanged.
+
 ## Citing SAM 3
 
 If you use SAM 3 or the SA-Co dataset in your research, please use the following BibTeX entry.
