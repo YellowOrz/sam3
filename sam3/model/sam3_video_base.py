@@ -176,8 +176,8 @@ def _associate_det_trk_compilable(
 ):
     """按掩码重合把本帧检测和已有轨迹分成新对象、失配轨迹和纠正候选。
 
-    重合矩阵形状为 ``(N, M)``，N 是检测数，M 是轨迹数。新建和失配用清零前的
-    原始重合；纠正候选和 ``im_mask`` 用清掉歧义匹配之后的矩阵。
+    重合矩阵形状为 ``(N, M)``，N 是检测数，M 是轨迹数。新建、失配和生命周期
+    匹配 ``im_mask`` 使用原始重合；只有重条件化候选使用去歧义后的矩阵。
     """
     # logits > 0 得到二值掩码；被丢弃的检测整张清零，避免参与重合。
     det_masks_binary = det_masks > 0
@@ -219,6 +219,9 @@ def _associate_det_trk_compilable(
         torch.logical_not(torch.any(intersection_metric >= iou_threshold, dim=1)),
     )
 
+    # 生命周期需要一对多匹配证据，不能被重条件化的歧义过滤抹掉。
+    im_mask = intersection_metric >= iou_threshold
+
     intersection_thresh_recond = (
         iom_thresh_recondition if use_iom_recondition else iou_thresh_recondition
     )
@@ -258,9 +261,6 @@ def _associate_det_trk_compilable(
     det_is_high_iou = (
         torch.amax(intersection_metric, dim=1) >= intersection_thresh_recond
     )
-    # 供后续“一个检测覆盖哪些轨迹”使用；歧义匹配已被置零，不会出现在这里。
-    im_mask = intersection_metric >= iou_threshold
-
     return (
         trk_is_unmatched,
         trk_is_nonempty,
@@ -989,9 +989,7 @@ class Sam3VideoBase(nn.Module):
             ), f"Manually update NUM_BROADCAST_ITEMS to be: {len(update_plan)}"
             self.broadcast_python_obj_cpu(update_plan, src=0)
         elif self.rank > 0 and self.world_size > 1:
-            update_plan = [
-                None
-            ] * NUM_BROADCAST_ITEMS  # 其他 rank 从 rank 0 接收计划
+            update_plan = [None] * NUM_BROADCAST_ITEMS  # 其他 rank 从 rank 0 接收计划
             self.broadcast_python_obj_cpu(update_plan, src=0)
             (
                 new_det_fa_inds,
