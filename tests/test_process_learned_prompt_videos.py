@@ -197,11 +197,10 @@ def test_invalid_gt(tmp_path: Path, problem: str) -> None:
     assert not (output / "comparison.mp4").exists()
 
 
-def test_cached_cli_comparison_and_failure_continuation(
+def test_cached_both_cli_comparison_and_failure_preserves_prediction(
     tmp_path: Path, monkeypatch
 ) -> None:
     import json
-    import shutil
 
     rgb, gt, output, _ = comparison_fixture(tmp_path)
     prompt = tmp_path / "prompt.pt"
@@ -212,23 +211,20 @@ def test_cached_cli_comparison_and_failure_continuation(
     monkeypatch.setattr(
         processor, "require_cuda", lambda *args: pytest.fail("loaded CUDA")
     )
-    for direction in ("forward", "backward"):
-        destination = output / direction
-        destination.mkdir()
-        shutil.copyfile(output / "masks.mkv", destination / "masks.mkv")
-        (destination / "result.mp4").touch()
-        (destination / "metadata.json").write_text(
-            json.dumps(
-                {
-                    "status": "success",
-                    "input_video": str(rgb),
-                    "prompt": "left_hand",
-                    "model_version": "sam3",
-                    "frames_processed": 7,
-                    "propagation_direction": direction,
-                }
-            )
+    (output / "result.mp4").touch()
+    (output / "metadata.json").write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "input_video": str(rgb),
+                "prompt": "left_hand",
+                "model_version": "sam3",
+                "frames_processed": 7,
+                "propagation_direction": "both",
+                "start_frame_index": 3,
+            }
         )
+    )
     args = [
         "--input-root",
         str(rgb.parent),
@@ -252,21 +248,21 @@ def test_cached_cli_comparison_and_failure_continuation(
     ]
     assert processor.main(args) == 0
     batch = json.loads((output / "gt_summary.json").read_text())
-    assert batch["directions"]["forward"]["frames_evaluated"] == 3
-    assert batch["directions"]["backward"]["pixel_iou"] == 0.5
-    original_compare = evaluation.compare_masks
+    assert batch["directions"]["both"]["frames_evaluated"] == 3
+    assert batch["directions"]["both"]["pixel_iou"] == 0.5
+    assert (output / "comparison.mp4").exists()
+    assert not (output / "forward").exists()
+    assert not (output / "backward").exists()
 
-    def fail_forward(*args):
-        if args[2].name == "forward":
-            raise ValueError("broken GT")
-        return original_compare(*args)
+    def fail_comparison(*args):
+        raise ValueError("broken GT")
 
-    monkeypatch.setattr(evaluation, "compare_masks", fail_forward)
+    monkeypatch.setattr(evaluation, "compare_masks", fail_comparison)
     assert processor.main(args) == 1
     batch = json.loads((output / "gt_summary.json").read_text())
-    assert [seq["status"] for seq in batch["sequences"]] == ["failed", "success"]
-    assert not (output / "forward" / "comparison.mp4").exists()
-    assert (output / "backward" / "comparison.mp4").exists()
+    assert [seq["status"] for seq in batch["sequences"]] == ["failed"]
+    assert not (output / "comparison.mp4").exists()
+    assert (output / "masks.mkv").exists()
 
 
 def test_inference_then_comparison(tmp_path: Path, monkeypatch) -> None:

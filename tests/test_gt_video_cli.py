@@ -118,6 +118,8 @@ def test_dataset_save_detector_cli_and_cache(tmp_path, monkeypatch):
     builds = []
 
     class Predictor:
+        model = SimpleNamespace()
+
         def handle_request(self, request):
             return {
                 "session_id": "test",
@@ -126,10 +128,11 @@ def test_dataset_save_detector_cli_and_cache(tmp_path, monkeypatch):
 
         def handle_stream_request(self, request):
             mask = np.ones((48, 64), dtype=bool)
+            start = request["start_frame_index"]
             indices = (
-                range(4)
+                range(start, 4)
                 if request["propagation_direction"] == "forward"
-                else range(3, -1, -1)
+                else range(start, -1, -1)
             )
             for index in indices:
                 yield {
@@ -200,6 +203,13 @@ def test_inference_cached_comparison_and_failure(
         gt,
         [np.zeros((48, 64), dtype=np.uint8)] + [np.ones((48, 64), dtype=np.uint8)] * 3,
     )
+    # A second sequence verifies that one failed comparison does not stop the batch.
+    second = root / "z" / "color.mp4"
+    write_video(second, [np.zeros((48, 64, 3), dtype=np.uint8)] * 4, color=True)
+    write_video(
+        second.parent / "truth" / "custom.mkv",
+        [np.zeros((48, 64), dtype=np.uint8)] + [np.ones((48, 64), dtype=np.uint8)] * 3,
+    )
     checkpoint = tmp_path / "sam3.pt"
     checkpoint.touch()
     builds = []
@@ -207,15 +217,18 @@ def test_inference_cached_comparison_and_failure(
     shutdowns = []
 
     class Predictor:
+        model = SimpleNamespace()
+
         def handle_request(self, request):
             requests.append(request)
             return {"session_id": "test"}
 
         def handle_stream_request(self, request):
+            start = request["start_frame_index"]
             indices = (
-                range(4)
+                range(start, 4)
                 if request["propagation_direction"] == "forward"
-                else range(3, -1, -1)
+                else range(start, -1, -1)
             )
             for index in indices:
                 yield {"frame_index": index, "outputs": dataset.empty_outputs()}
@@ -269,19 +282,18 @@ def test_inference_cached_comparison_and_failure(
     assert builds[0]["version"] == version
     expected_type = "add_geometry_prompts" if processor is mano else "add_prompt"
     assert sum(r["type"] == expected_type for r in requests) == 2
+    assert all(r["frame_index"] == 2 for r in requests if r["type"] == expected_type)
     summary = json.loads((output / "gt_summary.json").read_text())
-    for direction in ("forward", "backward"):
-        metrics = summary["directions"][direction]
-        assert metrics["frames_evaluated"] == 2
-        assert metrics["mean_iou"] == metrics["mean_dice"] == 0.5
-        assert (output / direction / "gt_metrics.csv").is_file()
-        assert (
-            dataset.probe_video(output / direction / "comparison.mp4")["frame_count"]
-            == 2
-        )
-    masks_before = {
-        d: (output / d / "masks.mkv").read_bytes() for d in ("forward", "backward")
-    }
+    metrics = summary["directions"]["both"]
+    assert metrics["frames_evaluated"] == 4
+    assert metrics["mean_iou"] == metrics["mean_dice"] == 0.5
+    destinations = [output, output / "z"]
+    for destination in destinations:
+        assert (destination / "gt_metrics.csv").is_file()
+        assert dataset.probe_video(destination / "comparison.mp4")["frame_count"] == 2
+        assert not (destination / "forward").exists()
+        assert not (destination / "backward").exists()
+    masks_before = {d: (d / "masks.mkv").read_bytes() for d in destinations}
     monkeypatch.setattr(
         dataset,
         "require_cuda",
@@ -292,7 +304,7 @@ def test_inference_cached_comparison_and_failure(
     original_compare = evaluation.compare_masks
 
     def fail_forward(*args):
-        if args[2].name == "forward":
+        if args[2] == output:
             raise ValueError("broken GT")
         return original_compare(*args)
 
@@ -301,12 +313,12 @@ def test_inference_cached_comparison_and_failure(
     summary = json.loads((output / "gt_summary.json").read_text())
     assert summary["status"] == "failed"
     assert [row["status"] for row in summary["sequences"]] == ["failed", "success"]
-    assert summary["directions"]["forward"]["mean_iou"] is None
-    assert not (output / "forward" / "comparison.mp4").exists()
-    assert not (output / "forward" / "gt_metrics.csv").exists()
-    assert (output / "backward" / "comparison.mp4").is_file()
-    for direction, data in masks_before.items():
-        assert (output / direction / "masks.mkv").read_bytes() == data
+    assert summary["directions"]["both"]["mean_iou"] == 0.5
+    assert not (output / "comparison.mp4").exists()
+    assert not (output / "gt_metrics.csv").exists()
+    assert (output / "z" / "comparison.mp4").is_file()
+    for destination, data in masks_before.items():
+        assert (destination / "masks.mkv").read_bytes() == data
     if processor is mano:
         records = json.loads((output / "batch_summary.json").read_text())["results"]
         assert [row["status"] for row in records] == ["failed", "skipped"]
@@ -318,9 +330,9 @@ def test_inference_cached_comparison_and_failure(
         assert processor.main(args) == 0
         summary = json.loads((output / "gt_summary.json").read_text())
         assert summary["sequences"] == []
-        assert (output / "backward" / "comparison.mp4").is_file()
+        assert (output / "z" / "comparison.mp4").is_file()
         records = json.loads((output / "batch_summary.json").read_text())["results"]
-        assert [row["status"] for row in records] == ["skipped"]
+        assert [row["status"] for row in records] == ["skipped", "skipped"]
 
 
 def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
@@ -338,6 +350,8 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
     builds = []
 
     class Predictor:
+        model = SimpleNamespace()
+
         def handle_request(self, request):
             if request["type"] == "add_geometry_prompts":
                 self.detector_only = request.get("detector_only", False)
@@ -348,10 +362,11 @@ def test_save_detector_cli_metrics_and_incomplete_cache(tmp_path, monkeypatch):
 
         def handle_stream_request(self, request):
             mask = np.ones((48, 64), dtype=bool)
+            start = request["start_frame_index"]
             indices = (
-                range(4)
+                range(start, 4)
                 if request["propagation_direction"] == "forward"
-                else range(3, -1, -1)
+                else range(start, -1, -1)
             )
             for index in indices:
                 yield {

@@ -7,6 +7,9 @@ Each video is decoded to a temporary lossless PNG directory because
 the SAM 3 image-directory loader is substantially more memory efficient than its
 direct OpenCV video loader.
 
+--direction both starts at frame_count // 2, then runs forward and backward
+in the same session and writes one chronological result (no direction subdirectories).
+
 GT evaluation: --compare-gt --gt-mask-name left_hand.mkv.
 --gt-dir-name defaults to masks_sam3; --compare-skip-frames defaults to 0.
 The GT filename must be explicit. Complete predictions can be evaluated on CPU.
@@ -117,15 +120,13 @@ def output_dir_for(video_path: Path, input_root: Path, output_root: Path) -> Pat
 
 
 def processing_directions(direction: str) -> Tuple[str, ...]:
-    return ("forward", "backward") if direction == "both" else (direction,)
+    return (direction,)
 
 
 def directional_output_dir(
     output_dir: Path, requested_direction: str, direction: str
 ) -> Path:
-    if requested_direction != "both":
-        return output_dir
-    return output_dir / direction
+    return output_dir
 
 
 def probe_video(video_path: Path) -> Dict[str, Any]:
@@ -141,6 +142,12 @@ def expected_frame_count(video_info: Dict[str, Any], max_frames: Optional[int]) 
     return min(frame_count, max_frames)
 
 
+def propagation_start_frame(frame_count: int, direction: str) -> int:
+    if direction == "both":
+        return frame_count // 2
+    return 0 if direction == "forward" else frame_count - 1
+
+
 def is_complete(
     output_dir: Path,
     video_path: Path,
@@ -152,6 +159,7 @@ def is_complete(
     save_detector: bool = False,
     detector_only: bool = False,
     clip_overseg: bool = False,
+    start_frame_index: Optional[int] = None,
 ) -> bool:
     metadata_path = output_dir / "metadata.json"
     result_path = output_dir / "result.mp4"
@@ -161,6 +169,14 @@ def is_complete(
         with metadata_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+
+    if direction == "both" and start_frame_index is None:
+        start_frame_index = propagation_start_frame(expected_frames, direction)
+    if (
+        start_frame_index is not None
+        and metadata.get("start_frame_index") != start_frame_index
+    ):
         return False
 
     if not (
@@ -406,6 +422,7 @@ def propagate_and_write(
     overlay_geometry: Optional[Dict[int, Dict[str, Any]]] = None,
     save_detector: bool = False,
     prompt_outputs: Optional[Dict[str, Any]] = None,
+    start_frame_index: Optional[int] = None,
 ) -> Dict[int, int]:
     result_writer = H264Writer(result_path, fps, (width, height))
     if not result_writer.isOpened():
@@ -442,7 +459,11 @@ def propagate_and_write(
             raise RuntimeError("cannot create detector mask or result video")
 
     object_to_label: Dict[int, int] = {}
-    prompt_frame = 0 if direction == "forward" else frame_count - 1
+    prompt_frame = (
+        propagation_start_frame(frame_count, direction)
+        if start_frame_index is None
+        else start_frame_index
+    )
     request = {
         "type": "propagate_in_video",
         "session_id": session_id,
@@ -477,23 +498,25 @@ def propagate_and_write(
         )
 
     try:
-        if direction == "backward":
+        if direction in ("backward", "both"):
             with tempfile.TemporaryDirectory(
-                prefix="sam3_backward_outputs_"
+                prefix="sam3_ordered_outputs_"
             ) as temporary:
                 output_cache = Path(temporary)
-                previous_frame_index = frame_count
-                for response in predictor.handle_stream_request(request):
-                    frame_index = int(response["frame_index"])
-                    if not 0 <= frame_index < frame_count:
-                        continue
-                    if frame_index >= previous_frame_index:
-                        raise RuntimeError(
-                            f"model returned out-of-order frame {frame_index} "
-                            "while propagating backward"
-                        )
-                    previous_frame_index = frame_index
-                    outputs = response.get("outputs", empty_outputs())
+
+                def cache_outputs(frame_index: int, outputs: Dict[str, Any]) -> None:
+                    if (
+                        save_detector
+                        and frame_index == prompt_frame
+                        and prompt_outputs is not None
+                        and outputs.get("out_detector_mask") is None
+                    ):
+                        outputs = {
+                            **outputs,
+                            "out_detector_mask": prompt_outputs.get(
+                                "out_detector_mask"
+                            ),
+                        }
                     obj_ids, probs, masks = normalize_outputs(outputs)
                     saved = {
                         "out_obj_ids": obj_ids,
@@ -505,6 +528,46 @@ def propagate_and_write(
                             outputs, height, width
                         )
                     np.savez(output_cache / f"{frame_index:06d}.npz", **saved)
+
+                if prompt_outputs is not None:
+                    cache_outputs(prompt_frame, prompt_outputs)
+                legs = ("forward", "backward") if direction == "both" else (direction,)
+                for leg in legs:
+                    if direction == "both" and leg == "backward" and prompt_frame == 0:
+                        continue
+                    # Full-video limits avoid predictor-specific anchor counting.
+                    leg_request = {**request, "propagation_direction": leg}
+                    previous_frame_index = -1 if leg == "forward" else frame_count
+                    for response in predictor.handle_stream_request(leg_request):
+                        frame_index = int(response["frame_index"])
+                        if not 0 <= frame_index < frame_count:
+                            continue
+                        in_order = (
+                            frame_index > previous_frame_index
+                            if leg == "forward"
+                            else frame_index < previous_frame_index
+                        )
+                        in_range = (
+                            frame_index >= prompt_frame
+                            if leg == "forward"
+                            else frame_index <= prompt_frame
+                        )
+                        if not in_order or not in_range:
+                            raise RuntimeError(
+                                f"model returned out-of-order frame {frame_index} "
+                                f"while propagating {leg}"
+                            )
+                        previous_frame_index = frame_index
+                        # Detector-only and some predictors also yield the reverse anchor.
+                        if (
+                            direction == "both"
+                            and leg == "backward"
+                            and frame_index == prompt_frame
+                        ):
+                            continue
+                        cache_outputs(
+                            frame_index, response.get("outputs", empty_outputs())
+                        )
 
                 for frame_index in range(frame_count):
                     cached_path = output_cache / f"{frame_index:06d}.npz"
@@ -584,11 +647,16 @@ def process_video(
     save_detector: bool = False,
     detector_only: bool = False,
     clip_overseg: bool = False,
+    start_frame_index: Optional[int] = None,
 ) -> str:
     if detector_only and (model_version != "sam3" or geometry_prompts is None):
         raise ValueError("detector-only requires SAM3 geometry prompts")
     video_info = probe_video(video_path)
     requested_frames = expected_frame_count(video_info, max_frames)
+    if start_frame_index is None:
+        start_frame_index = propagation_start_frame(requested_frames, direction)
+    if not 0 <= start_frame_index < requested_frames:
+        raise ValueError("start frame must be inside the processed video")
     if not overwrite and is_complete(
         output_dir,
         video_path,
@@ -600,6 +668,7 @@ def process_video(
         save_detector,
         detector_only,
         clip_overseg,
+        start_frame_index if direction == "both" else None,
     ):
         LOGGER.info("Skipping completed sequence: %s", video_path)
         return "skipped"
@@ -617,6 +686,7 @@ def process_video(
         "model_version": model_version,
         "detector_only": detector_only,
         "propagation_direction": direction,
+        "start_frame_index": start_frame_index,
         "clip_overseg": clip_overseg,
         "source": video_info,
         "started_at": utc_now(),
@@ -645,7 +715,7 @@ def process_video(
             session_id = session_response["session_id"]
             request = add_prompt_request(
                 session_id,
-                0 if direction == "forward" else frame_count - 1,
+                start_frame_index,
                 prompt,
                 prompt_request_type,
             )
@@ -671,9 +741,8 @@ def process_video(
                 geometry_prompts=geometry_prompts,
                 overlay_geometry=overlay_geometry,
                 save_detector=save_detector,
-                prompt_outputs=(
-                    prompt_response.get("outputs") if save_detector else None
-                ),
+                prompt_outputs=prompt_response.get("outputs"),
+                start_frame_index=start_frame_index,
             )
 
         metadata.update(

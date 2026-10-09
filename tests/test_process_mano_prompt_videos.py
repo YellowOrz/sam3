@@ -1,4 +1,5 @@
 import json
+import logging
 from types import MethodType, SimpleNamespace
 
 import cv2
@@ -645,3 +646,225 @@ def test_save_detector_writes_binary_and_reuses_prompt_frame(tmp_path):
         )
         == "skipped"
     )
+
+
+@pytest.mark.parametrize("mode", ["points", "box", "both"])
+@pytest.mark.parametrize("source", ["mesh", "joints"])
+def test_edge_start_scores_all_frames_and_adds_only_anchor_prompt(
+    tmp_path, mode, source
+):
+    # Frame 1 has the same raw box as 2, but 2 is translated toward the right edge.
+    # Frame 0 has a larger box. Frame indices in the NPZ are deliberately unsorted.
+    joints = np.zeros((3, 21, 3))
+    vertices = np.zeros((3, 778, 3))
+    for array in (joints, vertices):
+        for row, radius in enumerate((0.05, 0.3, 0.05)):
+            array[row, :, 0] = np.linspace(-radius, radius, array.shape[1])
+            array[row, :, 1] = np.linspace(-radius, radius, array.shape[1])
+    path = sample_npz(
+        tmp_path / "sample.npz",
+        joints=joints,
+        vertices=vertices,
+        has_hand=np.ones(3, dtype=bool),
+        camera_translation=np.array([[0.3, 0, 1], [0, 0, 1], [0, 0, 1]]),
+    )
+    prompts, _, metadata = mano.load_geometries(
+        [path],
+        INFO,
+        arguments(
+            "--start-from-mano-edge",
+            "--prompt-mode",
+            mode,
+            "--box-source",
+            source,
+            "--prompt-interval",
+            "3",
+            "--box-padding",
+            "5",
+        ),
+    )
+    assert metadata["start_frame_index"] == 1
+    assert metadata["start_edge_distance"] == 35.0
+    assert set(prompts) == {0, 1}
+    assert ("boxes" in prompts[1]) == (mode != "points")
+    assert ("points" in prompts[1]) == (mode != "box")
+    assert "edge_distances" not in metadata
+    assert metadata["geometry_frames"] == [0, 1]
+
+
+def test_edge_start_uses_pixels_signed_raw_boxes_and_earliest_tie(tmp_path):
+    # Both raw boxes touch/exceed the horizontal edge after padding, which must
+    # not affect the selection. Unsorted tied rows must still pick frame 0.
+    first = sample_npz(tmp_path / "first.npz")
+    _, _, metadata = mano.load_geometries(
+        [first], INFO, arguments("--start-from-mano-edge", "--box-padding", "5")
+    )
+    assert metadata["start_frame_index"] == 0
+    assert metadata["start_edge_distance"] == pytest.approx(10.0)
+    outside = sample_npz(
+        tmp_path / "outside.npz",
+        camera_translation=np.tile([0.2, 0, 1], (3, 1)),
+    )
+    _, _, metadata = mano.load_geometries(
+        [outside], INFO, arguments("--start-from-mano-edge")
+    )
+    assert metadata["start_edge_distance"] == pytest.approx(-10.0)
+
+
+def test_edge_start_multiple_boxes_uses_minimum_and_respects_max_frames(tmp_path):
+    first = sample_npz(tmp_path / "first.npz")
+    second = sample_npz(
+        tmp_path / "second.npz",
+        camera_translation=np.array([[0, 0, 1], [0.2, 0, 1], [0, 0, 1]]),
+    )
+    _, _, metadata = mano.load_geometries(
+        [first, second], INFO, arguments("--start-from-mano-edge")
+    )
+    assert metadata["start_frame_index"] == 2
+    assert metadata["start_edge_distance"] == pytest.approx(10.0)
+    _, _, metadata = mano.load_geometries(
+        [first, second], INFO, arguments("--start-from-mano-edge", "--max-frames", "2")
+    )
+    assert metadata["start_frame_index"] == 0
+    assert metadata["start_edge_distance"] == pytest.approx(-10.0)
+
+
+def test_edge_start_without_valid_box_warns_and_falls_back(tmp_path, caplog):
+    path = sample_npz(tmp_path / "empty.npz", has_hand=np.zeros(3, dtype=bool))
+    with caplog.at_level(logging.WARNING):
+        prompts, _, metadata = mano.load_geometries(
+            [path], INFO, arguments("--start-from-mano-edge")
+        )
+    assert prompts == {}
+    assert metadata["start_frame_index"] == 0
+    assert metadata["start_edge_distance"] is None
+    assert "No valid MANO box" in caplog.text
+    assert arguments().start_from_mano_edge is False
+
+
+@pytest.mark.parametrize("prompt_type", ["text", "learned", "geometry"])
+def test_both_process_initializes_once_at_middle_and_reuses_complete_result(
+    tmp_path, prompt_type
+):
+    video = tmp_path / "color.mp4"
+    make_video(video)
+    output = tmp_path / "out"
+
+    class Predictor:
+        def __init__(self):
+            self.requests = []
+
+        def handle_request(self, request):
+            self.requests.append(request)
+            return {"session_id": "s", "outputs": dataset.empty_outputs()}
+
+        def handle_stream_request(self, request):
+            self.requests.append(request)
+            indices = (1, 2) if request["propagation_direction"] == "forward" else (0,)
+            for index in indices:
+                yield {"frame_index": index, "outputs": dataset.empty_outputs()}
+
+    predictor = Predictor()
+    options = (
+        {"geometry_prompts": {1: {"points": [[0.5, 0.5]]}}}
+        if prompt_type == "geometry"
+        else {"prompt_request_type": prompt_type}
+    )
+
+    def run():
+        return dataset.process_video(
+            predictor,
+            video,
+            output,
+            tmp_path,
+            "hand",
+            "sam3",
+            None,
+            False,
+            "both",
+            **options,
+        )
+
+    assert run() == "success"
+    assert [r["type"] for r in predictor.requests] == [
+        "start_session",
+        {
+            "text": "add_prompt",
+            "learned": "add_learned_prompt",
+            "geometry": "add_geometry_prompts",
+        }[prompt_type],
+        "propagate_in_video",
+        "propagate_in_video",
+        "close_session",
+    ]
+    assert predictor.requests[1]["frame_index"] == 1
+    assert all(r["session_id"] == "s" for r in predictor.requests[1:])
+    data = json.loads((output / "metadata.json").read_text())
+    assert data["start_frame_index"] == 1
+    assert data["propagation_direction"] == "both"
+    assert dataset.probe_video(output / "masks.mkv")["frame_count"] == 3
+    assert run() == "skipped"
+    data["start_frame_index"] = 0
+    (output / "metadata.json").write_text(json.dumps(data))
+    assert run() == "success"
+
+
+def test_edge_start_non_square_image_uses_pixel_not_normalized_distance(tmp_path):
+    vertices = np.zeros((3, 778, 3))
+    # Frame 0: nearest edge is 10 px vertically; frame 2: 12 px horizontally.
+    # Normalized min distances would rank them in the opposite order.
+    for row, (rx, ry) in enumerate(((0.38, 0.2), (0.3, 0.3), (0.3, 0.3))):
+        vertices[row, :, 0] = np.linspace(-rx, rx, 778)
+        vertices[row, :, 1] = np.linspace(-ry, ry, 778)
+    path = sample_npz(tmp_path / "sample.npz", vertices=vertices)
+    _, _, metadata = mano.load_geometries(
+        [path], INFO, arguments("--start-from-mano-edge")
+    )
+    assert metadata["start_frame_index"] == 2
+    assert metadata["start_edge_distance"] == pytest.approx(12)
+
+
+def test_edge_start_cli_overrides_direction_and_passes_selected_anchor(
+    tmp_path, monkeypatch
+):
+    make_video(tmp_path / "color.mp4")
+    sample_npz(tmp_path / "MANO_wilor/left_hand/sample.npz")
+    checkpoint = tmp_path / "sam3.pt"
+    checkpoint.touch()
+    output = tmp_path / "output"
+    calls = []
+
+    def process(*args, **kwargs):
+        calls.append((args, kwargs))
+        assert args[2] == output
+        assert args[8] == "both"
+        assert kwargs["start_frame_index"] == 0
+        assert kwargs["extra_metadata"]["mano"]["start_from_mano_edge"] is True
+        return "success"
+
+    monkeypatch.setattr(dataset, "process_video", process)
+    assert (
+        mano.main(
+            [
+                "--input-root",
+                str(tmp_path),
+                "--output-root",
+                str(output),
+                "--checkpoint",
+                str(checkpoint),
+                "--text-prompt",
+                "left hand",
+                "--hand-side",
+                "left",
+                "--focal-length",
+                "100",
+                "--direction",
+                "backward",
+                "--start-from-mano-edge",
+            ]
+        )
+        == 0
+    )
+    assert len(calls) == 1
+    records = json.loads((output / "batch_summary.json").read_text())["results"]
+    assert records[0]["direction"] == "both"

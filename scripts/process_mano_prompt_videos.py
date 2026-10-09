@@ -8,7 +8,8 @@ MANO 文件位于视频同级 <mano-dir-name>/<left|right>_hand/*.npz，默认�
 同一帧多个 NPZ 的框和点全部送入同一检测查询。缺失帧退回文本和已有 memory（禁用文本时仅跟踪已有对象）；
 缺少指定手的 NPZ 时跳过视频，任一文件无效时记录失败并继续批次。
 输出：masks.mkv（全部实例、FFV1）、result.mp4（预测叠加、MANO 骨架、实际 prompts）、metadata.json；
-批次汇总写入 batch_summary.json。双向模式分别写 forward/、backward/，均正序播放。
+批次汇总写入 batch_summary.json。双向模式从
+中间帧初始化，在同一 session 中先正向、再反向传播，合为一套正序结果，不创建方向子目录。
 result.mp4 与 comparison 第一列在任一 NPZ 有手的帧上画全部在屏关节和骨架，不受 prompt-interval 限制。
 
 命令行参数：
@@ -19,6 +20,12 @@ result.mp4 与 comparison 第一列在任一 NPZ 有手的帧上画全部在屏�
   --prompt-mode：points / box / both，默认 both。
   --box-source：mesh / joints，默认 mesh；--box-padding：每侧扩张比例，默认 0.05。
   --prompt-interval：提示帧间隔，正整数，默认 1。
+  --start-from-mano-edge：默认关闭；开启后覆盖 --direction，计算每个有效帧原始 MANO
+      box 到四条图像边缘的最小像素距离（不 padding、不裁剪，越界为负）。多个 NPZ
+      取最小距离；选最大距离帧，同分选最早帧，在同一 session 中从该帧双向传播。
+      评分不受 prompt-mode/prompt-interval 限制，采用 box-source 指定的几何。
+      如起点不是间隔提示帧，额外补一次当前模式的提示，其余提示帧不变。
+      整段无有效 box 时 warning 并从第 0 帧开始；metadata 记录起点及距离。
   --mano-dir-name：视频同级的 MANO 目录名，默认 MANO_wilor。
   --focal-length：原图像素单位焦距，默认 5000 / 256 * max(width, height)。
       投影为 p_cam = joints/vertices + camera_translation，uv = f*xy/z + [W/2,H/2]；
@@ -149,7 +156,8 @@ def load_geometry(
     need_points = args.prompt_mode in ("points", "both")
     need_boxes = args.prompt_mode in ("box", "both")
     sources = {"joints"}
-    if need_boxes and args.box_source == "mesh":
+    select_start = args.start_from_mano_edge
+    if (need_boxes or select_start) and args.box_source == "mesh":
         sources.add("vertices")
     with np.load(path, allow_pickle=False) as data:
         required = {
@@ -201,6 +209,7 @@ def load_geometry(
     prompts: Dict[int, Dict[str, Any]] = {}
     overlay: Dict[int, List[Any]] = {}
     available = set()
+    edge_distances = {}
     for row, raw_index in enumerate(indices):
         frame_index = int(raw_index)
         if frame_index >= frame_count or not present[row]:
@@ -215,14 +224,14 @@ def load_geometry(
             overlay.setdefault(frame_index, []).append(
                 (onscreen / [width, height]).tolist()
             )
-        if frame_index % args.prompt_interval:
+        if not select_start and frame_index % args.prompt_interval:
             continue
         geometry: Dict[str, Any] = {}
         if need_points:
             xy = onscreen[np.isfinite(onscreen).all(axis=-1)]
             if len(xy):
                 geometry["points"] = (xy / [width, height]).tolist()
-        if need_boxes:
+        if need_boxes or select_start:
             if args.box_source == "mesh":
                 xy = project_points(
                     coordinates["vertices"][row],
@@ -235,10 +244,14 @@ def load_geometry(
                 xy = all_xy[np.isfinite(all_xy).all(axis=-1)]
             if len(xy):
                 lower, upper = xy.min(axis=0), xy.max(axis=0)
+                if select_start and (upper > lower).all():
+                    edge_distances[frame_index] = float(
+                        min(lower[0], lower[1], width - upper[0], height - upper[1])
+                    )
                 padding = (upper - lower) * args.box_padding
                 lower = np.clip(lower - padding, 0, [width, height])
                 upper = np.clip(upper + padding, 0, [width, height])
-                if (upper > lower).all():
+                if need_boxes and (upper > lower).all():
                     geometry["boxes"] = [
                         np.concatenate(
                             (lower / [width, height], (upper - lower) / [width, height])
@@ -267,6 +280,8 @@ def load_geometry(
             t for t in available if t % args.prompt_interval == 0 and t not in prompts
         ),
     }
+    if select_start:
+        metadata["edge_distances"] = edge_distances
     return prompts, overlay, metadata
 
 
@@ -279,6 +294,7 @@ def load_geometries(
     available = set()
     missing = None
     metadata = None
+    edge_distances = {}
     frame_count = (
         dataset.expected_frame_count(info, args.max_frames)
         if "frame_count" in info
@@ -286,6 +302,8 @@ def load_geometries(
     )
     for path in paths:
         file_prompts, file_overlay, metadata = load_geometry(path, info, args)
+        for index, distance in metadata.pop("edge_distances", {}).items():
+            edge_distances[index] = min(edge_distances.get(index, distance), distance)
         files.append(
             {
                 "path": metadata.get("path", str(path)),
@@ -307,6 +325,24 @@ def load_geometries(
             overlay.setdefault(frame_index, []).extend(hands)
     if metadata is None:
         raise FileNotFoundError("no MANO NPZ")
+    if args.start_from_mano_edge:
+        if edge_distances:
+            start_frame = max(sorted(edge_distances), key=edge_distances.get)
+        else:
+            LOGGER.warning(
+                "No valid MANO box; starting bidirectional propagation at frame 0"
+            )
+            start_frame = 0
+        prompts = {
+            index: geometry
+            for index, geometry in prompts.items()
+            if index % args.prompt_interval == 0 or index == start_frame
+        }
+        metadata.update(
+            start_from_mano_edge=True,
+            start_frame_index=start_frame,
+            start_edge_distance=edge_distances.get(start_frame),
+        )
     metadata = {
         **metadata,
         "files": files,
@@ -368,6 +404,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--box-padding", type=nonnegative_float, default=0.05)
     parser.add_argument("--prompt-interval", type=dataset.positive_int, default=1)
     parser.add_argument(
+        "--start-from-mano-edge",
+        action="store_true",
+        help=(
+            "Start bidirectional propagation at the frame whose raw MANO boxes "
+            "are farthest from the nearest image edge (pixels); overrides --direction"
+        ),
+    )
+    parser.add_argument(
         "--mano-dir-name",
         type=file_name,
         default="MANO_wilor",
@@ -390,6 +434,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.start_from_mano_edge:
+        args.direction = "both"
     dataset.validate_gt_arguments(parser, args)
     args.prompt = args.prompt.strip()
     if args.prompt == "visual":
@@ -504,6 +550,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             save_detector=args.save_detector,
                             detector_only=args.detector_only,
                             clip_overseg=args.clip_overseg,
+                            start_frame_index=metadata.get("start_frame_index"),
                         )
                         comparison.compare(video, destination, direction, visualization)
                     except Exception as exc:

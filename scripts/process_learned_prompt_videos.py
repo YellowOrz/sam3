@@ -19,8 +19,9 @@
     --target-id ID
         目标标识；默认从特征文件读取，显式指定时必须与文件中的 ID 一致。
     --direction {forward,backward,both}
-        传播方向；默认 forward。both 独立执行正反向传播，分别输出到
-        forward/ 和 backward/；结果视频与对比视频均按原始时间顺序播放。
+        传播方向；默认 forward。both 从 frame_count // 2 帧初始化，在同一
+        session 中先正向、再反向传播，合为一套结果，不创建方向子目录。
+        结果视频与对比视频均按原始时间顺序播放。
     --device cuda:N
         推理使用的 CUDA 设备；默认 cuda:0，cuda 等同于 cuda:0。
     --max-sequences N

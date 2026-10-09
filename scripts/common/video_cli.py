@@ -37,7 +37,7 @@ def add_video_arguments(
         "--direction",
         choices=["forward", "backward", "both"],
         default="forward",
-        help="Propagation/playback direction; both writes forward/ and backward/",
+        help="Propagation direction; both starts at the middle frame, runs forward then backward in one session, and writes one chronological result",
     )
     run.add_argument("--max-sequences", type=positive_int)
     run.add_argument("--max-frames", type=positive_int)

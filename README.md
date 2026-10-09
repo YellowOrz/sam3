@@ -181,6 +181,19 @@ Remove `--list-only` to segment. `--prompt-mode points|box|both` selects joint p
 
 Add `--detector-only` to skip tracker propagation, association, and memory updates, including on the initial prompt frame. The main `masks.mkv` then stores the per-frame detector union (background 0, foreground 1), with no persistent instance IDs; `result.mp4` and GT evaluation use this same union. Missing geometry falls back to text detection; frames with neither text nor geometry are empty. `--save-detector` remains supported and writes the same mask content as an additional detector output. The full model weights are still loaded. Forward/backward modes retain their output ordering, but no temporal information is used. Metadata distinguishes detector-only and tracked predictions, so changing the mode reruns inference; use separate output directories to retain both experiments.
 
+### Bidirectional propagation for batch video scripts
+
+All three batch scripts support `--direction both`: initialize at frame `frame_count // 2` (within `--max-frames`), then propagate forward and backward from that same frame in the same session, matching ordinary online editing in `qualitative_test_interactive.py`. They write one chronological `masks.mkv` / `result.mp4` pair directly in the sequence output directory, not separate `forward/` and `backward/` results. The two directions share inference state; this is not isolated-memory fusion or loaded-mask tracker-only propagation. `forward` still starts at frame 0 and `backward` at the last frame. Existing direction subdirectories are neither reused nor deleted.
+
+For MANO, add `--start-from-mano-edge` to choose the start automatically and force bidirectional propagation, overriding `--direction`. Every valid MANO frame is scored by the minimum pixel distance from its raw projected box to the four image edges, using `--box-source` without padding or clipping (offscreen boxes have negative distances). For multiple NPZ boxes, use the minimum score; choose the earliest frame tied for the highest score. Scoring works in points-only mode and ignores `--prompt-interval`. If needed, only the selected start gets an extra prompt in the current prompt mode; all other scheduled prompts stay unchanged. With no valid box, log a warning and start at frame 0. Metadata records the strategy, start frame and score, and incompatible cached results are rerun.
+
+```bash
+python scripts/process_mano_prompt_videos.py \
+    --input-root DATA --output-root OUT \
+    --text-prompt "left hand" --hand-side left \
+    --start-from-mano-edge --checkpoint /path/to/sam3.pt --device cuda:0
+```
+
 ### GT evaluation for video scripts
 
 `process_learned_prompt_videos.py`, `process_mano_prompt_videos.py`, and `process_dataset_videos.py` share the same GT options. Append these to any of their normal commands:
@@ -191,7 +204,7 @@ Add `--detector-only` to skip tracker propagation, association, and memory updat
 
 Evaluation is off by default. With `--compare-gt`, `--gt-mask-name` is required for all three scripts; it is never inferred from the text prompt, learned target ID, or hand side. GT is read from `<RGB video directory>/<gt-dir-name>/<gt-mask-name>`; the directory defaults to `masks_sam3`. Both names must be single names, not paths or globs. `--compare-skip-frames` defaults to 0; 2 evaluates frames 0, 3, 6, … without changing inference.
 
-GT must be an aligned uint8 grayscale label video matching the full RGB dimensions, FPS, and frame count. All nonzero labels form one foreground mask. Each prediction directory gains `comparison.mp4` (RGB / prediction / GT), `gt_metrics.csv`, and `gt_metrics.json`; the output root gains `gt_summary.json`, with separate forward/backward metrics. IoU and Dice include frame means and aggregate pixel scores. Both masks empty scores 1; no successful frames yields null metrics. MANO's existing `batch_summary.json` is also retained.
+GT must be an aligned uint8 grayscale label video matching the full RGB dimensions, FPS, and frame count. All nonzero labels form one foreground mask. Each prediction directory gains `comparison.mp4` (RGB / prediction / GT), `gt_metrics.csv`, and `gt_metrics.json`; the output root gains `gt_summary.json`, with metrics grouped by the requested propagation mode (`forward`, `backward`, or the merged `both`). IoU and Dice include frame means and aggregate pixel scores. Both masks empty scores 1; no successful frames yields null metrics. MANO's existing `batch_summary.json` is also retained.
 
 Complete predictions can be evaluated again without loading a model or requiring CUDA. Existing input checks still apply: checkpoint paths must exist, learned prompts must be valid, and MANO inputs/configuration must match cached metadata. Comparisons are regenerated each run; `--overwrite` also reruns inference. Invalid or missing GT records a failure, clears stale comparison video/CSV, preserves predictions, and allows remaining sequences to run; the command exits nonzero. See [the evaluation details](docs/learned_prompt_training.md) for sampling and metric aggregation.
 

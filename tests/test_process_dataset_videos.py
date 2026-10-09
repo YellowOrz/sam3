@@ -29,16 +29,10 @@ def test_direct_color_video_uses_output_root_directly(tmp_path: Path) -> None:
     assert processor.output_dir_for(video, input_root, output_root) == output_root
 
 
-def test_both_directions_get_independent_output_directories(tmp_path: Path) -> None:
+def test_both_directions_share_one_output_directory(tmp_path: Path) -> None:
     output = tmp_path / "output"
-
     assert processor.directional_output_dir(output, "forward", "forward") == output
-    assert processor.directional_output_dir(output, "both", "forward") == (
-        output / "forward"
-    )
-    assert processor.directional_output_dir(output, "both", "backward") == (
-        output / "backward"
-    )
+    assert processor.directional_output_dir(output, "both", "both") == output
 
 
 def test_clip_overseg_is_opt_in() -> None:
@@ -55,10 +49,7 @@ def test_direction_choices_and_expansion() -> None:
     parser = processor.build_parser()
     args = parser.parse_args(["--text-prompt", "hand", "--direction", "both"])
 
-    assert processor.processing_directions(args.direction) == (
-        "forward",
-        "backward",
-    )
+    assert processor.processing_directions(args.direction) == ("both",)
     with pytest.raises(SystemExit):
         parser.parse_args(["--text-prompt", "hand", "--direction", "sideways"])
 
@@ -153,3 +144,159 @@ def test_list_only_accepts_single_sequence_directory(tmp_path: Path, capsys) -> 
         == 0
     )
     assert capsys.readouterr().out.strip() == "color.mp4"
+
+
+@pytest.mark.parametrize("start", [0, 2, 4])
+@pytest.mark.parametrize("reverse_anchor", [False, True])
+def test_both_propagation_uses_same_session_and_anchor_and_writes_once(
+    tmp_path, monkeypatch, start, reverse_anchor
+):
+    class Writer:
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Predictor:
+        def __init__(self):
+            self.requests = []
+
+        def handle_stream_request(self, request):
+            self.requests.append(request)
+            if request["propagation_direction"] == "forward":
+                indices = range(start, 5)
+            else:
+                indices = range(start if reverse_anchor else start - 1, -1, -1)
+            for index in indices:
+                yield {"frame_index": index, "outputs": processor.empty_outputs()}
+
+    written = []
+    monkeypatch.setattr(processor.cv2, "VideoWriter", lambda *a, **kw: Writer())
+    monkeypatch.setattr(processor, "H264Writer", lambda *a, **kw: Writer())
+    monkeypatch.setattr(
+        processor, "write_frame_outputs", lambda *a, **kw: written.append(a[3])
+    )
+    predictor = Predictor()
+    processor.propagate_and_write(
+        predictor,
+        "session",
+        tmp_path,
+        tmp_path / "masks.mkv",
+        tmp_path / "result.mp4",
+        5,
+        16,
+        12,
+        10.0,
+        "hand",
+        "both",
+        start_frame_index=start,
+        prompt_outputs=processor.empty_outputs(),
+    )
+    assert written == list(range(5))
+    assert [r["propagation_direction"] for r in predictor.requests] == (
+        ["forward"] if start == 0 else ["forward", "backward"]
+    )
+    for request in predictor.requests:
+        assert request["session_id"] == "session"
+        assert request["start_frame_index"] == start
+        assert request["max_frame_num_to_track"] == 5
+
+
+@pytest.mark.parametrize(
+    "direction, expected", [("forward", 0), ("backward", 4), ("both", 2)]
+)
+def test_default_propagation_start(direction, expected):
+    assert processor.propagation_start_frame(5, direction) == expected
+    assert processor.propagation_start_frame(1, direction) == 0
+
+
+def test_both_cache_preserves_side_masks_anchor_and_detector_fallback(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+
+    class Writer:
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    def outputs(value, detector=False):
+        result = {
+            "out_obj_ids": np.array([7]),
+            "out_probs": np.array([0.9]),
+            "out_binary_masks": np.full((1, 12, 16), value, dtype=np.uint8),
+        }
+        if detector:
+            result["out_detector_mask"] = np.ones((12, 16), dtype=bool)
+        return result
+
+    class Predictor:
+        def handle_stream_request(self, request):
+            if request["propagation_direction"] == "forward":
+                yield {"frame_index": 1, "outputs": outputs(1)}
+                yield {"frame_index": 2, "outputs": outputs(2)}
+            else:
+                yield {"frame_index": 1, "outputs": outputs(9)}
+                yield {"frame_index": 0, "outputs": outputs(3)}
+
+    written = {}
+    monkeypatch.setattr(processor.cv2, "VideoWriter", lambda *a, **kw: Writer())
+    monkeypatch.setattr(processor, "H264Writer", lambda *a, **kw: Writer())
+    monkeypatch.setattr(
+        processor, "write_frame_outputs", lambda *a, **kw: written.update({a[3]: a[4]})
+    )
+    processor.propagate_and_write(
+        Predictor(),
+        "session",
+        tmp_path,
+        tmp_path / "masks.mkv",
+        tmp_path / "result.mp4",
+        3,
+        16,
+        12,
+        10.0,
+        "hand",
+        "both",
+        save_detector=True,
+        prompt_outputs=outputs(1, detector=True),
+    )
+    assert list(written) == [0, 1, 2]
+    assert [int(written[i]["out_binary_masks"][0, 0, 0]) for i in range(3)] == [3, 1, 2]
+    assert written[1]["out_detector_mask"].all()
+    assert all(written[i]["out_obj_ids"].tolist() == [7] for i in range(3))
+
+
+@pytest.mark.parametrize("leg, indices", [("forward", [2, 1]), ("backward", [0, 1])])
+def test_both_rejects_out_of_order_frames(tmp_path, monkeypatch, leg, indices):
+    class Writer:
+        def isOpened(self):
+            return True
+
+        def release(self):
+            pass
+
+    class Predictor:
+        def handle_stream_request(self, request):
+            if request["propagation_direction"] == leg:
+                for index in indices:
+                    yield {"frame_index": index, "outputs": processor.empty_outputs()}
+
+    monkeypatch.setattr(processor.cv2, "VideoWriter", lambda *a, **kw: Writer())
+    monkeypatch.setattr(processor, "H264Writer", lambda *a, **kw: Writer())
+    with pytest.raises(RuntimeError, match="out-of-order"):
+        processor.propagate_and_write(
+            Predictor(),
+            "session",
+            tmp_path,
+            tmp_path / "masks.mkv",
+            tmp_path / "result.mp4",
+            3,
+            16,
+            12,
+            10.0,
+            "hand",
+            "both",
+        )

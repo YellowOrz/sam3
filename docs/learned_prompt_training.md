@@ -176,7 +176,7 @@ python scripts/process_learned_prompt_videos.py \
     --device cuda:0
 ```
 
-省略 `--target-id` 时从特征文件读取；传入的 ID 必须与文件一致。`--direction both` 的独立正反向输出与 `process_dataset_videos.py` 相同。
+省略 `--target-id` 时从特征文件读取；传入的 ID 必须与文件一致。`--direction both` 与 `process_dataset_videos.py` 相同：从 `frame_count // 2` 帧初始化，在同一 session 中先正向、再反向传播，合为一套正序结果；两方向共享推理状态，不是独立 memory 融合。
 
 用 `--rgb-name` 选择递归查找的 RGB 文件名，默认 `color.mp4`；例如另一类数据使用 `--rgb-name rgb.mkv`。文件名与 GT 目录名参数只接受单个名称，不接受路径或通配符。建议先加 `--list-only` 核对输入。
 
@@ -206,7 +206,7 @@ python scripts/process_learned_prompt_videos.py \
 - `gt_metrics.csv`：逐采样帧的 IoU、Dice、交集和双方前景像素数。
 - `gt_metrics.json`：该视频的逐帧均值 `mean_iou` / `mean_dice`、累计像素指标 `pixel_iou` / `pixel_dice`、采样设置及来源。
 
-输出根目录的 `gt_summary.json` 汇总本次选中序列，正反向分别统计；逐帧均值按所有成功序列的采样帧平均，累计像素指标先汇总交集和前景像素再计算。双方均为空时两项指标均为 1，仅一方为空时均为 0；没有成功评测帧的汇总指标为 `null`。`--direction both` 将对比产物分别放在 `forward/`、`backward/`，视频均按原始时间顺序播放。
+输出根目录的 `gt_summary.json` 汇总本次选中序列，按传播模式 `forward`、`backward` 或合并后的 `both` 统计；逐帧均值按所有成功序列的采样帧平均，累计像素指标先汇总交集和前景像素再计算。双方均为空时两项指标均为 1，仅一方为空时均为 0；没有成功评测帧的汇总指标为 `null`。`--direction both` 将合并后的预测和对比产物放在序列输出目录，不创建方向子目录；视频均按原始时间顺序播放。旧 `forward/`、`backward/` 结果不复用也不删除。
 
 已有符合当前目标、方向及帧数设置的完整预测时，直接读取 `masks.mkv` 补做对比，无需加载模型或使用 CUDA；仍需提供有效的特征文件和基础 checkpoint 路径。对比每次重新生成；`--overwrite` 会同时重新执行预测。更换同一目标的训练特征或基础 checkpoint 后，应使用新的输出目录或 `--overwrite`，已有预测完成检查不会校验权重内容。
 
