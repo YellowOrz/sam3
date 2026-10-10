@@ -34,14 +34,29 @@
 单视频模式已有输出仍直接报错，覆盖需 ``--overwrite``。
 
 ``--load-existing`` 在单视频和批量模式下加载完整、设置匹配的已有结果，
-与 ``--overwrite`` 互斥；无结果的视频仍正常推理，有残缺或不匹配结果则报错保护文件。
+与 ``--overwrite`` 互斥。批量模式先跳过 output 中完整、成功且设置匹配的结果，
+即使传入 ``--load-existing`` 或 ``--existing-mask-dir`` 也跳过，便于中断后续审；
+input 侧预分割结果不会因此被跳过，仍需加载审查。若要重新审查已完成输出，用单视频模式。
+未完成的序列优先从目标输出目录加载；目标无结果时，再从输入侧按同样的
+``<去掉末尾 raw 的视频相对目录>/<output-subdir>/<提示词目录>`` 查找。
+输入侧兼容 ``raw`` 上级及 RGB 文件同级目录：也查找 ``raw/<output-subdir>/<提示词目录>``。
+单视频采用同样的查找规则。批量推理的三文件结果可加载，缺少交互日志时视为无人工交互；
+交互脚本自身的结果仍要求完整交互日志，不能把缺失日志当作正常。
+所有候选目录都无结果时，会打印查找路径再正常推理；有残缺或不匹配结果则立即报错保护文件。
+显式传 ``--existing-mask-dir DIR``（需同时传 ``--load-existing``）时，只从每个 RGB 文件
+所在目录的 ``DIR/<提示词目录>`` 读取，不再优先读 output 或猜测 ``raw`` 上级目录；
+``DIR`` 是无 ``..`` 的非空相对路径，与输出目录设置独立。显式目录缺失、结果残缺或设置
+不匹配时立即报错且不启动模型、不自动推理；输入原结果及已有输出文件仍受保护。
 加载时暂停播放、不启动模型或传播，进度条下显示从全视频标签掩码重算的突变曲线。
 首次编辑只在编辑帧初始化 tracker；手动传播严格遵守当前范围（默认全视频），
 双向各自从同一修正帧初始化，经过其他已确认修正帧时使用其掩码作为新条件。
 这条路径仅推进已有实例的 tracker，不重新执行文本检测，也不恢复旧 session 的 memory；
 保存文件不含原始概率或重叠实例信息。原先分块生成的结果按合并后的全视频编辑，
 全视频掩码会载入内存，长视频需要足够 RAM。
-仅浏览后按 ``Q`` 退出不改写文件；修改后 ``Q`` 保存，未确认草稿会取消。
+从输出目录加载时，仅浏览后按 ``Q`` 不改写文件；从输入侧加载时，审查完成按 ``Q``
+会将原结果文件复制到输出目录（无修改时不重新编码、不运行模型；三文件批量结果另生成
+空的 ``interactions.json``），有修改则在输出目录
+保存编辑后的结果，输入侧原结果不变。未确认草稿会取消，关闭窗口或 Ctrl+C 不复制/保存。
 加载模式的 ``C`` 仅清除点约束，保留掩码且不自动重传；保存时保留已有标签编号。
 
 
@@ -2906,6 +2921,7 @@ class LoadedInteractiveApp(InteractiveApp):
         super().__init__(*args, **kwargs)
         self.predictor = LoadedMaskPredictor(self, get_predictor)
         self.runner.predictor = self.predictor
+        self.loaded_result_dir: Optional[Path] = None
         self.loaded_metadata: Dict[str, Any] = {}
         self.loaded_labels: Dict[int, int] = {}
         self.loaded_points: Dict[int, Dict[str, Any]] = {}
@@ -2984,8 +3000,16 @@ class LoadedInteractiveApp(InteractiveApp):
     def finalize(self) -> None:
         self.stop_propagation()
         self.cancel_edit()
+        separate_output = (
+            self.loaded_result_dir is not None
+            and self.loaded_result_dir.resolve() != self.output_dir.resolve()
+        )
+        if separate_output:
+            validate_interactive_outputs(self.output_dir, overwrite=False)
         if self.dirty:
             super().finalize()
+        elif separate_output:
+            copy_interactive_outputs(self.loaded_result_dir, self.output_dir)
         else:
             print("Loaded result inspected; existing files left unchanged.")
 
@@ -3202,6 +3226,60 @@ def validate_interactive_outputs(output_dir: Path, overwrite: bool) -> None:
             "output already exists (use --overwrite): "
             + ", ".join(str(path) for path in existing)
         )
+
+
+def read_saved_interactions(
+    result_dir: Path, metadata: Dict[str, Any]
+) -> Dict[str, Any]:
+    path = result_dir / "interactions.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    # Batch inference has no click log; a missing interactive-session log is an error.
+    if (
+        "input_relative_path" not in metadata
+        or "original_object_id_to_object_id" in metadata
+        or "chunks" in metadata
+    ):
+        raise ValueError(f"missing interaction log: {path}")
+    return {
+        **{
+            key: metadata.get(key)
+            for key in ("status", "input_video", "model_version", "source", "outputs")
+        },
+        "text_prompt": metadata.get("prompt"),
+        "propagation_direction": metadata.get("propagation_direction", "forward"),
+        "confirmed_points": [],
+        "events": [],
+    }
+
+
+def copy_interactive_outputs(source_dir: Path, output_dir: Path) -> None:
+    """Publish a byte-for-byte reviewed copy without overwriting existing files."""
+    validate_interactive_outputs(output_dir, overwrite=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    names = ("result.mp4", "masks.mkv", "interactions.json", "metadata.json")
+    with tempfile.TemporaryDirectory(prefix=".review-copy-", dir=output_dir) as temp:
+        staged = Path(temp)
+        for name in names:
+            if name == "interactions.json" and not (source_dir / name).exists():
+                metadata = json.loads((source_dir / "metadata.json").read_text())
+                atomic_write_json(
+                    staged / name, read_saved_interactions(source_dir, metadata)
+                )
+            else:
+                shutil.copy2(source_dir / name, staged / name)
+        published = []
+        try:
+            # Stage on the destination filesystem; exclusive links publish metadata last.
+            for name in names:
+                target = output_dir / name
+                os.link(staged / name, target)
+                published.append(target)
+        except BaseException:
+            for target in published:
+                target.unlink()
+            raise
+    print(f"Reviewed results copied from {source_dir} to {output_dir}")
 
 
 def remap_chunk_interaction(
@@ -3708,7 +3786,7 @@ def output_subdir(value: str) -> Path:
     path = Path(value)
     if not value.strip() or path.is_absolute() or not path.parts or ".." in path.parts:
         raise argparse.ArgumentTypeError(
-            "output subdir must be a nonempty relative path without '..'"
+            "directory must be a nonempty relative path without '..'"
         )
     return path
 
@@ -3747,7 +3825,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("masks_sam3"),
         help="Batch output subdirectory after removing a trailing raw directory "
         "(default: masks_sam3), followed by the text prompt with spaces replaced "
-        "by underscores; ignored with --video",
+        "by underscores; also locates input-side saved results unless "
+        "--existing-mask-dir is supplied; "
+        "does not change --video's output directory",
     )
     existing = parser.add_mutually_exclusive_group()
     existing.add_argument(
@@ -3756,7 +3836,14 @@ def build_parser() -> argparse.ArgumentParser:
     existing.add_argument(
         "--load-existing",
         action="store_true",
-        help="Open saved masks without automatic propagation (single or batch)",
+        help="Load masks for review; batch mode still skips complete matching outputs",
+    )
+    parser.add_argument(
+        "--existing-mask-dir",
+        type=output_subdir,
+        metavar="DIR",
+        help="With --load-existing, read only DIR/<prompt> beside each RGB video; "
+        "missing or invalid results are errors, never fresh inference",
     )
     parser.add_argument(
         "--window-width",
@@ -3792,8 +3879,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def load_interactive_result(app: LoadedInteractiveApp) -> None:
     """Decode every label frame before any model initialization or output writes."""
-    metadata = json.loads((app.output_dir / "metadata.json").read_text())
-    interactions = json.loads((app.output_dir / "interactions.json").read_text())
+    result_dir = app.loaded_result_dir or app.output_dir
+    metadata = json.loads((result_dir / "metadata.json").read_text())
+    interactions = read_saved_interactions(result_dir, metadata)
     labels = {
         int(obj): int(label) for obj, label in metadata["object_id_to_label"].items()
     }
@@ -3801,7 +3889,7 @@ def load_interactive_result(app: LoadedInteractiveApp) -> None:
         set(labels.values())
     ) != len(labels):
         raise ValueError("invalid or duplicate instance label mapping")
-    capture = cv2.VideoCapture(str(app.output_dir / "masks.mkv"))
+    capture = cv2.VideoCapture(str(result_dir / "masks.mkv"))
     # ponytail: full-video mask cache; use a disk-backed cache if long clips exceed RAM.
     cache = {}
     try:
@@ -3875,13 +3963,21 @@ def load_interactive_result(app: LoadedInteractiveApp) -> None:
 
 
 def process_loaded_interactive_video(
-    get_predictor: Any, args: argparse.Namespace, video_path: Path, output_dir: Path
+    get_predictor: Any,
+    args: argparse.Namespace,
+    video_path: Path,
+    output_dir: Path,
+    result_dir: Optional[Path] = None,
 ) -> bool:
-    if not completed_interactive_video(output_dir, video_path, args):
+    result_dir = result_dir or output_dir
+    if result_dir.resolve() != output_dir.resolve():
+        validate_interactive_outputs(output_dir, overwrite=False)
+    if not completed_interactive_video(result_dir, video_path, args):
         raise RuntimeError(
-            "saved result is incomplete, invalid, or settings do not match; "
+            f"saved result in {result_dir} is incomplete, invalid, or settings do not match; "
             "files left unchanged (use --overwrite separately to rerun)"
         )
+    print(f"Loading saved results from {result_dir}")
     info = probe_video(video_path)
     with tempfile.TemporaryDirectory(prefix="sam3_loaded_frames_") as temp:
         frame_dir = Path(temp) / "frames"
@@ -3903,6 +3999,7 @@ def process_loaded_interactive_video(
             clip_overseg=args.clip_overseg,
             get_predictor=get_predictor,
         )
+        app.loaded_result_dir = result_dir
         load_interactive_result(app)
         try:
             app.run()
@@ -4041,12 +4138,11 @@ def completed_interactive_video(
                 "result.mp4",
                 "masks.mkv",
                 "metadata.json",
-                "interactions.json",
             )
         ):
             return False
         metadata = json.loads((output_dir / "metadata.json").read_text())
-        interactions = json.loads((output_dir / "interactions.json").read_text())
+        interactions = read_saved_interactions(output_dir, metadata)
         source = probe_video(video_path)
         if not (
             metadata.get("status") == interactions.get("status") == "success"
@@ -4117,6 +4213,8 @@ def _interactive_output_is_protected(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.existing_mask_dir is not None and not args.load_existing:
+        parser.error("--existing-mask-dir requires --load-existing")
     if args.clip_overseg and args.version != "sam3":
         parser.error("--clip-overseg requires --version sam3")
     batch = args.input_root is not None
@@ -4139,6 +4237,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except (argparse.ArgumentTypeError, ValueError) as exc:
             parser.error(f"text prompt cannot be used as an output directory: {exc}")
         jobs = []
+        source_results = {}
         destinations = set()
         for video in videos:
             relative_dir = video.parent.relative_to(input_root)
@@ -4151,6 +4250,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             destinations.add(destination)
             jobs.append((video, destination))
+            source_results[video] = (
+                input_root / relative_dir / args.output_subdir / prompt_dir,
+                video.parent / args.output_subdir / prompt_dir,
+            )
     else:
         if args.output_dir is None:
             parser.error("--video requires --output-dir")
@@ -4164,6 +4267,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except RuntimeError as exc:
             parser.error(str(exc))
         jobs = [(video_path, output_dir)]
+        source_results = {video_path: (output_dir,)}
+        if args.load_existing:
+            try:
+                prompt_dir = file_name(args.text_prompt.replace(" ", "_"))
+                if "\0" in prompt_dir:
+                    raise ValueError("prompt contains a null character")
+            except (argparse.ArgumentTypeError, ValueError) as exc:
+                if args.existing_mask_dir is not None:
+                    parser.error(
+                        f"text prompt cannot be used as a mask directory: {exc}"
+                    )
+                # Single-video prompts without an explicit mask directory stay unrestricted.
+            else:
+                parent = video_path.parent
+                if parent.name == "raw":
+                    parent = parent.parent
+                source_results[video_path] = (
+                    parent / args.output_subdir / prompt_dir,
+                    video_path.parent / args.output_subdir / prompt_dir,
+                )
     checkpoint = expand_path(args.checkpoint) if args.checkpoint else None
     if checkpoint is not None and not checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {checkpoint}")
@@ -4184,22 +4307,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for index, (video_path, output_dir) in enumerate(jobs, 1):
             print(f"[{index}/{len(jobs)}] {video_path} -> {output_dir}")
             try:
-                if args.load_existing and any(
-                    (output_dir / name).exists()
-                    for name in (
-                        "result.mp4",
-                        "masks.mkv",
-                        "metadata.json",
-                        "interactions.json",
-                    )
-                ):
-                    if not process_loaded_interactive_video(
-                        get_predictor, args, video_path, output_dir
-                    ):
-                        interrupted = True
-                        break
-                    succeeded += 1
-                    continue
                 if (
                     batch
                     and not args.overwrite
@@ -4208,6 +4315,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     skipped += 1
                     print("Skipping completed video")
                     continue
+                if args.load_existing:
+                    if args.existing_mask_dir is not None:
+                        result_dir = (
+                            video_path.parent / args.existing_mask_dir / prompt_dir
+                        )
+                    else:
+                        result_dir = next(
+                            (
+                                candidate
+                                for candidate in (
+                                    output_dir,
+                                    *source_results[video_path],
+                                )
+                                if any(
+                                    (candidate / name).exists()
+                                    for name in (
+                                        "result.mp4",
+                                        "masks.mkv",
+                                        "metadata.json",
+                                        "interactions.json",
+                                    )
+                                )
+                            ),
+                            None,
+                        )
+                    if result_dir is not None:
+                        kwargs = (
+                            {"result_dir": result_dir}
+                            if result_dir != output_dir
+                            else {}
+                        )
+                        if not process_loaded_interactive_video(
+                            get_predictor, args, video_path, output_dir, **kwargs
+                        ):
+                            interrupted = True
+                            break
+                        succeeded += 1
+                        continue
+                    print(
+                        "No saved results found; starting new segmentation. Searched: "
+                        + ", ".join(
+                            str(path)
+                            for path in (output_dir, *source_results[video_path])
+                        ),
+                        flush=True,
+                    )
                 if _interactive_output_is_protected(
                     output_dir, video_path, args, batch
                 ):
@@ -4224,7 +4377,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "Skipped current video; current edits were not saved.", flush=True
                 )
             except Exception as exc:
-                failures.append((video_path, f"{type(exc).__name__}: {exc}"))
+                error = f"{type(exc).__name__}: {exc}"
+                failures.append((video_path, error))
+                print(f"FAILED {video_path}: {error}", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         interrupted = True
     finally:

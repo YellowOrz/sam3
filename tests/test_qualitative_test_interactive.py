@@ -1863,7 +1863,7 @@ def test_checkpoints_skip_nested_recomputed_features(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("stop", [None, "interrupt", "unconfirmed", "skip"])
-def test_batch_reuses_model_and_reports_failures_at_end(
+def test_batch_reuses_model_and_reports_failures_immediately(
     tmp_path, monkeypatch, capsys, stop
 ):
     root, output = tmp_path / "input", tmp_path / "output"
@@ -1888,7 +1888,10 @@ def test_batch_reuses_model_and_reports_failures_at_end(
             destination
             == output / video.parent.relative_to(root) / "masks_sam3" / "circle"
         )
-        assert "FAILED" not in capsys.readouterr().err
+        error = capsys.readouterr().err
+        assert ("broken video" in error) == (
+            stop is None and video.parent == root / "b"
+        )
         events.append(video.parent.relative_to(root).as_posix())
         if video.parent == root / "a":
             if stop == "interrupt":
@@ -2607,6 +2610,526 @@ def test_loaded_result_rejects_unknown_mask_label_without_writes(tmp_path):
         qualitative.load_interactive_result(app)
     assert not app.cache
     assert before == {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("source_inside_raw", [False, True])
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_load_existing_finds_input_side_results(
+    tmp_path, monkeypatch, batch, target_exists, source_inside_raw
+):
+    root = tmp_path / "data"
+    raw = root / "session" / "raw"
+    raw.mkdir(parents=True)
+    video = raw / "rgb.mkv"
+    video.touch()
+    source_parent = raw if source_inside_raw else root / "session"
+    source = source_parent / "masks_sam3" / "green_object"
+    source.mkdir(parents=True)
+    (source / "metadata.json").write_text("{}")
+    output_root = tmp_path / "reviewed"
+    target = (
+        output_root / "session" / "masks_sam3" / "green_object"
+        if batch
+        else output_root
+    )
+    if target_exists:
+        target.mkdir(parents=True)
+        (target / "metadata.json").write_text("{}")
+    visited = []
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *a: pytest.fail("unexpected inference")
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_loaded_interactive_video",
+        lambda factory, args, path, out, **kw: visited.append(
+            (path, out, kw.get("result_dir", out))
+        )
+        or True,
+    )
+    argv = (
+        [
+            "--input-root",
+            str(root),
+            "--output-root",
+            str(output_root),
+            "--rgb-name",
+            "rgb.mkv",
+        ]
+        if batch
+        else ["--video", str(video), "--output-dir", str(output_root)]
+    )
+    assert (
+        qualitative.main([*argv, "--text-prompt", "green object", "--load-existing"])
+        == 0
+    )
+    assert visited == [(video, target, target if target_exists else source)]
+
+
+@pytest.mark.parametrize("action", ["unchanged", "edited", "interrupted", "skipped"])
+def test_review_input_results_publishes_only_on_completion(
+    tmp_path, monkeypatch, action
+):
+    import shutil
+
+    original = make_app(tmp_path)
+    mask = np.zeros((8, 10), dtype=bool)
+    mask[:, :4] = True
+    original.cache = {frame: {7: mask} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    shutil.copy2(original.output_dir / "result.mp4", original.video_path)
+    before = {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+    target = tmp_path / "reviewed"
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            str(original.video_path),
+            "--output-dir",
+            str(target),
+            "--version",
+            original.version,
+            "--text-prompt",
+            original.prompt,
+            "--load-existing",
+        ]
+    )
+
+    def review(app):
+        assert app.loaded_result_dir == original.output_dir
+        assert app.output_dir == target
+        assert len(app.cache) == 3
+        assert not target.exists()
+        if action == "interrupted":
+            raise KeyboardInterrupt("window closed")
+        if action == "skipped":
+            app.store_masks(1, {0: ~mask}, {})
+            app.dirty = True
+            app.handle_key(ord("s"))
+        if action == "edited":
+            app.store_masks(1, {0: ~mask}, {})
+            app.dirty = True
+        app.finalize()
+
+    monkeypatch.setattr(qualitative.LoadedInteractiveApp, "run", review)
+    factory = lambda: pytest.fail("unexpected model load")
+    if action in ("interrupted", "skipped"):
+        error = KeyboardInterrupt if action == "interrupted" else qualitative.SkipVideo
+        with pytest.raises(error):
+            qualitative.process_loaded_interactive_video(
+                factory,
+                args,
+                original.video_path,
+                target,
+                result_dir=original.output_dir,
+            )
+        assert not target.exists()
+    else:
+        assert qualitative.process_loaded_interactive_video(
+            factory, args, original.video_path, target, result_dir=original.output_dir
+        )
+        assert qualitative.completed_interactive_video(
+            target, original.video_path, args
+        )
+        if action == "unchanged":
+            assert before == {p.name: p.read_bytes() for p in target.iterdir()}
+        else:
+            cap = cv2.VideoCapture(str(target / "masks.mkv"))
+            try:
+                assert cap.read()[0]
+                ok, changed = cap.read()
+                assert ok
+                assert np.array_equal(changed[:, :, 0], (~mask).astype(np.uint8))
+            finally:
+                cap.release()
+    assert before == {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+
+
+@pytest.mark.parametrize("failure", ["copy", "publish"])
+def test_review_copy_failure_leaves_no_partial_result(tmp_path, monkeypatch, failure):
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    names = ("result.mp4", "masks.mkv", "interactions.json", "metadata.json")
+    for name in names:
+        (source / name).write_bytes(name.encode())
+    copy = qualitative.shutil.copy2
+    link = qualitative.os.link
+
+    def fail_copy(src, dest):
+        if src.name == "interactions.json":
+            raise OSError("copy failed")
+        return copy(src, dest)
+
+    def fail_link(src, dest):
+        if dest.name == "metadata.json":
+            raise OSError("publish failed")
+        return link(src, dest)
+
+    monkeypatch.setattr(
+        qualitative.shutil, "copy2", fail_copy if failure == "copy" else copy
+    )
+    monkeypatch.setattr(
+        qualitative.os, "link", fail_link if failure == "publish" else link
+    )
+    with pytest.raises(OSError):
+        qualitative.copy_interactive_outputs(source, target)
+    assert not list(target.iterdir())
+    assert all((source / name).read_bytes() == name.encode() for name in names)
+
+
+def test_review_copy_protects_existing_destination(tmp_path):
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    (target / "masks.mkv").write_bytes(b"keep")
+    with pytest.raises(RuntimeError, match="output already exists"):
+        qualitative.copy_interactive_outputs(source, target)
+    assert (target / "masks.mkv").read_bytes() == b"keep"
+
+
+def test_review_three_file_dataset_result_without_inference(tmp_path, monkeypatch):
+    import shutil
+
+    original = make_app(tmp_path)
+    mask = np.ones((8, 10), dtype=bool)
+    original.cache = {frame: {0: mask.copy()} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    shutil.copy2(original.output_dir / "result.mp4", original.video_path)
+    path = original.output_dir / "metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata.pop("original_object_id_to_object_id")
+    metadata["input_relative_path"] = "input.mp4"
+    metadata["detector_only"] = False
+    path.write_text(json.dumps(metadata))
+    (original.output_dir / "interactions.json").unlink()
+    before = {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+    target = tmp_path / "reviewed"
+    args = qualitative.build_parser().parse_args(
+        [
+            "--video",
+            str(original.video_path),
+            "--output-dir",
+            str(target),
+            "--version",
+            original.version,
+            "--text-prompt",
+            original.prompt,
+            "--load-existing",
+        ]
+    )
+    assert qualitative.completed_interactive_video(
+        original.output_dir, original.video_path, args
+    )
+
+    def review(app):
+        assert len(app.cache) == 3
+        assert app.confirmed_points == []
+        assert app.cached_mutation_series() == [(1, 0.0), (2, 0.0)]
+        app.finalize()
+
+    monkeypatch.setattr(qualitative.LoadedInteractiveApp, "run", review)
+    assert qualitative.process_loaded_interactive_video(
+        lambda: pytest.fail("model initialized"),
+        args,
+        original.video_path,
+        target,
+        result_dir=original.output_dir,
+    )
+    assert before == {p.name: p.read_bytes() for p in original.output_dir.iterdir()}
+    assert all((target / name).read_bytes() == value for name, value in before.items())
+    interactions = json.loads((target / "interactions.json").read_text())
+    assert interactions["status"] == "success"
+    assert interactions["confirmed_points"] == interactions["events"] == []
+    assert qualitative.completed_interactive_video(target, original.video_path, args)
+
+
+def test_missing_interactive_log_is_not_treated_as_no_interactions(tmp_path):
+    original = make_app(tmp_path)
+    original.cache = {frame: {0: np.ones((8, 10), dtype=bool)} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    (original.output_dir / "interactions.json").unlink()
+    metadata = json.loads((original.output_dir / "metadata.json").read_text())
+    with pytest.raises(ValueError, match="missing interaction log"):
+        qualitative.read_saved_interactions(original.output_dir, metadata)
+
+
+@pytest.mark.parametrize(
+    "directory", ["", ".", "../masks", "/tmp/masks", "masks/../other"]
+)
+def test_existing_mask_dir_rejects_unsafe_paths(directory):
+    with pytest.raises(SystemExit):
+        qualitative.build_parser().parse_args(
+            [
+                "--video",
+                "in.mp4",
+                "--output-dir",
+                "out",
+                "--load-existing",
+                "--existing-mask-dir",
+                directory,
+            ]
+        )
+
+
+def test_existing_mask_dir_requires_load_existing():
+    with pytest.raises(SystemExit):
+        qualitative.main(
+            [
+                "--video",
+                "in.mp4",
+                "--output-dir",
+                "out",
+                "--existing-mask-dir",
+                "masks_sam3",
+            ]
+        )
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_explicit_existing_mask_dir_is_relative_to_rgb_not_output(
+    tmp_path, monkeypatch, batch
+):
+    root = tmp_path / "input"
+    raw = root / "session" / "raw"
+    raw.mkdir(parents=True)
+    video = raw / "rgb.mkv"
+    video.touch()
+    source = raw / "source_masks" / "green_object"
+    source.mkdir(parents=True)
+    (source / "metadata.json").write_text("{}")
+    out_root = tmp_path / "reviewed"
+    target = (
+        out_root / "session" / "review_masks" / "green_object" if batch else out_root
+    )
+    target.mkdir(parents=True)
+    (target / "metadata.json").write_text("{}")
+    visited = []
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *a: pytest.fail("model initialized")
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_loaded_interactive_video",
+        lambda factory, args, path, out, **kw: visited.append(
+            (path, out, kw.get("result_dir", out))
+        )
+        or True,
+    )
+    argv = (
+        [
+            "--input-root",
+            str(root),
+            "--output-root",
+            str(out_root),
+            "--rgb-name",
+            "rgb.mkv",
+        ]
+        if batch
+        else ["--video", str(video), "--output-dir", str(out_root)]
+    )
+    assert (
+        qualitative.main(
+            [
+                *argv,
+                "--text-prompt",
+                "green object",
+                "--output-subdir",
+                "review_masks",
+                "--load-existing",
+                "--existing-mask-dir",
+                "source_masks",
+            ]
+        )
+        == 0
+    )
+    assert visited == [(video, target, source)]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_explicit_missing_or_partial_masks_never_start_inference(
+    tmp_path, monkeypatch, capsys, batch, partial
+):
+    root = tmp_path / "input"
+    raw = root / "session" / "raw"
+    raw.mkdir(parents=True)
+    video = raw / "rgb.mkv"
+    video.touch()
+    source = raw / "source_masks" / "green_object"
+    if partial:
+        source.mkdir(parents=True)
+        (source / "metadata.json").write_text('{"status":"processing"}')
+    target = tmp_path / "out"
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *a: pytest.fail("model initialized")
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_interactive_video",
+        lambda *a: pytest.fail("fresh inference"),
+    )
+    monkeypatch.setattr(
+        qualitative, "extract_frames", lambda *a: pytest.fail("frames extracted")
+    )
+    argv = (
+        [
+            "--input-root",
+            str(root),
+            "--output-root",
+            str(target),
+            "--rgb-name",
+            "rgb.mkv",
+        ]
+        if batch
+        else ["--video", str(video), "--output-dir", str(target)]
+    )
+    assert (
+        qualitative.main(
+            [
+                *argv,
+                "--text-prompt",
+                "green object",
+                "--load-existing",
+                "--existing-mask-dir",
+                "source_masks",
+            ]
+        )
+        == 1
+    )
+    output = capsys.readouterr()
+    assert str(source) in output.err
+    assert "starting new segmentation" not in output.out
+    assert not target.exists()
+    if partial:
+        assert (source / "metadata.json").read_text() == '{"status":"processing"}'
+
+
+def test_explicit_mask_dir_rejects_single_video_prompt_traversal(tmp_path):
+    video = tmp_path / "video.mp4"
+    video.touch()
+    with pytest.raises(SystemExit):
+        qualitative.main(
+            [
+                "--video",
+                str(video),
+                "--output-dir",
+                str(tmp_path / "out"),
+                "--text-prompt",
+                "../green",
+                "--load-existing",
+                "--existing-mask-dir",
+                "masks_sam3",
+            ]
+        )
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("explicit_masks", [False, True])
+def test_load_existing_batch_skips_completed_output_but_single_reopens(
+    tmp_path, monkeypatch, capsys, batch, explicit_masks
+):
+    import shutil
+
+    root = tmp_path / "input"
+    raw = root / "raw"
+    raw.mkdir(parents=True)
+    video = raw / "rgb.mkv"
+    out_root = tmp_path / "reviewed"
+    target = out_root / "masks_sam3" / "hand"
+    original = make_app(tmp_path)
+    original.video_path = video
+    original.output_dir = target
+    original.cache = {frame: {0: np.ones((8, 10), dtype=bool)} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    shutil.copy2(target / "result.mp4", video)
+    source = raw / "masks_sam3" / "hand"
+    if not batch:
+        shutil.copytree(target, source)
+    before = {p.name: p.read_bytes() for p in target.iterdir()}
+    visited = []
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *a: pytest.fail("model loaded")
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_interactive_video",
+        lambda *a: pytest.fail("fresh inference"),
+    )
+    monkeypatch.setattr(
+        qualitative,
+        "process_loaded_interactive_video",
+        lambda factory, args, path, out, **kw: visited.append(kw.get("result_dir", out))
+        or True,
+    )
+    argv = (
+        [
+            "--input-root",
+            str(root),
+            "--output-root",
+            str(out_root),
+            "--rgb-name",
+            "rgb.mkv",
+        ]
+        if batch
+        else ["--video", str(video), "--output-dir", str(target)]
+    )
+    if explicit_masks:
+        argv += ["--existing-mask-dir", "masks_sam3"]
+    assert (
+        qualitative.main(
+            [
+                *argv,
+                "--load-existing",
+                "--version",
+                original.version,
+                "--text-prompt",
+                "hand",
+            ]
+        )
+        == 0
+    )
+    assert visited == ([] if batch else [source if explicit_masks else target])
+    log = capsys.readouterr().out
+    assert ("Skipping completed video" in log) == batch
+    assert before == {p.name: p.read_bytes() for p in target.iterdir()}
+
+
+@pytest.mark.parametrize("status", ["processing", "unconfirmed"])
+def test_load_existing_batch_does_not_skip_incomplete_output(
+    tmp_path, monkeypatch, capsys, status
+):
+    root = tmp_path / "input"
+    root.mkdir()
+    video = root / "rgb.mkv"
+    video.touch()
+    out_root = tmp_path / "reviewed"
+    target = out_root / "masks_sam3" / "hand"
+    target.mkdir(parents=True)
+    metadata = json.dumps({"status": status})
+    (target / "metadata.json").write_text(metadata)
+    monkeypatch.setattr(
+        qualitative, "load_predictor", lambda *a: pytest.fail("model loaded")
+    )
+    assert (
+        qualitative.main(
+            [
+                "--input-root",
+                str(root),
+                "--output-root",
+                str(out_root),
+                "--rgb-name",
+                "rgb.mkv",
+                "--load-existing",
+                "--text-prompt",
+                "hand",
+            ]
+        )
+        == 1
+    )
+    log = capsys.readouterr()
+    assert "Skipping completed video" not in log.out
+    assert "incomplete" in log.err
+    assert (target / "metadata.json").read_text() == metadata
 
 
 @pytest.mark.parametrize("key", ["s", "S"])
