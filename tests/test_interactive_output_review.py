@@ -34,6 +34,7 @@ def make_outputs(tmp_path, ids=(0, 2), frame_count=2):
         probability_cache={},
         prompt="hand",
         version="sam3",
+        clip_overseg=False,
         initial_propagation_mode="forward",
         confirmed_points=(
             [qualitative.PointEdit(1, 0, ids[-1], 40, 40, 1)] if ids else []
@@ -66,6 +67,7 @@ def read_masks(directory):
 def test_compaction_updates_export_without_mutating_tracker_cache(tmp_path):
     app = make_outputs(tmp_path)
     metadata = read_json(app.output_dir)
+    assert metadata["clip_overseg"] is app.clip_overseg is False
     assert metadata["original_object_id_to_object_id"] == {"0": 0, "2": 1}
     assert metadata["object_id_to_label"] == {"0": 1, "1": 2}
     assert list(app.cache[0]) == [0, 2]

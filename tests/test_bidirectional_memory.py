@@ -198,6 +198,7 @@ def test_normal_sam3_frame_does_not_enter_memory_capture(monkeypatch):
         {"obj_id_to_tracker_score_frame_wise": {0: {}}},
         {},
         None,
+        {},
     )
     state = {
         "input_batch": None,
