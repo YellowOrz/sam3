@@ -28,7 +28,7 @@ def test_shared_gt_arguments(processor, required, capsys):
     parser = processor.build_parser()
     defaults = parser.parse_args(required)
     if processor in (dataset, mano):
-        assert defaults.prompt == "hand"
+        assert defaults.prompt == (["hand"] if processor is dataset else "hand")
         with pytest.raises(SystemExit):
             parser.parse_args([*required, "--prompt", "hand"])
     assert (

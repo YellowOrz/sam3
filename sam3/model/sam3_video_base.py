@@ -637,6 +637,7 @@ class Sam3VideoBase(nn.Module):
         reverse: bool,
         allow_new_detections: bool,
         prepare_tracker_features: bool = True,
+        return_by_prompt: bool = False,
     ):
         """! @brief 计算当前帧的文本条件检测结果，并缓存 tracker 所需视觉特征。
 
@@ -649,6 +650,13 @@ class Sam3VideoBase(nn.Module):
         这是检测器唯一的逐帧入口：同一次 detector 前向还返回 SAM 2 tracker
         使用的 FPN 特征，避免对图像 backbone 重复计算。
         """
+        batched_detection = feature_cache.pop("batched_detection", None)
+        if batched_detection is not None:
+            cached_frame, det_out = batched_detection
+            if cached_frame != frame_idx:
+                raise RuntimeError("batched detection frame does not match tracker")
+            return det_out
+
         # 文本在同一会话中通常不变；仅在提示改动后重新编码并替换缓存。
         text_batch_key = tuple(input_batch.find_text_batch)
         if "text" not in feature_cache or text_batch_key not in feature_cache["text"]:
@@ -706,11 +714,21 @@ class Sam3VideoBase(nn.Module):
         pred_masks = sam3_image_out["pred_masks"]
         # get the positive detection outputs above threshold
         pos_pred_idx = torch.where(pred_probs > self.score_threshold_detection)
-        det_out = {
-            "bbox": pred_boxes_xyxy[pos_pred_idx[0], pos_pred_idx[1]],
-            "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
-            "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
-        }
+        if return_by_prompt:
+            det_out = [
+                {
+                    "bbox": pred_boxes_xyxy[i, pos_pred_idx[1][pos_pred_idx[0] == i]],
+                    "mask": pred_masks[i, pos_pred_idx[1][pos_pred_idx[0] == i]],
+                    "scores": pred_probs[i, pos_pred_idx[1][pos_pred_idx[0] == i]],
+                }
+                for i in range(pred_probs.shape[0])
+            ]
+        else:
+            det_out = {
+                "bbox": pred_boxes_xyxy[pos_pred_idx[0], pos_pred_idx[1]],
+                "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
+                "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
+            }
 
         if not prepare_tracker_features:
             return det_out

@@ -27,6 +27,8 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
     该类负责构建处于 eval 模式的 ``Sam3VideoInference``，继承的基类负责将
     外部请求路由到模型。实际的逐帧检测、关联与跟踪在 ``self.model`` 内执行。
+    ``add_text_prompts`` 使用 ``texts`` 列表初始化独立文本任务，随后
+    ``propagate_in_video_batch`` 返回按文本输入顺序排列的逐帧输出列表。
     """
 
     def __init__(
@@ -73,6 +75,14 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
     @torch.inference_mode()
     def handle_request(self, request):
+        if request["type"] == "add_text_prompts":
+            session = self._get_session(request["session_id"])
+            self._extend_expiration_time(session)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                frame_idx, outputs = self.model.add_text_prompts(
+                    session["state"], request["frame_index"], request["texts"]
+                )
+            return {"frame_index": frame_idx, "outputs": outputs}
         if request["type"] == "add_geometry_prompts":
             if not isinstance(request["geometry_prompts"], dict):
                 raise ValueError("geometry_prompts must map frame indices to prompts")
@@ -127,6 +137,28 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             is_user_action=is_user_action,
         )
         return {"is_success": True}
+
+    @torch.inference_mode()
+    def handle_stream_request(self, request):
+        if request["type"] != "propagate_in_video_batch":
+            yield from super().handle_stream_request(request)
+            return
+        direction = request.get("propagation_direction", "both")
+        if direction not in ("forward", "backward", "both"):
+            raise ValueError("invalid propagation direction")
+        session = self._get_session(request["session_id"])
+        self._extend_expiration_time(session)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for reverse in (
+                (False, True) if direction == "both" else (direction == "backward",)
+            ):
+                for frame_idx, outputs in self.model.propagate_in_video_batch(
+                    session["state"],
+                    request.get("start_frame_index"),
+                    request.get("max_frame_num_to_track"),
+                    reverse=reverse,
+                ):
+                    yield {"frame_index": frame_idx, "outputs": outputs}
 
     def begin_memory_capture(self, session_id, directory):
         """Opt in to CPU/disk snapshots of standard SAM3 source memories."""

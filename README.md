@@ -166,6 +166,23 @@ output = response["outputs"]
 
 `process_dataset_videos.py`, `process_mano_prompt_videos.py`, and `process_learned_prompt_videos.py` share argument definitions in `scripts/common/video_cli.py`. Their help groups data input/output, batch execution, model loading, and GT evaluation. All three recursively find `--rgb-name` (default `color.mp4`) in the input root and its subdirectories, and preserve relative directories in the output. Input and output roots must differ, including when using `--list-only`. Output defaults remain `~/sam3_outputs` for dataset/MANO and `~/sam3_learned_outputs` for learned prompts. MANO's `--list-only` additionally validates MANO files, projections, and missing frames; model and prompt-specific validation stays with each processor.
 
+### Multi-text video segmentation (SAM3)
+
+`process_dataset_videos.py` accepts multiple quoted values after `--text-prompt`. SAM 3 runs a real batch of text-conditioned detector queries over shared per-frame image backbone/FPN features. Each text retains independent tracking memory, object IDs, detection association/NMS and outputs; resolution, detection frequency, propagation direction and `--clip-overseg` behavior are unchanged. SAM 3.1 continues to accept a single text only.
+
+```bash
+python scripts/process_dataset_videos.py \
+    --input-root DATA --output-root OUT --version sam3 \
+    --text-prompt "left hand" "right hand" --direction both \
+    --checkpoint /path/to/sam3.pt --device cuda:0
+```
+
+For multiple texts, results are stored under `OUT/left_hand/<video-relative-directory>/` and `OUT/right_hand/<video-relative-directory>/`, each containing `masks.mkv`, `result.mp4` and `metadata.json`, plus separate detector videos when `--save-detector` is enabled. Single-text commands retain their existing output layout and cache behavior. Prompt directory names replace runs of non-word characters (except hyphens) with underscores and trim edge underscores; invalid or colliding names fail before processing. Resolved output directories must be distinct and cannot contain input video directories; generated output artifacts cannot be symlinks. Exact duplicate prompts are removed in input order. Complete results are skipped per text, and only incomplete/mismatched tasks are inferred; an all-cached run loads no model. Cache matching retains the existing checkpoint/input identity rules; use `--overwrite` after changing weights or replacing same-path input videos. Counts in the multi-text log refer to video/text tasks, while `--max-sequences` still limits input videos.
+
+`--compare-gt --gt-mask-name NAME` evaluates every text against the same explicitly selected GT file, with separate per-text comparisons and `OUT/<prompt-directory>/gt_summary.json`. This is appropriate for alternative descriptions of the same target, **not** for separately evaluating left/right hands against a GT containing only one hand. Evaluation treats all nonzero GT labels as foreground; it does not select labels by text. Per-text GT mapping is not supported.
+
+Batching eliminates repeated image-backbone computation, but text-conditioned detector computation and each text's tracking memory remain separate. Peak GPU memory can increase; out-of-memory errors are reported without automatic splitting or serial fallback, and the batch continues with the next video. Multi-text runs temporarily cache per-text predictions on disk before writing final videos; reserve disk space for all active texts. Backward and bidirectional results are merged chronologically. Regenerated multi-text predictions invalidate previous per-video GT metrics and, when GT is disabled, the old per-text GT summary. Actual speedup depends on texts, objects and hardware; no fixed speedup is guaranteed.
+
 ### MANO-guided video segmentation (SAM3)
 
 [`process_mano_prompt_videos.py`](scripts/process_mano_prompt_videos.py) processes `color.mp4` files using MANO detector geometry and a text prompt. Pass `--text-prompt ""` to disable text and use geometry alone; frames without geometry only track existing objects. Each video reads all `*.npz` files under `MANO_wilor/<left|right>_hand/` (override the directory with `--mano-dir-name NAME`) and feeds every file's boxes/points into one detector query. Videos missing the requested hand directory or NPZ file are skipped without inference or GT evaluation; any invalid NPZ still fails. Check inputs first:

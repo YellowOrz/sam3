@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Run SAM 3/3.1 text-prompted video segmentation over RGB video sequences.
 
+SAM 3 accepts multiple quoted --text-prompt values, batches their detector
+queries over shared image features, and tracks each text independently.
+Multiple texts write OUTPUT_ROOT/<prompt_directory>/<relative_video_directory>;
+single-text output paths are unchanged. SAM 3.1 accepts one text only.
+
 The input root and all subdirectories are searched for ``--rgb-name``
 (default: ``color.mp4``). Input and output roots must differ.
 Each video is decoded to a temporary lossless PNG directory because
@@ -36,6 +41,7 @@ Example:
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import tempfile
@@ -171,6 +177,8 @@ def is_complete(
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return False
 
+    if not isinstance(metadata, dict):
+        return False
     if direction == "both" and start_frame_index is None:
         start_frame_index = propagation_start_frame(expected_frames, direction)
     if (
@@ -423,6 +431,7 @@ def propagate_and_write(
     save_detector: bool = False,
     prompt_outputs: Optional[Dict[str, Any]] = None,
     start_frame_index: Optional[int] = None,
+    frame_outputs: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> Dict[int, int]:
     result_writer = H264Writer(result_path, fps, (width, height))
     if not result_writer.isOpened():
@@ -498,7 +507,18 @@ def propagate_and_write(
         )
 
     try:
-        if direction in ("backward", "both"):
+        if frame_outputs is not None:
+            written = 0
+            for index, response in enumerate(frame_outputs):
+                if int(response["frame_index"]) != index or index >= frame_count:
+                    raise RuntimeError(
+                        "cached batch frames must be chronological and in range"
+                    )
+                write(index, response["outputs"])
+                written += 1
+            if written != frame_count:
+                raise RuntimeError("cached batch predictions are incomplete")
+        elif direction in ("backward", "both"):
             with tempfile.TemporaryDirectory(
                 prefix="sam3_ordered_outputs_"
             ) as temporary:
@@ -629,6 +649,46 @@ def add_prompt_request(
     raise ValueError(f"unsupported prompt request type: {prompt_request_type}")
 
 
+def complete_video_metadata(
+    metadata: Dict[str, Any],
+    started: float,
+    frame_count: int,
+    object_to_label: Dict[int, int],
+    masks_path: Path,
+    result_path: Path,
+    save_detector: bool,
+    detector_only: bool = False,
+) -> None:
+    metadata.update(
+        {
+            "status": "success",
+            "completed_at": utc_now(),
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "frames_processed": frame_count,
+            "object_id_to_label": {
+                str(obj_id): label for obj_id, label in sorted(object_to_label.items())
+            },
+            "outputs": {
+                "instance_masks_video": masks_path.name,
+                "instance_masks_codec": "FFV1",
+                "instance_masks_pixel_format": "gray8",
+                "visualization_video": result_path.name,
+                "label_dtype": "uint8",
+                "background_label": 0,
+                **({"mask_semantics": "binary_union"} if detector_only else {}),
+                **(
+                    {
+                        "detector_masks_video": "detector_masks.mkv",
+                        "detector_visualization_video": "detector_result.mp4",
+                    }
+                    if save_detector
+                    else {}
+                ),
+            },
+        }
+    )
+
+
 def process_video(
     predictor: Any,
     video_path: Path,
@@ -745,34 +805,15 @@ def process_video(
                 start_frame_index=start_frame_index,
             )
 
-        metadata.update(
-            {
-                "status": "success",
-                "completed_at": utc_now(),
-                "duration_seconds": round(time.monotonic() - started, 3),
-                "frames_processed": frame_count,
-                "object_id_to_label": {
-                    str(obj_id): label
-                    for obj_id, label in sorted(object_to_label.items())
-                },
-                "outputs": {
-                    "instance_masks_video": masks_path.name,
-                    "instance_masks_codec": "FFV1",
-                    "instance_masks_pixel_format": "gray8",
-                    "visualization_video": result_path.name,
-                    "label_dtype": "uint8",
-                    "background_label": 0,
-                    **({"mask_semantics": "binary_union"} if detector_only else {}),
-                    **(
-                        {
-                            "detector_masks_video": "detector_masks.mkv",
-                            "detector_visualization_video": "detector_result.mp4",
-                        }
-                        if save_detector
-                        else {}
-                    ),
-                },
-            }
+        complete_video_metadata(
+            metadata,
+            started,
+            frame_count,
+            object_to_label,
+            masks_path,
+            result_path,
+            save_detector,
+            detector_only,
         )
         write_json(metadata_path, metadata)
         LOGGER.info("Completed %s -> %s", relative_video, result_path)
@@ -900,16 +941,341 @@ def run_sequences(
     return counts
 
 
+def text_prompt_directory_names(prompts: List[str]) -> Dict[str, str]:
+    names = {prompt: re.sub(r"[^\w-]+", "_", prompt).strip("_") for prompt in prompts}
+    if any(not name or len(name.encode("utf-8")) > 255 for name in names.values()):
+        raise ValueError(
+            "text prompts must produce nonempty directory names of at most 255 bytes"
+        )
+    if len(set(names.values())) != len(names):
+        raise ValueError(
+            "text prompt directory names collide; use distinct prompt names"
+        )
+    return names
+
+
+def validate_text_batch_outputs(
+    input_root: Path, prompt_roots: Dict[str, Path], videos: List[Path]
+) -> None:
+    roots = [root.resolve() for root in prompt_roots.values()]
+    if len(set(roots)) != len(roots):
+        raise ValueError("text prompt output roots resolve to the same directory")
+    input_ancestors = set()
+    for video in videos:
+        source = video.parent.resolve()
+        input_ancestors.update((source, *source.parents))
+    outputs = set()
+    for root in prompt_roots.values():
+        validate_input_output(input_root, root)
+        if any(
+            (root / name).is_symlink()
+            for name in ("gt_summary.json", "gt_summary.json.tmp")
+        ):
+            raise ValueError("batch GT summary must not be a symlink")
+        for video in videos:
+            output = output_dir_for(video, input_root, root).resolve()
+            if output in outputs:
+                raise ValueError(
+                    "text batch output directories resolve to the same directory"
+                )
+            outputs.add(output)
+            if output in input_ancestors:
+                raise ValueError(
+                    "batch output directory must not contain an input video directory"
+                )
+            for name in (
+                "masks",
+                "masks.mkv",
+                "result.mp4",
+                "metadata.json",
+                "metadata.json.tmp",
+                "detector_masks.mkv",
+                "detector_result.mp4",
+                "comparison.mp4",
+                "gt_metrics.csv",
+                "gt_metrics.json",
+                "gt_metrics.json.tmp",
+            ):
+                if (output / name).is_symlink():
+                    raise ValueError(
+                        f"batch output artifact must not be a symlink: {output / name}"
+                    )
+
+
+def cached_batch_frames(cache_dir: Path, frame_count: int) -> Iterator[Dict[str, Any]]:
+    for index in range(frame_count):
+        with np.load(cache_dir / f"{index:06d}.npz") as cached:
+            yield {"frame_index": index, "outputs": dict(cached.items())}
+
+
+def process_video_text_batch(
+    predictor_factory: Callable[[], Any],
+    video_path: Path,
+    input_root: Path,
+    output_dirs: Dict[str, Path],
+    args: argparse.Namespace,
+) -> Dict[str, str]:
+    video_info = probe_video(video_path)
+    requested_frames = expected_frame_count(video_info, args.max_frames)
+    start_frame = propagation_start_frame(requested_frames, args.direction)
+    statuses = {
+        prompt: "skipped"
+        for prompt, output in output_dirs.items()
+        if not args.overwrite
+        and is_complete(
+            output,
+            video_path,
+            prompt,
+            args.version,
+            requested_frames,
+            args.direction,
+            save_detector=args.save_detector,
+            clip_overseg=args.clip_overseg,
+            start_frame_index=start_frame if args.direction == "both" else None,
+        )
+    }
+    prompts = [prompt for prompt in output_dirs if prompt not in statuses]
+    if not prompts:
+        return statuses
+    started = time.monotonic()
+    metadata = {}
+    session_id = None
+    try:
+        predictor = predictor_factory()
+        for prompt in prompts:
+            prepare_output_dir(output_dirs[prompt])
+            # A regenerated prediction invalidates previous per-video GT metrics.
+            for name in ("comparison.mp4", "gt_metrics.csv", "gt_metrics.json"):
+                (output_dirs[prompt] / name).unlink(missing_ok=True)
+            metadata[prompt] = {
+                "status": "processing",
+                "input_video": str(video_path),
+                "input_relative_path": video_path.relative_to(input_root).as_posix(),
+                "prompt": prompt,
+                "model_version": args.version,
+                "detector_only": False,
+                "propagation_direction": args.direction,
+                "start_frame_index": start_frame,
+                "clip_overseg": args.clip_overseg,
+                "source": video_info,
+                "started_at": utc_now(),
+                "frames_processed": 0,
+                "object_id_to_label": {},
+                "inference_mode": "multi_text_batch",
+                "batch_prompts": prompts,
+            }
+            write_json(output_dirs[prompt] / "metadata.json", metadata[prompt])
+        with tempfile.TemporaryDirectory(prefix="sam3_text_batch_") as temporary:
+            temporary = Path(temporary)
+            frame_dir = temporary / "frames"
+            frame_dir.mkdir()
+            frame_count = extract_png_frames(video_path, frame_dir, args.max_frames)
+            # Use the decoded length, just as the single-text initializer does.
+            if not 0 <= start_frame < frame_count:
+                raise ValueError("prompt frame must be inside the decoded video")
+            caches = [temporary / str(index) for index in range(len(prompts))]
+            for cache in caches:
+                cache.mkdir()
+            session_id = predictor.handle_request(
+                {
+                    "type": "start_session",
+                    "resource_path": str(frame_dir),
+                    "offload_video_to_cpu": True,
+                    "offload_state_to_cpu": False,
+                }
+            )["session_id"]
+            initial = predictor.handle_request(
+                {
+                    "type": "add_text_prompts",
+                    "session_id": session_id,
+                    "frame_index": start_frame,
+                    "texts": prompts,
+                }
+            )["outputs"]
+
+            def cache_outputs(index: int, outputs: List[Dict[str, Any]]) -> None:
+                if len(outputs) != len(prompts):
+                    raise RuntimeError("model returned an unexpected text batch size")
+                for prompt_index, (cache, output) in enumerate(zip(caches, outputs)):
+                    ids, probs, masks = normalize_outputs(output)
+                    saved = {
+                        "out_obj_ids": ids,
+                        "out_probs": probs,
+                        "out_binary_masks": masks,
+                    }
+                    if args.save_detector:
+                        if (
+                            index == start_frame
+                            and output.get("out_detector_mask") is None
+                        ):
+                            output = {
+                                **output,
+                                "out_detector_mask": initial[prompt_index].get(
+                                    "out_detector_mask"
+                                ),
+                            }
+                        saved["out_detector_mask"] = detector_label_image(
+                            output, int(video_info["height"]), int(video_info["width"])
+                        )
+                    np.savez(cache / f"{index:06d}.npz", **saved)
+
+            cache_outputs(start_frame, initial)
+            legs = (
+                ("forward", "backward")
+                if args.direction == "both"
+                else (args.direction,)
+            )
+            for leg in legs:
+                if args.direction == "both" and leg == "backward" and start_frame == 0:
+                    continue
+                previous = -1 if leg == "forward" else frame_count
+                for response in predictor.handle_stream_request(
+                    {
+                        "type": "propagate_in_video_batch",
+                        "session_id": session_id,
+                        "propagation_direction": leg,
+                        "start_frame_index": start_frame,
+                        "max_frame_num_to_track": frame_count,
+                    }
+                ):
+                    index = int(response["frame_index"])
+                    if not 0 <= index < frame_count:
+                        raise RuntimeError("batch frame index is outside the video")
+                    if not (previous < index if leg == "forward" else previous > index):
+                        raise RuntimeError("batch model returned out-of-order frames")
+                    if not (
+                        index >= start_frame
+                        if leg == "forward"
+                        else index <= start_frame
+                    ):
+                        raise RuntimeError(
+                            "batch model returned a frame outside propagation range"
+                        )
+                    previous = index
+                    if (
+                        args.direction == "both"
+                        and leg == "backward"
+                        and index == start_frame
+                    ):
+                        continue
+                    cache_outputs(index, response["outputs"])
+            for prompt, cache in zip(prompts, caches):
+                output = output_dirs[prompt]
+                labels = propagate_and_write(
+                    predictor,
+                    session_id,
+                    frame_dir,
+                    output / "masks.mkv",
+                    output / "result.mp4",
+                    frame_count,
+                    int(video_info["width"]),
+                    int(video_info["height"]),
+                    float(video_info["fps"]),
+                    prompt,
+                    args.direction,
+                    save_detector=args.save_detector,
+                    frame_outputs=cached_batch_frames(cache, frame_count),
+                )
+                complete_video_metadata(
+                    metadata[prompt],
+                    started,
+                    frame_count,
+                    labels,
+                    output / "masks.mkv",
+                    output / "result.mp4",
+                    args.save_detector,
+                )
+                write_json(output / "metadata.json", metadata[prompt])
+                statuses[prompt] = "success"
+    except Exception as exc:
+        LOGGER.exception("Multi-text batch failed: %s", video_path)
+        for prompt in prompts:
+            if statuses.get(prompt) == "success":
+                continue
+            statuses[prompt] = "failed"
+            if prompt in metadata:
+                metadata[prompt].update(
+                    status="failed",
+                    failed_at=utc_now(),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                try:
+                    write_json(output_dirs[prompt] / "metadata.json", metadata[prompt])
+                except Exception:
+                    LOGGER.exception(
+                        "Cannot write failed metadata for %s", output_dirs[prompt]
+                    )
+    finally:
+        if session_id is not None:
+            try:
+                predictor.handle_request(
+                    {"type": "close_session", "session_id": session_id}
+                )
+            except Exception:
+                LOGGER.exception("Failed to close session %s", session_id)
+    return statuses
+
+
+def run_text_batch_sequences(
+    predictor_factory: Callable[[], Any],
+    videos: List[Path],
+    input_root: Path,
+    prompt_roots: Dict[str, Path],
+    args: argparse.Namespace,
+    comparisons: Dict[str, GTComparison],
+) -> Dict[str, int]:
+    counts = {"success": 0, "skipped": 0, "failed": 0}
+    for index, video in enumerate(videos, start=1):
+        LOGGER.info("[%d/%d] Processing text batch: %s", index, len(videos), video)
+        outputs = {
+            prompt: output_dir_for(video, input_root, root)
+            for prompt, root in prompt_roots.items()
+        }
+        try:
+            statuses = process_video_text_batch(
+                predictor_factory, video, input_root, outputs, args
+            )
+        except Exception:
+            LOGGER.exception("Sequence failed: %s", video)
+            statuses = dict.fromkeys(prompt_roots, "failed")
+        for prompt, status in statuses.items():
+            comparison = comparisons[prompt]
+            try:
+                if status != "skipped" and not args.compare_gt:
+                    (prompt_roots[prompt] / "gt_summary.json").unlink(missing_ok=True)
+                if status == "failed":
+                    raise RuntimeError(f"multi-text inference failed for {prompt!r}")
+                comparison.compare(video, outputs[prompt], args.direction)
+            except Exception as exc:
+                LOGGER.exception("Task failed (%s): %s", prompt, video)
+                try:
+                    comparison.record_failure(
+                        video, outputs[prompt], args.direction, exc
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Cannot write failed GT report for %s", outputs[prompt]
+                    )
+                status = "failed"
+            counts[status] += 1
+    return counts
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively process RGB videos with a shared SAM 3/3.1 " "text prompt."
+            "Recursively process RGB videos with SAM 3/3.1 text prompts. "
+            "SAM 3 batches multiple texts over shared image features."
         )
     )
     add_video_arguments(parser)
     parser.add_argument("--version", default="sam3", choices=["sam3", "sam3.1"])
     parser.add_argument(
-        "--text-prompt", dest="prompt", required=True, help="Shared text prompt"
+        "--text-prompt",
+        dest="prompt",
+        required=True,
+        nargs="+",
+        help="One or more quoted text prompts; multiple prompts batch SAM 3 detection",
     )
     parser.add_argument(
         "--save-detector",
@@ -922,6 +1288,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    prompts = list(dict.fromkeys(args.prompt))
+    if any(not prompt.strip() for prompt in prompts):
+        parser.error("text prompts must not be empty or whitespace-only")
+    if len(prompts) > 1 and args.version != "sam3":
+        parser.error("multiple text prompts require --version sam3")
+    if len(prompts) > 1 and any(prompt.strip() == "visual" for prompt in prompts):
+        parser.error("'visual' is reserved for geometry-only prompts")
+    try:
+        prompt_names = text_prompt_directory_names(prompts) if len(prompts) > 1 else {}
+    except ValueError as exc:
+        parser.error(str(exc))
     validate_gt_arguments(parser, args)
     if args.save_detector and args.version != "sam3":
         parser.error("--save-detector requires --version sam3")
@@ -941,6 +1318,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.error("%s", exc)
         return 2
     videos = discover_rgb_videos(input_root, args.rgb_name)
+    prompt_roots = {prompt: output_root / name for prompt, name in prompt_names.items()}
+    if prompt_roots:
+        try:
+            validate_text_batch_outputs(input_root, prompt_roots, videos)
+        except (ValueError, OSError, RuntimeError) as exc:
+            LOGGER.error("%s", exc)
+            return 2
     if args.max_sequences is not None:
         videos = videos[: args.max_sequences]
     if not videos:
@@ -956,6 +1340,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         LOGGER.error("Checkpoint does not exist: %s", checkpoint)
         return 2
 
+    if len(prompts) > 1:
+        comparisons = {
+            prompt: GTComparison(args, processing_directions(args.direction))
+            for prompt in prompts
+        }
+        with lazy_predictor(args) as get_predictor:
+            counts = run_text_batch_sequences(
+                get_predictor, videos, input_root, prompt_roots, args, comparisons
+            )
+        summary_failed = False
+        for prompt, comparison in comparisons.items():
+            try:
+                comparison.write_summary(prompt_roots[prompt])
+            except Exception:
+                LOGGER.exception("Cannot write GT summary for %s", prompt_roots[prompt])
+                summary_failed = True
+        LOGGER.info("Finished video/prompt tasks: %s", counts)
+        return 1 if counts["failed"] or summary_failed else 0
+
     comparison = GTComparison(args, processing_directions(args.direction))
     with lazy_predictor(args) as get_predictor:
         counts = run_sequences(
@@ -963,7 +1366,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             videos=videos,
             input_root=input_root,
             output_root=output_root,
-            prompt=args.prompt,
+            prompt=prompts[0],
             model_version=args.version,
             max_frames=args.max_frames,
             overwrite=args.overwrite,

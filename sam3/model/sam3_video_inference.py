@@ -4,6 +4,7 @@
 
 import logging
 from collections import defaultdict
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -117,6 +118,17 @@ class Sam3VideoInference(Sam3VideoBase):
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
         )
+        return self._init_state_from_images(
+            images,
+            orig_height,
+            orig_width,
+            offload_state_to_cpu,
+            is_image_type(resource_path),
+        )
+
+    def _init_state_from_images(
+        self, images, orig_height, orig_width, offload_state_to_cpu, is_image_only
+    ):
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["offload_state_to_cpu"] = offload_state_to_cpu
@@ -134,7 +146,7 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state["feature_cache"] = {}
         inference_state["cached_frame_outputs"] = {}
         inference_state["action_history"] = []  # for logging user actions
-        inference_state["is_image_only"] = is_image_type(resource_path)
+        inference_state["is_image_only"] = is_image_only
         return inference_state
 
     @torch.inference_mode()
@@ -143,6 +155,9 @@ class Sam3VideoInference(Sam3VideoBase):
 
         @param inference_state 要重置的视频状态。
         """
+        inference_state.pop("text_prompt_states", None)
+        inference_state.pop("text_batch_input", None)
+        inference_state.pop("text_batch_geometry", None)
         inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
         inference_state["text_prompt"] = None
         inference_state["detector_only"] = False
@@ -325,6 +340,19 @@ class Sam3VideoInference(Sam3VideoBase):
         max_frame_num_to_track=None,
         reverse=False,
     ):
+        """Propagate one text task, retaining the original per-output API."""
+        for outputs in self._propagate_in_video_frames(
+            inference_state, start_frame_idx, max_frame_num_to_track, reverse
+        ):
+            yield from outputs
+
+    def _propagate_in_video_frames(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
         """! @brief 按一个时间方向执行整段视频的检测、跟踪与流式输出。
 
         @param inference_state 当前视频状态。
@@ -381,14 +409,14 @@ class Sam3VideoInference(Sam3VideoBase):
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
 
             if detector_only:
-                yield (
-                    frame_idx,
+                yield [
                     (
+                        frame_idx,
                         self._postprocess_output(inference_state, out)
                         if self.rank == 0
-                        else None
-                    ),
-                )
+                        else None,
+                    )
+                ]
                 continue
 
             if self.hotstart_delay > 0:
@@ -415,6 +443,7 @@ class Sam3VideoInference(Sam3VideoBase):
             else:
                 yield_list = [(frame_idx, out)]  # output the current frame
 
+            frame_outputs = []
             for yield_frame_idx, yield_out in yield_list:
                 # post-process the output and yield it
                 if self.rank == 0:
@@ -452,7 +481,139 @@ class Sam3VideoInference(Sam3VideoBase):
                     )
                 else:
                     postprocessed_out = None  # no output on other GPUs
-                yield yield_frame_idx, postprocessed_out
+                frame_outputs.append((yield_frame_idx, postprocessed_out))
+            yield frame_outputs
+
+    @torch.inference_mode()
+    def add_text_prompts(self, inference_state, frame_idx, texts):
+        """Initialize independent text tasks over one shared set of video frames."""
+        if self.world_size != 1:
+            raise ValueError("multi-text video batches require a single GPU")
+        if hasattr(self.detector.backbone, "learned_prompt"):
+            raise ValueError("multi-text batches require the text backbone")
+        if (
+            not isinstance(texts, list)
+            or not texts
+            or any(
+                not isinstance(text, str)
+                or not text.strip()
+                or text.strip() == "visual"
+                for text in texts
+            )
+        ):
+            raise ValueError("texts must be a nonempty list of nonempty text prompts")
+        if len(set(texts)) != len(texts):
+            raise ValueError("text prompts must be unique")
+        if not 0 <= frame_idx < inference_state["num_frames"]:
+            raise ValueError("prompt frame must be inside the video")
+        self.reset_state(inference_state)
+        images = inference_state["input_batch"].img_batch
+        states = [
+            self._init_state_from_images(
+                images,
+                inference_state["orig_height"],
+                inference_state["orig_width"],
+                inference_state["offload_state_to_cpu"],
+                inference_state["is_image_only"],
+            )
+            for _ in texts
+        ]
+        for state, text in zip(states, texts):
+            state["text_prompt"] = text
+            state["input_batch"].find_text_batch[0] = text
+        num_prompts = len(texts)
+        inference_state["text_prompt_states"] = states
+        inference_state["text_batch_input"] = replace(
+            inference_state["input_batch"],
+            find_text_batch=[*texts, "visual"],
+            find_inputs=[
+                replace(
+                    stage,
+                    img_ids=torch.full((num_prompts,), t, device=self.device),
+                    text_ids=torch.arange(num_prompts, device=self.device),
+                )
+                for t, stage in enumerate(inference_state["input_batch"].find_inputs)
+            ],
+        )
+        inference_state["text_batch_geometry"] = self.detector._get_dummy_prompt(
+            num_prompts
+        )
+        self._run_text_batch_detection(inference_state, frame_idx, reverse=False)
+        outputs = [
+            self._postprocess_output(
+                state, self._run_single_frame_inference(state, frame_idx, reverse=False)
+            )
+            for state in states
+        ]
+        return frame_idx, outputs
+
+    def _run_text_batch_detection(self, inference_state, frame_idx, reverse):
+        states = inference_state["text_prompt_states"]
+        shared_cache = inference_state["feature_cache"]
+        detections = self.run_backbone_and_detection(
+            frame_idx=frame_idx,
+            num_frames=inference_state["num_frames"],
+            input_batch=inference_state["text_batch_input"],
+            geometric_prompt=inference_state["text_batch_geometry"],
+            feature_cache=shared_cache,
+            reverse=reverse,
+            allow_new_detections=True,
+            return_by_prompt=True,
+        )
+        if len(detections) != len(states):
+            raise RuntimeError("detector returned an unexpected text batch size")
+        for state, detection in zip(states, detections):
+            cache = state["feature_cache"]
+            # Share only immutable visual features, never text-conditioned detector caches.
+            cache[frame_idx] = shared_cache[frame_idx]
+            cache.pop(frame_idx - 1 if not reverse else frame_idx + 1, None)
+            cache["batched_detection"] = (frame_idx, detection)
+
+    @torch.inference_mode()
+    def propagate_in_video_batch(
+        self,
+        inference_state,
+        start_frame_idx=None,
+        max_frame_num_to_track=None,
+        reverse=False,
+    ):
+        """Advance all text tasks frame-by-frame, preserving hotstart semantics."""
+        states = inference_state.get("text_prompt_states")
+        if not states:
+            raise ValueError("initialize the session with add_text_prompts first")
+        run_detection = True
+        if hasattr(self, "parse_action_history_for_propagation"):
+            modes = [
+                self.parse_action_history_for_propagation(state)[0] for state in states
+            ]
+            if len(set(modes)) != 1 or modes[0] not in (
+                "propagation_full",
+                "propagation_fetch",
+            ):
+                raise ValueError("text batches require aligned, unedited text tasks")
+            run_detection = modes[0] == "propagation_full"
+        order, _ = self._get_processing_order(
+            states[0], start_frame_idx, max_frame_num_to_track, reverse
+        )
+        generators = [
+            self._propagate_in_video_frames(
+                state, start_frame_idx, max_frame_num_to_track, reverse
+            )
+            for state in states
+        ]
+        try:
+            for frame_idx in order:
+                if run_detection:
+                    self._run_text_batch_detection(inference_state, frame_idx, reverse)
+                results = [next(generator) for generator in generators]
+                frame_ids = [[index for index, _ in result] for result in results]
+                if any(ids != frame_ids[0] for ids in frame_ids[1:]):
+                    raise RuntimeError("text tasks emitted different frame orders")
+                for items in zip(*results):
+                    yield items[0][0], [item[1] for item in items]
+        finally:
+            for generator in generators:
+                generator.close()
 
     def _run_single_frame_inference(self, inference_state, frame_idx, reverse):
         """! @brief 执行一帧的检测—跟踪联合推理，并原地更新视频状态。
@@ -1261,7 +1422,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         )
 
     @torch.inference_mode()
-    def propagate_in_video(
+    def _propagate_in_video_frames(
         self,
         inference_state,
         start_frame_idx=None,
@@ -1274,14 +1435,14 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         @param start_frame_idx 本次单向传播锚点。
         @param max_frame_num_to_track 最大传播范围。
         @param reverse 是否反向。
-        @yield 每帧的后处理实例输出。
+        @yield 每个内部处理帧对应的后处理输出列表。
 
         初次提示后必须全量运行检测+跟踪；后续仅交互细化部分对象时，复用已缓存的
         原始视频分割（VG）结果，只运行这些对象的 tracker，可显著减少开销。
         """
         # 所有 rank 解析同一历史，确保选择相同路径并保持集体通信一致。
         if inference_state.get("detector_only", False):
-            yield from super().propagate_in_video(
+            yield from super()._propagate_in_video_frames(
                 inference_state,
                 start_frame_idx=start_frame_idx,
                 max_frame_num_to_track=max_frame_num_to_track,
@@ -1302,7 +1463,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         # 全量路径回到父类，逐帧重新运行 detector、关联器和 tracker。
         if propagation_type == "propagation_full":
             logger.debug(f"Running full VG propagation (reverse={reverse}).")
-            yield from super().propagate_in_video(
+            yield from super()._propagate_in_video_frames(
                 inference_state,
                 start_frame_idx=start_frame_idx,
                 max_frame_num_to_track=max_frame_num_to_track,
@@ -1349,14 +1510,18 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                         "obj_id_to_score": obj_id_to_score,
                         "obj_id_to_tracker_score": obj_id_to_tracker_score,
                     }
-                    yield (
-                        frame_idx,
-                        self._postprocess_output(
-                            inference_state, out, suppressed_obj_ids=suppressed_obj_ids
-                        ),
-                    )
+                    yield [
+                        (
+                            frame_idx,
+                            self._postprocess_output(
+                                inference_state,
+                                out,
+                                suppressed_obj_ids=suppressed_obj_ids,
+                            ),
+                        )
+                    ]
                 else:
-                    yield frame_idx, None
+                    yield [(frame_idx, None)]
 
             return
 
@@ -1471,14 +1636,18 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     suppressed_obj_ids = tracker_metadata["rank0_metadata"][
                         "suppressed_obj_ids"
                     ][frame_idx]
-                    yield (
-                        frame_idx,
-                        self._postprocess_output(
-                            inference_state, out, suppressed_obj_ids=suppressed_obj_ids
-                        ),
-                    )
+                    yield [
+                        (
+                            frame_idx,
+                            self._postprocess_output(
+                                inference_state,
+                                out,
+                                suppressed_obj_ids=suppressed_obj_ids,
+                            ),
+                        )
+                    ]
                 else:
-                    yield frame_idx, None
+                    yield [(frame_idx, None)]
 
     def add_action_history(
         self, inference_state, action_type, frame_idx=None, obj_ids=None
