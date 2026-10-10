@@ -338,7 +338,7 @@ def test_list_only_and_missing_file_skip(tmp_path, capsys, dir_name):
 
 
 @pytest.mark.parametrize("text", ["left hand", "", "   "])
-def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch, text):
+def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch, caplog, text):
     import sam3
 
     root = tmp_path / "data"
@@ -365,23 +365,25 @@ def test_batch_records_missing_npz_and_continues(tmp_path, monkeypatch, text):
         return "success"
 
     monkeypatch.setattr(dataset, "process_video", process)
-    assert (
-        mano.main(
-            [
-                "--input-root",
-                str(root),
-                "--output-root",
-                str(output),
-                "--checkpoint",
-                str(checkpoint),
-                "--text-prompt",
-                text,
-                "--hand-side",
-                "left",
-            ]
+    with caplog.at_level(logging.INFO, logger="sam3_mano_processor"):
+        assert (
+            mano.main(
+                [
+                    "--input-root",
+                    str(root),
+                    "--output-root",
+                    str(output),
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--text-prompt",
+                    text,
+                    "--hand-side",
+                    "left",
+                ]
+            )
+            == 0
         )
-        == 0
-    )
+    assert "Finished: 1 succeeded, 1 skipped, 0 failed" in caplog.text
     records = json.loads((output / "batch_summary.json").read_text())["results"]
     assert [record["status"] for record in records] == ["skipped", "success"]
     assert "no MANO NPZ" in records[0]["reason"]

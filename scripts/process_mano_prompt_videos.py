@@ -8,7 +8,7 @@ MANO 文件位于视频同级 <mano-dir-name>/<left|right>_hand/*.npz，默认�
 同一帧多个 NPZ 的框和点全部送入同一检测查询。缺失帧退回文本和已有 memory（禁用文本时仅跟踪已有对象）；
 缺少指定手的 NPZ 时跳过视频，任一文件无效时记录失败并继续批次。
 输出：masks.mkv（全部实例、FFV1）、result.mp4（预测叠加、MANO 骨架、实际 prompts）、metadata.json；
-批次汇总写入 batch_summary.json。双向模式从
+批次汇总写入 batch_summary.json，结束后记录 succeeded / skipped / failed。双向模式从
 中间帧初始化，在同一 session 中先正向、再反向传播，合为一套正序结果，不创建方向子目录。
 result.mp4 与 comparison 第一列在任一 NPZ 有手的帧上画全部在屏关节和骨架，不受 prompt-interval 限制。
 
@@ -565,6 +565,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     output_root / "batch_summary.json", {"results": results}
                 )
                 comparison.write_summary(output_root)
+    if not args.list_only:
+        LOGGER.info(
+            "Finished: %d succeeded, %d skipped, %d failed",
+            sum(item["status"] == "success" for item in results),
+            sum(item["status"] == "skipped" for item in results),
+            sum(item["status"] == "failed" for item in results),
+        )
     return 1 if any(item["status"] == "failed" for item in results) else 0
 
 
