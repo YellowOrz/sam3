@@ -53,7 +53,7 @@ uv run python scripts/qualitative_test_interactive.py \
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--version` | `sam3.1` | `sam3` 或 `sam3.1` |
+| `--version` | `sam3` | `sam3` 或 `sam3.1` |
 | `--video` | 必填 | 输入视频 |
 | `--checkpoint` | 省略则自动下载 | 权重文件 |
 | `--text-prompt` | `circle` | 初始文本检测提示 |
@@ -172,8 +172,18 @@ uv run python scripts/qualitative_test_interactive.py \
 | 文件 | 内容 |
 | --- | --- |
 | `result.mp4` | 原帧率、叠加最终 mask |
-| `masks.mkv` | FFV1 无损灰度标签；0 背景，1–255 对象。最终对象 ID 对应像素标签 **ID+1** |
+| `masks.mkv` | FFV1 无损灰度标签；0 背景，1–255 对象。新推理导出通常为 **ID+1**；加载后编辑保留原标签编号 |
 | `metadata.json` | 输入、模型、ID 映射、输出格式；分段时含局部→全局对应及是否已确认 |
 | `interactions.json` | 文本提示、确认点和交互事件。已删除对象导出 ID 为 null，仍保留原始 ID |
 
 CUDA 推理用 AMP：优先 `bfloat16`，不支持则 `float16`。
+
+## 多提示词独立窗口
+
+`--text-prompt "left hand" "right hand"` 为每个待审提示词开一个独立播放窗口，多提示词仅 SAM 3，默认模型也改为 SAM 3。点击画面或 Tab 切换带标记的快捷键目标；点修正、P/C/删除与传播只影响该提示词。GPU 操作串行，其他窗口仍可浏览，但暂不能编辑。
+
+缺失提示词共同完成初始 batch 后暂停开窗，各自保留 memory 和 CPU checkpoints；已有结果按提示词加载，浏览不需 CUDA/权重，编辑沿用 tracker-only。完整匹配的批量 output 跳过，不完整/不匹配的已加载结果报错；显式 `--existing-mask-dir` 缺任一待审结果就报错且不推理。
+
+Q 确认并关闭当前窗但不立即发布，所有窗口确认后一起保存；S 跳过整视频，关闭任一窗/Ctrl+C 停止整批，均不发布当前视频修改。保存错误回滚旧文件；若文件系统连回滚都拒绝，则保留原文件备份并报告路径，不承诺断电/强杀期间事务恢复。单视频多提示词追加提示词目录，批量保留原路径，各自四文件。
+
+新分块按块共同推理/审查，全部 Q 再下一块，各提示词独立合并和终端 ok；加载的全视频结果只在第一轮审查，后续不重复打开。重复提示词去重，非法/冲突路径报错；OOM 不自动拆批或串行回退，失败继续下一视频。GPU/CPU memory 和临时磁盘需求随提示词增加。重开旧 SAM 3.1 单提示词结果请显式加 `--version sam3.1`。

@@ -488,6 +488,24 @@ Nisha Deo, Peter Park, Phillip Thomas, Raghu Nayani, Rene Martinez Doehner, Robb
 Mitts, Shashank Jain, Spencer Whitehead, Ty Toledano, Valentin Gabeur, Vincent Cho, Vivian Lee, William Ngan,
 Xuehai He, Yael Yungster, Ziqi Pang, Ziyi Dou, Zoe Quake.
 
+## Multi-prompt interactive review
+
+The editor now defaults to **SAM 3**. `--text-prompt "left hand" "right hand"` opens one window per pending prompt; multi-prompt mode requires SAM 3, while explicit SAM 3.1 single-prompt commands remain supported. Exact duplicate texts are removed in input order. Directory names keep the existing space-to-underscore rule; invalid names, collisions and unsafe/physically aliased output paths fail before inference.
+
+```bash
+python scripts/qualitative_test_interactive.py \
+  --video INPUT.mp4 --output-dir OUT --device cuda:0 --window-width 640 \
+  --text-prompt "left hand" "right hand"
+```
+
+Windows have independent playback, frame positions, selection, drafts, mask-change curves and propagation ranges. Click a window's image or press **Tab** to select the visibly marked keyboard target. Edits, `P`, `C`, deletion and manual propagation affect only that prompt. GPU operations are serialized; peers can browse but cannot edit or start propagation while the model is busy. Missing texts share initial image-backbone/FPN computation; inference completes before paused windows open, with each native session's memory and CPU checkpoints retained. Loaded masks keep tracker-only editing, without restoring old memory or rerunning text detection. All-loaded browsing requires no CUDA/weights, and the existing lazy getter shares one model across all windows/videos.
+
+**Q confirms and closes the selected window without publishing yet.** Click or Tab before confirming another window; a held Q does not confirm a peer. All pending prompts must confirm before publication. `S` skips the whole current video, and closing any editor window or Ctrl+C stops the batch; neither publishes current edits or input-side copies. Handled save failures roll back all replacements and preserve old/unrelated files; if the filesystem also rejects rollback, original backups are retained and their paths are reported. This is not a power-loss or process-kill recovery guarantee. OOM is reported without automatic splitting or serial fallback; failed videos do not stop subsequent batch videos.
+
+Batch paths remain `OUT/<video-relative-directory-without-trailing-raw>/<output-subdir>/<prompt-directory>/`; single-video multi-prompt paths are `OUT/<prompt-directory>/`, and single-prompt paths are unchanged. Each prompt keeps its own four result files. Complete matching batch destinations are skipped independently, so fewer windows may open. `--load-existing` retains destination-first/input-side lookup and infers only entirely absent results; incomplete/mismatched selected results never fall back. Explicit `--existing-mask-dir DIR` requires every pending prompt there and errors before model loading if any is absent.
+
+Fresh `--chunk-frames` tasks batch per chunk and review together, with all current windows confirming before the next chunk. Each fresh text gets independent ID merging and terminal `ok` review before any output is published. Loaded full-video results are reviewed once alongside the first fresh chunk, then are not reopened; previously chunked loaded results still edit the merged video. Multi-prompt memories/checkpoints, loaded masks, temporary predictions and staged results require additional GPU/host RAM and disk space.
+
 ## Interactive video batches
 
 The desktop editor can process a directory of videos with one shared model, opening one video at a time (CUDA and a graphical desktop required):

@@ -29,6 +29,8 @@ class Sam3VideoPredictor(Sam3BasePredictor):
     外部请求路由到模型。实际的逐帧检测、关联与跟踪在 ``self.model`` 内执行。
     ``add_text_prompts`` 使用 ``texts`` 列表初始化独立文本任务，随后
     ``propagate_in_video_batch`` 返回按文本输入顺序排列的逐帧输出列表。
+    ``register_text_prompt_sessions`` 可为子状态建立独立 checkpoint；batch 完成后
+    须关闭父 session，再通过子 session 编辑，避免同时修改同一状态。
     """
 
     def __init__(
@@ -75,6 +77,18 @@ class Sam3VideoPredictor(Sam3BasePredictor):
 
     @torch.inference_mode()
     def handle_request(self, request):
+        if request["type"] == "register_text_prompt_sessions":
+            session = self._get_session(request["session_id"])
+            states = session["state"].get("text_prompt_states")
+            if not states:
+                raise ValueError(
+                    "initialize the text batch before registering sessions"
+                )
+            if "text_prompt_session_ids" not in session:
+                session["text_prompt_session_ids"] = [
+                    self._register_session(state)["session_id"] for state in states
+                ]
+            return {"session_ids": session["text_prompt_session_ids"]}
         if request["type"] == "add_text_prompts":
             session = self._get_session(request["session_id"])
             self._extend_expiration_time(session)

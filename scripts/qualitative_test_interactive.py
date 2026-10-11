@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """交互式 SAM 3/3.1 视频分割工具。
 
+默认模型为 SAM 3。``--text-prompt "left hand" "right hand"`` 开多个独立播放窗口。
+多提示词仅支持 SAM 3；缺失结果先共享图像特征做初始 batch，再保留各自 memory 编辑。
+点击画面或 Tab 选择快捷键目标；GPU 编辑/传播串行，其他窗口仍可浏览。
+Q 确认当前窗口，全部确认（分块还需 ok）后才统一发布；S/关窗/Ctrl+C 不发布当前视频。
+多提示词单视频输出追加提示词目录，批量路径沿用原规则；已有结果按提示词复用。
+
 使用方法
 ========
 
@@ -432,10 +438,34 @@ def key_help_copy(
 
 
 @lru_cache(maxsize=8)
-def render_key_help_panel(height: int, use_cjk: Optional[bool] = None) -> np.ndarray:
+def render_key_help_panel(
+    height: int, use_cjk: Optional[bool] = None, multi_prompt: bool = False
+) -> np.ndarray:
     if use_cjk is None:
         use_cjk = cjk_font_path() is not None
     title, note, rows, mouse_title, mouse_rows = key_help_copy(use_cjk)
+    if multi_prompt:
+        note = (
+            "各窗独立播放；GPU 操作串行"
+            if use_cjk
+            else "Independent playback; one GPU operation"
+        )
+        rows = tuple(
+            (
+                key,
+                (
+                    "确认本窗；全部确认后保存"
+                    if use_cjk
+                    else "confirm window; save when all done"
+                )
+                if key == "Q"
+                else desc,
+            )
+            for key, desc in rows
+        )
+        rows += (
+            ("Tab", "切换快捷键目标窗口" if use_cjk else "select keyboard target"),
+        )
     panel = np.full((height, HELP_PANEL_WIDTH, 3), (27, 29, 32), dtype=np.uint8)
     image = Image.fromarray(panel[:, :, ::-1])
     draw = ImageDraw.Draw(image)
@@ -3791,9 +3821,16 @@ def output_subdir(value: str) -> Path:
     return path
 
 
+class TextPromptAction(argparse.Action):
+    def __call__(
+        self, parser: Any, namespace: Any, values: List[str], option_string: Any = None
+    ) -> None:
+        setattr(namespace, self.dest, values[0] if len(values) == 1 else values)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive SAM3 qualitative test")
-    parser.add_argument("--version", default="sam3.1", choices=["sam3", "sam3.1"])
+    parser.add_argument("--version", default="sam3", choices=["sam3", "sam3.1"])
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--video", help="Input video path")
     inputs.add_argument(
@@ -3804,7 +3841,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint", help="Checkpoint path (auto-downloads if omitted)"
     )
     parser.add_argument(
-        "--text-prompt", default="circle", help="Text prompt for detection"
+        "--text-prompt",
+        nargs="+",
+        action=TextPromptAction,
+        default="circle",
+        help="One or more text prompts; SAM 3 opens independent review windows",
     )
     parser.add_argument(
         "--device",
@@ -4210,6 +4251,800 @@ def _interactive_output_is_protected(
     return not _clip_overseg_only_mismatch(output_dir, video_path, args)
 
 
+class SerializedPredictor:
+    """One model lock shared by native and loaded-mask sessions."""
+
+    def __init__(self, backend: Any, lock: Any, device_index: int):
+        self.backend = backend
+        self.lock = lock
+        self.device_index = device_index
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.backend, name)
+
+    def bind_device(self) -> None:
+        model = getattr(self.backend, "model", None)
+        if getattr(getattr(model, "device", None), "type", None) == "cuda":
+            torch.cuda.set_device(self.device_index)
+
+    def handle_request(self, request: Dict[str, Any]) -> Any:
+        with self.lock:
+            self.bind_device()
+            return self.backend.handle_request(request)
+
+    def handle_stream_request(self, request: Dict[str, Any]) -> Iterable[Any]:
+        with self.lock:
+            self.bind_device()
+            yield from self.backend.handle_stream_request(request)
+
+
+class MultiWindowEditor:
+    """Independent UI state; only the model-operation owner mutates off-thread."""
+
+    def __init__(self, apps: Sequence[InteractiveApp], lock: Any):
+        self.apps = list(apps)
+        self.live = list(apps)
+        self.active: Optional[InteractiveApp] = self.live[0] if self.live else None
+        self.lock = lock
+        self.worker: Optional[threading.Thread] = None
+        self.worker_app: Optional[InteractiveApp] = None
+        self.worker_error: Optional[BaseException] = None
+        self.confirming = False
+        self.frozen: Optional[np.ndarray] = None
+        self.callback_error: Optional[BaseException] = None
+        self.names = {
+            app: f"{WINDOW_NAME} [{i + 1}] {app.prompt}" for i, app in enumerate(apps)
+        }
+
+    def busy_owner(self) -> Optional[InteractiveApp]:
+        if self.worker is not None:
+            return self.worker_app
+        return next((app for app in self.apps if app.runner.is_alive), None)
+
+    def launch(
+        self,
+        app: InteractiveApp,
+        action: Any,
+        confirm: bool = False,
+        stop: bool = False,
+    ) -> None:
+        owner = self.busy_owner()
+        if owner is not None and (
+            owner is not app or self.worker is not None or not stop
+        ):
+            app.status = "GPU busy; browse only until the current operation finishes"
+            return
+        self.frozen = app.render().copy()
+        self.worker_app = app
+        self.worker_error = None
+        self.confirming = confirm
+
+        def run() -> None:
+            try:
+                app.predictor.bind_device()
+                if stop:
+                    app.stop_propagation()
+                with self.lock:
+                    action()
+            except BaseException as exc:
+                self.worker_error = exc
+
+        self.worker = threading.Thread(target=run, name="sam3-window-edit", daemon=True)
+        self.worker.start()
+
+    def finish_worker(self) -> None:
+        if self.worker is None or self.worker.is_alive():
+            return
+        self.worker.join()
+        app = self.worker_app
+        error = self.worker_error
+        confirming = self.confirming
+        self.worker = None
+        self.worker_app = None
+        self.frozen = None
+        if error is not None:
+            if isinstance(error, (SkipVideo, KeyboardInterrupt)):
+                raise error
+            raise RuntimeError(f"editing {app.prompt!r} failed") from error
+        if confirming:
+            self.live.remove(app)
+            cv2.destroyWindow(self.names[app])
+            app.window_open = False
+            # Require a click or Tab before another Q; held keys must not confirm a peer.
+            self.active = None
+
+    def on_key(self, key: int) -> None:
+        if key in (ord("s"), ord("S")):
+            raise SkipVideo
+        if key == 9:
+            if self.live:
+                current = (
+                    self.live.index(self.active) if self.active in self.live else -1
+                )
+                self.active = self.live[(current + 1) % len(self.live)]
+            return
+        app = self.active
+        if app is None:
+            return
+        if key in (ord("q"), ord("Q")):
+            if app.unprocessed_frames():
+                app.handle_key(key)
+                return
+            self.launch(app, app.cancel_edit, confirm=True, stop=True)
+        elif key in (
+            27,
+            8,
+            127,
+            ord("p"),
+            ord("P"),
+            ord("c"),
+            ord("C"),
+            ord("d"),
+            ord("D"),
+        ):
+            self.launch(app, lambda: app.handle_key(key))
+        elif app is not self.worker_app:
+            app.handle_key(key)
+
+    def on_mouse(
+        self, app: InteractiveApp, event: int, x: int, y: int, flags: int, param: Any
+    ) -> None:
+        if event in (
+            cv2.EVENT_LBUTTONDOWN,
+            cv2.EVENT_RBUTTONDOWN,
+            cv2.EVENT_MBUTTONDOWN,
+        ):
+            self.active = app
+        if app is self.worker_app:
+            return
+        control = None
+        if event == cv2.EVENT_LBUTTONDOWN:
+            control = next(
+                (
+                    name
+                    for name, rect in app.hitboxes.items()
+                    if app.point_in_rect(x, y - app.display_height, rect)
+                ),
+                None,
+            )
+        if control is not None and control.startswith("prop_"):
+            self.launch(
+                app,
+                lambda: app.on_mouse(event, x, y, flags, param),
+                stop=control == "prop_pause",
+            )
+            return
+        if (
+            self.busy_owner() is not None
+            and event
+            in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN, cv2.EVENT_MBUTTONDOWN)
+            and y < app.display_height
+        ):
+            app.status = "GPU busy; image editing is temporarily disabled"
+            return
+        app.on_mouse(event, x, y, flags, param)
+
+    def mouse_callback(
+        self, app: InteractiveApp, event: int, x: int, y: int, flags: int, param: Any
+    ) -> None:
+        try:
+            self.on_mouse(app, event, x, y, flags, param)
+        except BaseException as exc:
+            self.callback_error = exc
+
+    def run(self) -> None:
+        try:
+            for i, app in enumerate(self.live):
+                name = self.names[app]
+                cv2.namedWindow(name, WINDOW_FLAGS)
+                app.window_open = True
+                cv2.setMouseCallback(
+                    name,
+                    lambda event, x, y, flags, param, app=app: self.mouse_callback(
+                        app, event, x, y, flags, param
+                    ),
+                )
+                cv2.moveWindow(
+                    name, 30 + i * (app.display_width + HELP_PANEL_WIDTH + 20), 30
+                )
+            while self.live:
+                if self.callback_error is not None:
+                    raise self.callback_error
+                self.finish_worker()
+                if not self.live:
+                    break
+                for app in list(self.live):
+                    if app is self.worker_app:
+                        image = self.frozen
+                    else:
+                        app.drain_events()
+                        if app.fatal_error is not None:
+                            raise RuntimeError(
+                                f"propagation failed for {app.prompt!r}"
+                            ) from app.fatal_error
+                        app.advance_playback()
+                        image = app.render()
+                    # Keep prompt/keyboard ownership visible even without a window manager.
+                    image = image.copy()
+                    help_panel = render_key_help_panel(
+                        image.shape[0], multi_prompt=True
+                    ).copy()
+                    panel = Image.fromarray(help_panel[:, :, ::-1])
+                    draw = ImageDraw.Draw(panel)
+                    draw.rectangle((0, 0, HELP_PANEL_WIDTH, 32), fill=(27, 29, 32))
+                    draw.text(
+                        (14, 12),
+                        f"{app.prompt} {'[KEYBOARD]' if app is self.active else '[click/Tab]'}",
+                        font=_help_font(15),
+                        fill=(90, 230, 110) if app is self.active else (220, 220, 220),
+                    )
+                    image[:, app.display_width :] = np.asarray(panel)[:, :, ::-1]
+                    cv2.setWindowTitle(
+                        self.names[app],
+                        f"{'[KEYBOARD] ' if app is self.active else ''}{app.video_path} - {app.prompt}{' [GPU BUSY]' if self.busy_owner() is app else ''}",
+                    )
+                    cv2.imshow(self.names[app], image)
+                key = cv2.waitKey(15) & 0xFF
+                for app in self.live:
+                    try:
+                        visible = cv2.getWindowProperty(
+                            self.names[app], cv2.WND_PROP_VISIBLE
+                        )
+                    except cv2.error:
+                        visible = 0
+                    if visible < 1:
+                        raise KeyboardInterrupt("editor window closed")
+                if key != 255:
+                    self.on_key(key)
+        finally:
+            for app in self.apps:
+                app.runner.request_stop(cancel_model=False)
+            if self.worker is not None:
+                self.worker.join()
+            for app in self.apps:
+                app.stop_propagation()
+                if app.window_open:
+                    try:
+                        cv2.destroyWindow(self.names[app])
+                    except cv2.error:
+                        pass
+                    app.window_open = False
+
+
+INTERACTIVE_FILES = ("masks.mkv", "result.mp4", "interactions.json", "metadata.json")
+
+
+def publish_reviewed_outputs(
+    staged: Dict[Path, Path], exclusive: Iterable[Path] = ()
+) -> None:
+    """Rollback handled failures; retain backups if the filesystem rejects rollback."""
+    exclusive = set(exclusive)
+    temporary_dirs = []
+    replacements = []
+    keep_backups = False
+    try:
+        for destination, source in staged.items():
+            destination.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=".sam3-publish-", dir=destination))
+            temporary_dirs.append(temporary)
+            for name in INTERACTIVE_FILES:
+                target = destination / name
+                if target.is_symlink() or (target.exists() and not target.is_file()):
+                    raise RuntimeError(f"unsafe result file: {target}")
+                if destination in exclusive and target.exists():
+                    raise RuntimeError(f"output already exists: {target}")
+                ready = temporary / name
+                shutil.copy2(source / name, ready)
+                replacements.append(
+                    (
+                        target,
+                        ready,
+                        temporary / f"{name}.backup",
+                        destination in exclusive,
+                    )
+                )
+        changed = []
+        try:
+            for target, ready, backup, no_overwrite in replacements:
+                if no_overwrite:
+                    os.link(ready, target)
+                    changed.append((target, backup, False))
+                else:
+                    existed = target.exists()
+                    if existed:
+                        target.replace(backup)
+                    changed.append((target, backup, existed))
+                    ready.replace(target)
+        except BaseException:
+            rollback_errors = []
+            for target, backup, existed in reversed(changed):
+                try:
+                    if existed:
+                        backup.replace(target)
+                    else:
+                        target.unlink(missing_ok=True)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+            if rollback_errors:
+                keep_backups = True
+                raise RuntimeError(
+                    "publication rollback failed; original backups retained in "
+                    + ", ".join(map(str, temporary_dirs))
+                ) from rollback_errors[0]
+            raise
+    finally:
+        if not keep_backups:
+            for directory in temporary_dirs:
+                try:
+                    shutil.rmtree(directory)
+                except OSError as exc:
+                    print(
+                        f"Could not remove publication staging {directory}: {exc}",
+                        file=sys.stderr,
+                    )
+
+
+def prefill_text_windows(
+    predictor: Any,
+    args: argparse.Namespace,
+    video: Path,
+    info: VideoInfo,
+    frames: Path,
+    outputs: Dict[str, Path],
+    frame_offset: int = 0,
+) -> List[InteractiveApp]:
+    parent = predictor.handle_request(
+        {
+            "type": "start_session",
+            "resource_path": str(frames),
+            "offload_video_to_cpu": True,
+            "offload_state_to_cpu": False,
+        }
+    )["session_id"]
+    ids = []
+    try:
+        response = predictor.handle_request(
+            {
+                "type": "add_text_prompts",
+                "session_id": parent,
+                "frame_index": 0,
+                "texts": list(outputs),
+            }
+        )
+        ids = predictor.handle_request(
+            {"type": "register_text_prompt_sessions", "session_id": parent}
+        )["session_ids"]
+        if len(ids) != len(outputs) or len(response["outputs"]) != len(outputs):
+            raise RuntimeError("invalid text session batch size")
+        apps = [
+            InteractiveApp(
+                predictor,
+                args.version,
+                session,
+                frames,
+                video,
+                info,
+                info.frame_count,
+                prompt,
+                output,
+                args.window_width,
+                args.checkpoint_interval,
+                frame_offset,
+                clip_overseg=args.clip_overseg,
+            )
+            for (prompt, output), session in zip(outputs.items(), ids)
+        ]
+        for app, initial in zip(apps, response["outputs"]):
+            app.store_frame_outputs(0, initial)
+            app.record_event("initial_prompt", frame_index=0, text=app.prompt)
+            app.save_checkpoint(0)
+        next_checkpoint = 0
+        touched = {app: {0} for app in apps}
+        previous = -1
+        for response in predictor.handle_stream_request(
+            {
+                "type": "propagate_in_video_batch",
+                "session_id": parent,
+                "propagation_direction": "forward",
+                "start_frame_index": 0,
+                "max_frame_num_to_track": info.frame_count,
+            }
+        ):
+            index = int(response["frame_index"])
+            if not previous < index < info.frame_count or len(
+                response["outputs"]
+            ) != len(apps):
+                raise RuntimeError("invalid batch frame output")
+            previous = index
+            save = index >= next_checkpoint
+            for app, output in zip(apps, response["outputs"]):
+                app.store_frame_outputs(index, output)
+                updated = predictor.handle_request(
+                    {
+                        "type": "update_frame_checkpoints",
+                        "session_id": app.session_id,
+                        "frame_index": index,
+                    }
+                )
+                if updated.get("updated"):
+                    touched[app].add(index)
+                if save:
+                    checkpoint = predictor.handle_request(
+                        {
+                            "type": "save_checkpoint",
+                            "session_id": app.session_id,
+                            "frame_index": index,
+                            "propagation_direction": "forward",
+                        }
+                    )
+                    app.record_checkpoint(checkpoint, index)
+                    touched[app].add(index)
+            if save:
+                next_checkpoint = index + args.checkpoint_interval
+        for app in apps:
+            if app.unprocessed_frames():
+                raise RuntimeError(
+                    f"incomplete initial segmentation for {app.prompt!r}"
+                )
+            predictor.handle_request(
+                {
+                    "type": "limit_checkpoint_spans",
+                    "session_id": app.session_id,
+                    "frame_indexes": sorted(touched[app]),
+                    "valid_span": [0, info.frame_count - 1],
+                }
+            )
+            app.playing = False
+            app.propagation_complete = True
+            app.status = (
+                "batch initialized - paused; click or Tab selects keyboard window"
+            )
+        return apps
+    except BaseException:
+        for session in ids:
+            predictor.handle_request({"type": "close_session", "session_id": session})
+        raise
+    finally:
+        predictor.handle_request({"type": "close_session", "session_id": parent})
+
+
+def process_multi_interactive_video(
+    get_predictor: Any,
+    args: argparse.Namespace,
+    video: Path,
+    destinations: Dict[str, Path],
+    sources: Dict[str, Optional[Path]],
+) -> bool:
+    info = probe_video(video)
+    with tempfile.TemporaryDirectory(prefix="sam3-multi-review-") as temp:
+        workspace = Path(temp)
+        frames = workspace / "frames"
+        count = extract_frames(video, frames)
+        if (
+            any(source is not None for source in sources.values())
+            and count != info.frame_count
+        ):
+            raise RuntimeError("source frame count changed while extracting")
+        info = VideoInfo(info.width, info.height, count, info.fps)
+        loaded_apps = []
+        try:
+            for prompt, source in sources.items():
+                if source is None:
+                    continue
+                app = LoadedInteractiveApp(
+                    None,
+                    args.version,
+                    "loaded",
+                    frames,
+                    video,
+                    info,
+                    count,
+                    prompt,
+                    destinations[prompt],
+                    args.window_width,
+                    args.checkpoint_interval,
+                    clip_overseg=args.clip_overseg,
+                    get_predictor=get_predictor,
+                )
+                app.loaded_result_dir = source
+                loaded_apps.append(app)
+                load_interactive_result(app)
+                app.predictor = SerializedPredictor(
+                    app.predictor, get_predictor.lock, args.device[1]
+                )
+                app.runner.predictor = app.predictor
+            fresh = [prompt for prompt, source in sources.items() if source is None]
+            chunks = {prompt: [] for prompt in fresh}
+            staged = {}
+            ranges = frame_ranges(count, args.chunk_frames) if fresh else [(0, count)]
+            for chunk_index, (start, end) in enumerate(ranges):
+                apps = list(loaded_apps) if chunk_index == 0 else []
+                native = []
+                chunk_root = workspace / f"chunk_{chunk_index:04d}"
+                if fresh:
+                    chunk_frames = frames
+                    if args.chunk_frames:
+                        chunk_frames = chunk_root / "frames"
+                        make_chunk_frame_dir(frames, chunk_frames, start, end)
+                    outputs = {
+                        prompt: chunk_root / str(index)
+                        for index, prompt in enumerate(fresh)
+                    }
+                    native = prefill_text_windows(
+                        get_predictor(),
+                        args,
+                        video,
+                        VideoInfo(info.width, info.height, end - start, info.fps),
+                        chunk_frames,
+                        outputs,
+                        start,
+                    )
+                    apps.extend(native)
+                try:
+                    MultiWindowEditor(apps, get_predictor.lock).run()
+                    for index, app in enumerate(apps):
+                        original = destinations[app.prompt]
+                        if (
+                            isinstance(app, LoadedInteractiveApp)
+                            and not app.dirty
+                            and app.loaded_result_dir.resolve() == original.resolve()
+                        ):
+                            continue
+                        stage = chunk_root / f"reviewed_{index}"
+                        stage.mkdir(parents=True, exist_ok=True)
+                        app.output_dir = stage
+                        app.finalize()
+                        if app in native and args.chunk_frames:
+                            chunks[app.prompt].append((start, end, stage))
+                        else:
+                            staged[original] = stage
+                finally:
+                    for app in native:
+                        get_predictor().handle_request(
+                            {"type": "close_session", "session_id": app.session_id}
+                        )
+            if args.chunk_frames:
+                for index, prompt in enumerate(fresh):
+                    merged = workspace / f"merged_{index}"
+                    if not review_chunk_outputs(
+                        chunks[prompt],
+                        merged,
+                        video,
+                        info,
+                        prompt,
+                        args.version,
+                        args.chunk_frames,
+                        frames,
+                        args.window_width,
+                        args.clip_overseg,
+                    ):
+                        return False
+                    staged[destinations[prompt]] = merged
+            exclusive = {
+                destinations[prompt]
+                for prompt, source in sources.items()
+                if source is not None
+                and source.resolve() != destinations[prompt].resolve()
+            }
+            publish_reviewed_outputs(staged, exclusive)
+        finally:
+            for app in loaded_apps:
+                app.stop_propagation()
+                app.predictor.reset(0, {})
+                if isinstance(app.predictor, SerializedPredictor):
+                    app.predictor.backend.app = None
+                else:
+                    app.predictor.app = None
+
+    return True
+
+
+def multi_prompt_main(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, prompts: List[str]
+) -> int:
+    if args.version != "sam3":
+        parser.error("multiple text prompts require --version sam3")
+    try:
+        names = {prompt: file_name(prompt.replace(" ", "_")) for prompt in prompts}
+        if any(
+            not prompt.strip() or "\0" in names[prompt] or prompt.strip() == "visual"
+            for prompt in prompts
+        ):
+            raise ValueError(
+                "text prompts must be nonempty, non-visual directory names"
+            )
+        if len(set(names.values())) != len(names):
+            raise ValueError("text prompt directory names collide")
+    except (argparse.ArgumentTypeError, ValueError) as exc:
+        parser.error(str(exc))
+    batch = args.input_root is not None
+    if batch:
+        if args.output_root is None:
+            parser.error("--input-root requires --output-root")
+        input_root, output_root = (
+            expand_path(args.input_root),
+            expand_path(args.output_root),
+        )
+        try:
+            validate_input_output(input_root, output_root)
+        except ValueError as exc:
+            parser.error(str(exc))
+        videos = discover_rgb_videos(input_root, args.rgb_name)
+        jobs = []
+        for video in videos:
+            relative = video.parent.relative_to(input_root)
+            if relative.name == "raw":
+                relative = relative.parent
+            jobs.append(
+                (
+                    video,
+                    {
+                        prompt: output_root / relative / args.output_subdir / name
+                        for prompt, name in names.items()
+                    },
+                )
+            )
+    else:
+        if args.output_dir is None:
+            parser.error("--video requires --output-dir")
+        video = expand_path(args.video)
+        if not video.is_file():
+            parser.error(f"video does not exist: {video}")
+        jobs = [
+            (
+                video,
+                {
+                    prompt: expand_path(args.output_dir) / name
+                    for prompt, name in names.items()
+                },
+            )
+        ]
+    if not jobs:
+        parser.error("no input videos found")
+    paths = set()
+    ancestors = {
+        parent
+        for video, _ in jobs
+        for parent in (video.parent.resolve(), *video.parent.resolve().parents)
+    }
+    for _, destinations in jobs:
+        for output in destinations.values():
+            resolved = output.resolve()
+            if resolved in paths or resolved in ancestors:
+                parser.error(
+                    f"output aliases another result or input directory: {output}"
+                )
+            paths.add(resolved)
+            if any(
+                (output / name).is_symlink()
+                for name in (
+                    *INTERACTIVE_FILES,
+                    "metadata.json.tmp",
+                    "interactions.json.tmp",
+                    "masks.mkv.tmp",
+                    "result.mp4.tmp",
+                )
+            ):
+                parser.error(f"output result files must not be symlinks: {output}")
+    if args.checkpoint and not expand_path(args.checkpoint).is_file():
+        parser.error(f"checkpoint does not exist: {args.checkpoint}")
+    lock = threading.RLock()
+    predictor = None
+
+    def get_predictor() -> Any:
+        nonlocal predictor
+        with lock:
+            if predictor is None:
+                predictor = SerializedPredictor(
+                    load_predictor(args, parser), lock, args.device[1]
+                )
+            predictor.bind_device()
+            return predictor
+
+    get_predictor.lock = lock
+    failures = []
+    succeeded = skipped = 0
+    interrupted = False
+    try:
+        for video, destinations in jobs:
+            print(f"Processing prompt windows: {video}", flush=True)
+            try:
+                sources = {}
+                pending = {}
+                for prompt, output in destinations.items():
+                    settings = argparse.Namespace(
+                        **{**vars(args), "text_prompt": prompt}
+                    )
+                    if (
+                        batch
+                        and not args.overwrite
+                        and completed_interactive_video(output, video, settings)
+                    ):
+                        continue
+                    source = None
+                    if args.load_existing:
+                        candidates = (
+                            [video.parent / args.existing_mask_dir / names[prompt]]
+                            if args.existing_mask_dir is not None
+                            else [
+                                output,
+                                (
+                                    video.parent.parent
+                                    if video.parent.name == "raw"
+                                    else video.parent
+                                )
+                                / args.output_subdir
+                                / names[prompt],
+                                video.parent / args.output_subdir / names[prompt],
+                            ]
+                        )
+                        source = next(
+                            (
+                                candidate
+                                for candidate in candidates
+                                if any(
+                                    (candidate / name).exists()
+                                    for name in INTERACTIVE_FILES
+                                )
+                            ),
+                            None,
+                        )
+                        if source is None and args.existing_mask_dir is not None:
+                            raise RuntimeError(
+                                f"missing explicit mask results: {candidates[0]}"
+                            )
+                        if source is not None:
+                            if not completed_interactive_video(source, video, settings):
+                                raise RuntimeError(
+                                    f"saved result incomplete or settings mismatch: {source}"
+                                )
+                            if source.resolve() != output.resolve():
+                                validate_interactive_outputs(output, overwrite=False)
+                        else:
+                            print(
+                                "No saved results found; starting new segmentation. Searched: "
+                                + ", ".join(map(str, candidates)),
+                                flush=True,
+                            )
+                    if source is None and _interactive_output_is_protected(
+                        output, video, settings, batch
+                    ):
+                        validate_interactive_outputs(output, args.overwrite)
+                    pending[prompt] = output
+                    sources[prompt] = source
+                if not pending:
+                    skipped += 1
+                    print("Skipping completed video")
+                    continue
+                if not process_multi_interactive_video(
+                    get_predictor, args, video, pending, sources
+                ):
+                    interrupted = True
+                    break
+                succeeded += 1
+            except SkipVideo:
+                skipped += 1
+                print(
+                    "Skipped current video; no prompt results were published.",
+                    flush=True,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                failures.append((video, error))
+                print(f"FAILED {video}: {error}", file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        if predictor is not None:
+            predictor.shutdown()
+    print(f"Finished: {succeeded} succeeded, {skipped} skipped, {len(failures)} failed")
+    for video, error in failures:
+        print(f"FAILED {video}: {error}", file=sys.stderr)
+    if interrupted:
+        print("Batch stopped by user; current prompt results were not published.")
+    return 1 if failures or interrupted else 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -4217,6 +5052,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--existing-mask-dir requires --load-existing")
     if args.clip_overseg and args.version != "sam3":
         parser.error("--clip-overseg requires --version sam3")
+    prompts = list(
+        dict.fromkeys(
+            [args.text_prompt]
+            if isinstance(args.text_prompt, str)
+            else args.text_prompt
+        )
+    )
+    if len(prompts) > 1:
+        return multi_prompt_main(args, parser, prompts)
+    args.text_prompt = prompts[0]
     batch = args.input_root is not None
     if batch:
         if args.output_root is None:

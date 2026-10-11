@@ -344,6 +344,10 @@ class Sam3BasePredictor:
         # 状态内含帧、提示、特征缓存和跟踪器 memory，绝不能在不同视频间复用。
         inference_state = self.model.init_state(**init_kwargs)
 
+        return self._register_session(inference_state, session_id)
+
+    def _register_session(self, inference_state, session_id=None):
+        """Register an existing state without decoding frames or resetting memory."""
         if not session_id:
             session_id = str(uuid.uuid4())
         self._all_inference_states[session_id] = {
@@ -691,10 +695,7 @@ class Sam3BasePredictor:
             span = (prior_spans if is_prior else spans).get(key)
             if is_prior:
                 current = spans.get(key)
-                if (
-                    current is not None
-                    and current[0] <= target_frame_idx <= current[1]
-                ):
+                if current is not None and current[0] <= target_frame_idx <= current[1]:
                     continue
             if span is not None and not span[0] <= target_frame_idx <= span[1]:
                 continue
