@@ -1,4 +1,5 @@
 import json
+import threading
 from contextlib import nullcontext
 from io import StringIO
 from pathlib import Path
@@ -2325,14 +2326,20 @@ def test_loaded_edit_rollback_and_save_preserves_label_ids(tmp_path, monkeypatch
         cap.release()
 
 
+@pytest.mark.parametrize("serialized", [False, True])
 @pytest.mark.parametrize("mode", ["forward", "forward_backward", "backward_forward"])
-def test_loaded_propagation_hard_bounds_and_anchors(tmp_path, monkeypatch, mode):
+def test_loaded_propagation_hard_bounds_and_anchors(
+    tmp_path, monkeypatch, mode, serialized
+):
     app = make_loaded_app(tmp_path, lambda: None)
     mask = np.ones((8, 10), dtype=bool)
     app.cache = {frame: {0: mask.copy()} for frame in range(100)}
     before = {frame: app.cache[frame][0].copy() for frame in range(100)}
     app.loaded_anchor_frames = {40, 50, 60}
-    app.confirmed_points = [qualitative.PointEdit(1, 40, 0, 3, 3, 1)]
+    app.confirmed_points = [
+        qualitative.PointEdit(1, 40, 0, 3, 3, 1),
+        qualitative.PointEdit(2, 60, 0, 3, 3, 1),
+    ]
     app.prop_range_left, app.prop_range_right = (30, 70)
     calls = []
     seeds = []
@@ -2351,6 +2358,16 @@ def test_loaded_propagation_hard_bounds_and_anchors(tmp_path, monkeypatch, mode)
 
     monkeypatch.setattr(backend, "initialize", initialize)
     monkeypatch.setattr(backend, "track_frame", track)
+    original_request = backend.handle_request
+
+    def request(data):
+        assert data["type"] != "add_prompt", "loaded anchors must not be reprompted"
+        return original_request(data)
+
+    monkeypatch.setattr(backend, "handle_request", request)
+    if serialized:
+        app.predictor = qualitative.SerializedPredictor(backend, threading.RLock(), 0)
+        app.runner.predictor = app.predictor
     app.start_propagation(50, mode)
     app.runner.join()
     app.drain_events()
@@ -2370,6 +2387,7 @@ def test_loaded_propagation_hard_bounds_and_anchors(tmp_path, monkeypatch, mode)
     assert all(np.array_equal(seed, before[frame]) for frame, seed in seeds)
     assert all(30 <= frame <= 70 for frame, _ in seeds)
     assert app.confirmed_points[0].frame_index == 40
+    assert not app.loaded_anchor_frames & app.stale_frames
 
 
 def test_loaded_default_range_both_directions_and_empty_leg(tmp_path, monkeypatch):

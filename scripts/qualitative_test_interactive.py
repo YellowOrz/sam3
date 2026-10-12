@@ -2,7 +2,8 @@
 """交互式 SAM 3/3.1 视频分割工具。
 
 默认模型为 SAM 3。``--text-prompt "left hand" "right hand"`` 开多个独立播放窗口。
-多提示词仅支持 SAM 3；缺失结果先共享图像特征做初始 batch，再保留各自 memory 编辑。
+多提示词仅支持 SAM 3；缺失结果共享图像特征，在后台做初始 batch，边传播边查看。
+初始传播暂停会停止整个共享 batch，之后保留各自 memory/checkpoints 独立编辑。
 点击画面或 Tab 选择快捷键目标；GPU 编辑/传播串行，其他窗口仍可浏览。
 Q 确认当前窗口，全部确认（分块还需 ok）后才统一发布；S/关窗/Ctrl+C 不发布当前视频。
 多提示词单视频输出追加提示词目录，批量路径沿用原规则；已有结果按提示词复用。
@@ -177,6 +178,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -1323,7 +1325,7 @@ class InteractiveApp:
                         point.frame_index
                         for point in self.confirmed_points
                         if point.frame_index != frame_index
-                        and not isinstance(self.predictor, LoadedMaskPredictor)
+                        and not isinstance(self, LoadedInteractiveApp)
                     }
                 )
             ),
@@ -4281,7 +4283,13 @@ class SerializedPredictor:
 class MultiWindowEditor:
     """Independent UI state; only the model-operation owner mutates off-thread."""
 
-    def __init__(self, apps: Sequence[InteractiveApp], lock: Any):
+    def __init__(
+        self,
+        apps: Sequence[InteractiveApp],
+        lock: Any,
+        initial_batch: Optional["TextBatchRunner"] = None,
+    ):
+        self.initial_batch = initial_batch
         self.apps = list(apps)
         self.live = list(apps)
         self.active: Optional[InteractiveApp] = self.live[0] if self.live else None
@@ -4297,6 +4305,8 @@ class MultiWindowEditor:
         }
 
     def busy_owner(self) -> Optional[InteractiveApp]:
+        if self.initial_batch is not None and self.initial_batch.is_alive:
+            return self.initial_batch.apps[0]
         if self.worker is not None:
             return self.worker_app
         return next((app for app in self.apps if app.runner.is_alive), None)
@@ -4308,6 +4318,9 @@ class MultiWindowEditor:
         confirm: bool = False,
         stop: bool = False,
     ) -> None:
+        if self.initial_batch is not None and self.initial_batch.is_alive:
+            app.status = "pause shared initial propagation before editing"
+            return
         owner = self.busy_owner()
         if owner is not None and (
             owner is not app or self.worker is not None or not stop
@@ -4407,6 +4420,18 @@ class MultiWindowEditor:
                 ),
                 None,
             )
+        if (
+            control == "prop_pause"
+            and self.initial_batch is not None
+            and self.initial_batch.is_alive
+        ):
+            app.log_input("control", control=control)
+            if app in self.initial_batch.apps:
+                self.initial_batch.request_stop()
+                app.status = "stopping shared initial batch for all prompts"
+            else:
+                app.status = "no propagation running in this window"
+            return
         if control is not None and control.startswith("prop_"):
             self.launch(
                 app,
@@ -4484,6 +4509,8 @@ class MultiWindowEditor:
                         f"{'[KEYBOARD] ' if app is self.active else ''}{app.video_path} - {app.prompt}{' [GPU BUSY]' if self.busy_owner() is app else ''}",
                     )
                     cv2.imshow(self.names[app], image)
+                if self.initial_batch is not None and self.initial_batch.thread is None:
+                    self.initial_batch.start()
                 key = cv2.waitKey(15) & 0xFF
                 for app in self.live:
                     try:
@@ -4499,6 +4526,8 @@ class MultiWindowEditor:
         finally:
             for app in self.apps:
                 app.runner.request_stop(cancel_model=False)
+            if self.initial_batch is not None:
+                self.initial_batch.close()
             if self.worker is not None:
                 self.worker.join()
             for app in self.apps:
@@ -4584,7 +4613,155 @@ def publish_reviewed_outputs(
                     )
 
 
-def prefill_text_windows(
+class TextBatchRunner:
+    """Stream shared inference through UI queues, never mutate UI state off-thread."""
+
+    def __init__(self, predictor: Any, parent: str, apps: Sequence[InteractiveApp]):
+        self.predictor = predictor
+        self.parent = parent
+        self.apps = list(apps)
+        self.thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.parent_closed = False
+
+    @property
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self) -> None:
+        if self.thread is not None:
+            raise RuntimeError("initial text batch has already started")
+        for app in self.apps:
+            app.propagation_mode = "forward"
+            app.status = "shared initial batch - browse while propagating"
+            app.last_play_time = time.monotonic()
+            app.record_event(
+                "propagation_start",
+                frame_index=0,
+                generation=app.generation,
+                mode="forward",
+                text_batch=True,
+            )
+        self.thread = threading.Thread(
+            target=self.run, name="sam3-initial-text-batch", daemon=True
+        )
+        self.thread.start()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+    def close(self) -> None:
+        self.request_stop()
+        if self.thread is not None:
+            self.thread.join()
+        self.close_parent()
+
+    def close_parent(self) -> None:
+        if not self.parent_closed:
+            self.predictor.handle_request(
+                {"type": "close_session", "session_id": self.parent}
+            )
+            self.parent_closed = True
+
+    def run(self) -> None:
+        error = None
+        reached = {0}
+        touched = {app: {0} for app in self.apps}
+        count = self.apps[0].frame_count
+        next_checkpoint = 0
+        previous = -1
+        try:
+            self.predictor.bind_device()
+            with torch.autocast(device_type="cuda", dtype=cuda_amp_dtype()):
+                with closing(
+                    self.predictor.handle_stream_request(
+                        {
+                            "type": "propagate_in_video_batch",
+                            "session_id": self.parent,
+                            "propagation_direction": "forward",
+                            "start_frame_index": 0,
+                            "max_frame_num_to_track": count,
+                        }
+                    )
+                ) as stream:
+                    while not self.stop_event.is_set():
+                        try:
+                            response = next(stream)
+                        except StopIteration:
+                            break
+                        index = int(response["frame_index"])
+                        if not previous < index < count or len(
+                            response["outputs"]
+                        ) != len(self.apps):
+                            raise RuntimeError("invalid batch frame output")
+                        previous = index
+                        reached.add(index)
+                        save = index >= next_checkpoint
+                        for app, output in zip(self.apps, response["outputs"]):
+                            app.event_queue.put(
+                                (
+                                    "frame",
+                                    app.generation,
+                                    index,
+                                    normalize_frame_outputs(output),
+                                )
+                            )
+                            updated = self.predictor.handle_request(
+                                {
+                                    "type": "update_frame_checkpoints",
+                                    "session_id": app.session_id,
+                                    "frame_index": index,
+                                }
+                            )
+                            if updated.get("updated"):
+                                touched[app].add(index)
+                            if save:
+                                checkpoint = self.predictor.handle_request(
+                                    {
+                                        "type": "save_checkpoint",
+                                        "session_id": app.session_id,
+                                        "frame_index": index,
+                                        "propagation_direction": "forward",
+                                    }
+                                )
+                                app.event_queue.put(
+                                    ("checkpoint", app.generation, checkpoint, None)
+                                )
+                                touched[app].add(index)
+                        if save:
+                            next_checkpoint = index + self.apps[0].checkpoint_interval
+                if not self.stop_event.is_set() and len(reached) != count:
+                    raise RuntimeError("incomplete initial text batch segmentation")
+                for app in self.apps:
+                    self.predictor.handle_request(
+                        {
+                            "type": "limit_checkpoint_spans",
+                            "session_id": app.session_id,
+                            "frame_indexes": sorted(touched[app]),
+                            "valid_span": [0, max(reached)],
+                        }
+                    )
+        except BaseException as exc:
+            error = exc
+        finally:
+            try:
+                # Child states are editable only after the batch no longer owns them.
+                self.close_parent()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            for app in self.apps:
+                app.event_queue.put(
+                    (
+                        "error" if error is not None else "done",
+                        app.generation,
+                        error if error is not None else self.stop_event.is_set(),
+                        None,
+                    )
+                )
+
+
+def prepare_text_windows(
     predictor: Any,
     args: argparse.Namespace,
     video: Path,
@@ -4592,7 +4769,7 @@ def prefill_text_windows(
     frames: Path,
     outputs: Dict[str, Path],
     frame_offset: int = 0,
-) -> List[InteractiveApp]:
+) -> Tuple[List[InteractiveApp], TextBatchRunner]:
     parent = predictor.handle_request(
         {
             "type": "start_session",
@@ -4638,74 +4815,12 @@ def prefill_text_windows(
             app.store_frame_outputs(0, initial)
             app.record_event("initial_prompt", frame_index=0, text=app.prompt)
             app.save_checkpoint(0)
-        next_checkpoint = 0
-        touched = {app: {0} for app in apps}
-        previous = -1
-        for response in predictor.handle_stream_request(
-            {
-                "type": "propagate_in_video_batch",
-                "session_id": parent,
-                "propagation_direction": "forward",
-                "start_frame_index": 0,
-                "max_frame_num_to_track": info.frame_count,
-            }
-        ):
-            index = int(response["frame_index"])
-            if not previous < index < info.frame_count or len(
-                response["outputs"]
-            ) != len(apps):
-                raise RuntimeError("invalid batch frame output")
-            previous = index
-            save = index >= next_checkpoint
-            for app, output in zip(apps, response["outputs"]):
-                app.store_frame_outputs(index, output)
-                updated = predictor.handle_request(
-                    {
-                        "type": "update_frame_checkpoints",
-                        "session_id": app.session_id,
-                        "frame_index": index,
-                    }
-                )
-                if updated.get("updated"):
-                    touched[app].add(index)
-                if save:
-                    checkpoint = predictor.handle_request(
-                        {
-                            "type": "save_checkpoint",
-                            "session_id": app.session_id,
-                            "frame_index": index,
-                            "propagation_direction": "forward",
-                        }
-                    )
-                    app.record_checkpoint(checkpoint, index)
-                    touched[app].add(index)
-            if save:
-                next_checkpoint = index + args.checkpoint_interval
-        for app in apps:
-            if app.unprocessed_frames():
-                raise RuntimeError(
-                    f"incomplete initial segmentation for {app.prompt!r}"
-                )
-            predictor.handle_request(
-                {
-                    "type": "limit_checkpoint_spans",
-                    "session_id": app.session_id,
-                    "frame_indexes": sorted(touched[app]),
-                    "valid_span": [0, info.frame_count - 1],
-                }
-            )
-            app.playing = False
-            app.propagation_complete = True
-            app.status = (
-                "batch initialized - paused; click or Tab selects keyboard window"
-            )
-        return apps
+        return apps, TextBatchRunner(predictor, parent, apps)
     except BaseException:
         for session in ids:
             predictor.handle_request({"type": "close_session", "session_id": session})
-        raise
-    finally:
         predictor.handle_request({"type": "close_session", "session_id": parent})
+        raise
 
 
 def process_multi_interactive_video(
@@ -4760,6 +4875,7 @@ def process_multi_interactive_video(
             for chunk_index, (start, end) in enumerate(ranges):
                 apps = list(loaded_apps) if chunk_index == 0 else []
                 native = []
+                initial_batch = None
                 chunk_root = workspace / f"chunk_{chunk_index:04d}"
                 if fresh:
                     chunk_frames = frames
@@ -4770,7 +4886,7 @@ def process_multi_interactive_video(
                         prompt: chunk_root / str(index)
                         for index, prompt in enumerate(fresh)
                     }
-                    native = prefill_text_windows(
+                    native, initial_batch = prepare_text_windows(
                         get_predictor(),
                         args,
                         video,
@@ -4781,7 +4897,7 @@ def process_multi_interactive_video(
                     )
                     apps.extend(native)
                 try:
-                    MultiWindowEditor(apps, get_predictor.lock).run()
+                    MultiWindowEditor(apps, get_predictor.lock, initial_batch).run()
                     for index, app in enumerate(apps):
                         original = destinations[app.prompt]
                         if (
@@ -4799,6 +4915,8 @@ def process_multi_interactive_video(
                         else:
                             staged[original] = stage
                 finally:
+                    if initial_batch is not None:
+                        initial_batch.close()
                     for app in native:
                         get_predictor().handle_request(
                             {"type": "close_session", "session_id": app.session_id}

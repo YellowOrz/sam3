@@ -286,6 +286,19 @@ def write_rgb(path, count=4):
     writer.release()
 
 
+def complete_initial_batch(editor):
+    if editor.initial_batch is not None:
+        assert editor.initial_batch.thread is None
+        assert all(set(app.cache) == {0} for app in editor.initial_batch.apps)
+        editor.initial_batch.start()
+        editor.initial_batch.thread.join(timeout=5)
+        assert not editor.initial_batch.is_alive
+    for app in editor.apps:
+        app.drain_events()
+        assert app.fatal_error is None
+        app.playing = False
+
+
 @pytest.fixture
 def cli_model(monkeypatch):
     backend = FakeBatchPredictor()
@@ -296,6 +309,7 @@ def cli_model(monkeypatch):
     reviews = []
 
     def review(editor):
+        complete_initial_batch(editor)
         reviews.append(
             [
                 (app.prompt, app.frame_offset, app.frame_count, type(app).__name__)
@@ -398,6 +412,7 @@ def test_skip_after_first_chunk_publishes_nothing(tmp_path, monkeypatch, cli_mod
         rounds.append(True)
         if len(rounds) == 2:
             raise ui.SkipVideo
+        complete_initial_batch(editor)
 
     monkeypatch.setattr(ui.MultiWindowEditor, "run", review)
     assert (
@@ -776,3 +791,335 @@ def test_multi_help_documents_confirmation_and_keyboard_routing():
     multi = ui.render_key_help_panel(650, False, True)
     assert single.shape == multi.shape
     assert not np.array_equal(single, multi)
+
+
+def prepared_batch(tmp_path):
+    apps, lock, backend = make_apps(tmp_path)
+    args = ui.build_parser().parse_args(
+        ["--video", str(apps[0].video_path), "--output-dir", str(tmp_path / "out")]
+    )
+    native, batch = ui.prepare_text_windows(
+        apps[0].predictor,
+        args,
+        apps[0].video_path,
+        apps[0].video_info,
+        apps[0].frame_dir,
+        {app.prompt: app.output_dir for app in apps},
+    )
+    assert all(set(app.cache) == {0} and app.playing for app in native)
+    assert not any(r["type"] == "propagate_in_video_batch" for r in backend.requests)
+    return ui.MultiWindowEditor(native, lock, batch), backend
+
+
+def mock_windows(monkeypatch):
+    for name in (
+        "namedWindow",
+        "setWindowTitle",
+        "setMouseCallback",
+        "destroyWindow",
+        "moveWindow",
+        "imshow",
+    ):
+        monkeypatch.setattr(cv2, name, lambda *args: None)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 1)
+
+
+def test_initial_batch_displays_both_windows_and_partial_frames_before_completion(
+    tmp_path, monkeypatch
+):
+    editor, backend = prepared_batch(tmp_path)
+    left, right = editor.apps
+    batch = editor.initial_batch
+    mock_windows(monkeypatch)
+    displayed = set()
+    monkeypatch.setattr(cv2, "imshow", lambda name, _: displayed.add(name))
+    entered, release = threading.Event(), threading.Event()
+    observed = []
+
+    def stream(request):
+        assert request["type"] == "propagate_in_video_batch"
+        assert displayed == set(editor.names.values())
+        yield {"frame_index": 1, "outputs": [output(app.prompt) for app in editor.apps]}
+        entered.set()
+        assert release.wait(5)
+        for index in (2, 3):
+            yield {
+                "frame_index": index,
+                "outputs": [output(app.prompt) for app in editor.apps],
+            }
+
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+
+    def key(_):
+        assert entered.wait(5)
+        if 1 not in left.cache or 1 not in right.cache:
+            return 255
+        assert batch.is_alive and all(
+            app.unprocessed_frames() == [2, 3] for app in editor.apps
+        )
+        left.set_display_index(1)
+        right.set_display_index(0)
+        right.handle_control_click("play_pause")
+        assert left.display_index == 1 and right.display_index == 0
+        assert left.playing and not right.playing
+        editor.on_key(ord("q"))
+        assert editor.live == editor.apps and editor.worker is None
+        editor.on_mouse(right, cv2.EVENT_LBUTTONDOWN, 100, 100, 0, None)
+        assert not right.draft_points
+        editor.launch(right, lambda: pytest.fail("must not edit batch-owned memory"))
+        assert editor.worker is None
+        observed.append(True)
+        release.set()
+        return ord("s")
+
+    monkeypatch.setattr(cv2, "waitKey", key)
+    try:
+        with pytest.raises(ui.SkipVideo):
+            editor.run()
+    finally:
+        release.set()
+        batch.close()
+    assert observed == [True] and not batch.is_alive
+    assert batch.parent_closed and not any(app.window_open for app in editor.apps)
+
+
+@pytest.mark.parametrize("exit_kind", ["skip", "close", "interrupt"])
+def test_initial_batch_abort_stops_worker_and_closes_parent_without_publication(
+    tmp_path, monkeypatch, exit_kind
+):
+    editor, backend = prepared_batch(tmp_path)
+    batch = editor.initial_batch
+    mock_windows(monkeypatch)
+    entered = threading.Event()
+
+    def stream(request):
+        entered.set()
+        assert batch.stop_event.wait(5)
+        yield {"frame_index": 1, "outputs": [output(app.prompt) for app in editor.apps]}
+        pytest.fail("must not compute another batch frame after stop")
+
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+    for app in editor.apps:
+        monkeypatch.setattr(app, "finalize", lambda: pytest.fail("must not save"))
+
+    def key(_):
+        assert entered.wait(5)
+        if exit_kind == "interrupt":
+            raise KeyboardInterrupt
+        if exit_kind == "close":
+            monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 0)
+            return 255
+        return ord("s")
+
+    monkeypatch.setattr(cv2, "waitKey", key)
+    with pytest.raises(ui.SkipVideo if exit_kind == "skip" else KeyboardInterrupt):
+        editor.run()
+    assert batch.parent_closed and not batch.is_alive
+    assert not any(app.window_open for app in editor.apps)
+    closes = [r["session_id"] for r in backend.requests if r["type"] == "close_session"]
+    assert closes == ["batch"]
+    spans = [
+        r["valid_span"]
+        for r in backend.requests
+        if r["type"] == "limit_checkpoint_spans"
+    ]
+    assert spans == [[0, 1], [0, 1]]
+
+
+def test_initial_batch_pause_preserves_child_checkpoints_for_independent_editing(
+    tmp_path, monkeypatch
+):
+    editor, backend = prepared_batch(tmp_path)
+    left, right = editor.apps
+    batch = editor.initial_batch
+    entered = threading.Event()
+
+    def stream(request):
+        yield {"frame_index": 1, "outputs": [output(app.prompt) for app in editor.apps]}
+        entered.set()
+        assert batch.stop_event.wait(5)
+        yield {"frame_index": 2, "outputs": [output(app.prompt) for app in editor.apps]}
+
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+    try:
+        batch.start()
+        assert entered.wait(5)
+        for app in editor.apps:
+            app.drain_events()
+        right.render()
+        rect = right.hitboxes["prop_pause"]
+        editor.on_mouse(
+            right,
+            cv2.EVENT_LBUTTONDOWN,
+            (rect[0] + rect[2]) // 2,
+            right.display_height + (rect[1] + rect[3]) // 2,
+            0,
+            None,
+        )
+        assert batch.stop_event.is_set()
+        batch.thread.join(timeout=5)
+        assert not batch.is_alive and batch.parent_closed
+        for app in editor.apps:
+            app.drain_events()
+            app.playing = False
+            assert app.fatal_error is None and not app.propagation_complete
+            assert app.unprocessed_frames() == [3]
+        spans = [
+            r["valid_span"]
+            for r in backend.requests
+            if r["type"] == "limit_checkpoint_spans"
+        ]
+        assert spans == [[0, 2], [0, 2]]
+        jobs = []
+        editor.launch(right, lambda: jobs.append(right.session_id))
+        finish(editor)
+        assert jobs == [right.session_id]
+        assert not any(
+            r.get("session_id") == left.session_id and r["type"] == "close_session"
+            for r in backend.requests
+        )
+    finally:
+        batch.close()
+
+
+@pytest.mark.parametrize("failure", ["oom", "missing", "order", "size"])
+def test_initial_batch_stream_errors_are_reported_in_both_windows(
+    tmp_path, monkeypatch, failure
+):
+    editor, backend = prepared_batch(tmp_path)
+    batch = editor.initial_batch
+
+    def stream(request):
+        if failure == "oom":
+            raise RuntimeError("CUDA out of memory")
+        if failure == "missing":
+            yield {
+                "frame_index": 1,
+                "outputs": [output(app.prompt) for app in editor.apps],
+            }
+        else:
+            for index in (0, 0) if failure == "order" else (0,):
+                yield {
+                    "frame_index": index,
+                    "outputs": [output("left hand")]
+                    if failure == "size"
+                    else [output(app.prompt) for app in editor.apps],
+                }
+
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+    try:
+        batch.start()
+        batch.thread.join(timeout=5)
+        assert not batch.is_alive and batch.parent_closed
+        for app in editor.apps:
+            app.drain_events()
+            assert isinstance(app.fatal_error, RuntimeError)
+        assert editor.apps[0].fatal_error is editor.apps[1].fatal_error
+    finally:
+        batch.close()
+
+
+def test_initial_batch_enters_amp_on_worker_including_checkpoint_updates(
+    tmp_path, monkeypatch
+):
+    editor, backend = prepared_batch(tmp_path)
+    batch = editor.initial_batch
+    active = threading.local()
+    workers = []
+    original_stream = backend.handle_stream_request
+    original_request = backend.handle_request
+
+    class Autocast:
+        def __init__(self, device_type, dtype):
+            assert device_type == "cuda" and dtype == ui.cuda_amp_dtype()
+
+        def __enter__(self):
+            assert threading.current_thread() is not threading.main_thread()
+            active.enabled = True
+            workers.append(threading.current_thread().name)
+
+        def __exit__(self, *args):
+            active.enabled = False
+
+    def stream(request):
+        assert active.enabled
+        yield from original_stream(request)
+
+    def request(data):
+        if data["type"] != "close_session":
+            assert active.enabled
+        return original_request(data)
+
+    monkeypatch.setattr(ui.torch, "autocast", Autocast)
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+    monkeypatch.setattr(backend, "handle_request", request)
+    try:
+        batch.start()
+        batch.thread.join(timeout=5)
+        assert not batch.is_alive
+        for app in editor.apps:
+            app.drain_events()
+            assert app.fatal_error is None and not app.unprocessed_frames()
+        assert workers == ["sam3-initial-text-batch"]
+    finally:
+        batch.close()
+
+
+def test_loaded_window_pause_does_not_stop_fresh_initial_batch(tmp_path, monkeypatch):
+    editor, backend = prepared_batch(tmp_path)
+    native = editor.apps
+    batch = editor.initial_batch
+    sample = native[0]
+    loaded = ui.LoadedInteractiveApp(
+        None,
+        "sam3",
+        "loaded",
+        sample.frame_dir,
+        sample.video_path,
+        sample.video_info,
+        sample.frame_count,
+        "loaded object",
+        tmp_path / "loaded",
+        640,
+        get_predictor=lambda: backend,
+    )
+    for index in range(loaded.frame_count):
+        loaded.store_frame_outputs(index, output(loaded.prompt))
+    editor = ui.MultiWindowEditor([loaded, *native], editor.lock, batch)
+    entered = threading.Event()
+
+    def stream(request):
+        entered.set()
+        assert batch.stop_event.wait(5)
+        yield {"frame_index": 1, "outputs": [output(app.prompt) for app in native]}
+
+    monkeypatch.setattr(backend, "handle_stream_request", stream)
+
+    def pause(app):
+        app.render()
+        rect = app.hitboxes["prop_pause"]
+        editor.on_mouse(
+            app,
+            cv2.EVENT_LBUTTONDOWN,
+            (rect[0] + rect[2]) // 2,
+            app.display_height + (rect[1] + rect[3]) // 2,
+            0,
+            None,
+        )
+
+    try:
+        batch.start()
+        assert entered.wait(5)
+        pause(loaded)
+        assert not batch.stop_event.is_set()
+        assert batch.is_alive and not loaded.runner.is_alive
+        assert editor.active is loaded
+        pause(native[1])
+        assert batch.stop_event.is_set()
+        batch.thread.join(timeout=5)
+        assert not batch.is_alive and batch.parent_closed
+        for app in native:
+            app.drain_events()
+            assert app.fatal_error is None
+    finally:
+        batch.close()
