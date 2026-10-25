@@ -1,0 +1,297 @@
+"""Shared, policy-free helpers for the repository's video CLIs."""
+
+import argparse
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+
+
+COLORS = (
+    (60, 60, 255),
+    (60, 220, 60),
+    (255, 100, 60),
+    (60, 220, 220),
+    (220, 60, 220),
+    (220, 180, 60),
+    (120, 60, 255),
+    (255, 160, 60),
+    (60, 160, 255),
+    (180, 255, 60),
+    (255, 60, 160),
+    (160, 60, 255),
+)
+MASK_ALPHA = 0.30
+
+
+def utc_now(timespec: str = "seconds") -> str:
+    return datetime.now(timezone.utc).isoformat(timespec=timespec)
+
+
+def expand_path(value: str) -> Path:
+    """Expand a user path without resolving symlink components."""
+    return Path(value).expanduser().absolute()
+
+
+def parse_device(value: str) -> Tuple[str, int]:
+    if value == "cuda":
+        return "cuda:0", 0
+    if not value.startswith("cuda:"):
+        raise argparse.ArgumentTypeError("device must look like 'cuda:0'")
+    try:
+        index = int(value.split(":", 1)[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("device must look like 'cuda:0'") from exc
+    if index < 0:
+        raise argparse.ArgumentTypeError("CUDA device index must be non-negative")
+    return value, index
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return number
+
+
+def probe_video(
+    video_path: Path, *, fallback_fps: Optional[float] = None
+) -> Dict[str, Any]:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"cannot open video: {video_path}")
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+    finally:
+        cap.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"invalid video dimensions: {video_path}")
+    if not np.isfinite(fps) or fps <= 0:
+        if fallback_fps is None:
+            raise RuntimeError(f"invalid video FPS: {video_path}")
+        fps = fallback_fps
+    return {"width": width, "height": height, "frame_count": frame_count, "fps": fps}
+
+
+def extract_png_frames(
+    video_path: Path, frame_dir: Path, max_frames: Optional[int]
+) -> int:
+    """Decode one video to sequential, lossless PNG files."""
+    cap = cv2.VideoCapture(str(video_path))
+    count = 0
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"cannot open video: {video_path}")
+        while max_frames is None or count < max_frames:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_path = frame_dir / f"{count:06d}.png"
+            if not cv2.imwrite(
+                str(frame_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 1]
+            ):
+                raise RuntimeError(f"failed to write temporary frame: {frame_path}")
+            count += 1
+    finally:
+        cap.release()
+    if count == 0:
+        raise RuntimeError(f"video contains no readable frames: {video_path}")
+    return count
+
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically replace a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    temporary_path.replace(path)
+
+
+def as_numpy(value: Any) -> np.ndarray:
+    if value is None:
+        return np.empty((0,), dtype=np.float32)
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def normalize_output_arrays(
+    outputs: Optional[Dict[str, Any]], score_key: str = "out_probs"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    outputs = outputs or {}
+    obj_ids = as_numpy(outputs.get("out_obj_ids")).reshape(-1)
+    scores = as_numpy(outputs.get(score_key)).reshape(-1)
+    masks = as_numpy(outputs.get("out_binary_masks"))
+    if masks.size == 0:
+        masks = np.empty((0, 0, 0), dtype=bool)
+    elif masks.ndim == 4 and masks.shape[1] == 1:
+        masks = masks[:, 0]
+    elif masks.ndim == 2:
+        masks = masks[None]
+    if masks.ndim != 3:
+        raise RuntimeError(f"unexpected mask shape: {masks.shape}")
+    if len(obj_ids) != len(masks):
+        raise RuntimeError(
+            f"object/mask count mismatch: {len(obj_ids)} IDs and {len(masks)} masks"
+        )
+    if len(scores) not in (0, len(obj_ids)):
+        raise RuntimeError(
+            f"object/score count mismatch: {len(obj_ids)} IDs and {len(scores)} scores"
+        )
+    return obj_ids, scores, masks
+
+
+def color_for_label(label: int) -> Tuple[int, int, int]:
+    return COLORS[(label - 1) % len(COLORS)]
+
+
+def lighter_color(
+    color: Tuple[int, int, int], amount: float = 0.45
+) -> Tuple[int, int, int]:
+    return tuple(round(channel + (255 - channel) * amount) for channel in color)
+
+
+MANO_EDGES = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (0, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (0, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+)
+
+
+def _pixel(x: float, y: float, width: int, height: int) -> Tuple[int, int]:
+    return (
+        min(width - 1, round(x * width)),
+        min(height - 1, round(y * height)),
+    )
+
+
+def draw_geometry(overlay: np.ndarray, geometry: Dict[str, Any]) -> None:
+    """Draw normalized detector points, xywh boxes, and optional MANO hands."""
+    height, width = overlay.shape[:2]
+    for hand in geometry.get("hands", []):
+        joints = np.asarray(hand, dtype=np.float64)
+        for start, end in MANO_EDGES:
+            if start >= len(joints) or end >= len(joints):
+                continue
+            if not (
+                np.isfinite(joints[start]).all() and np.isfinite(joints[end]).all()
+            ):
+                continue
+            cv2.line(
+                overlay,
+                _pixel(*joints[start], width, height),
+                _pixel(*joints[end], width, height),
+                (0, 200, 200),
+                1,
+                cv2.LINE_AA,
+            )
+        for x, y in joints:
+            if not np.isfinite([x, y]).all():
+                continue
+            center = _pixel(x, y, width, height)
+            cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
+    for x, y in geometry.get("points", []):
+        center = _pixel(x, y, width, height)
+        cv2.circle(overlay, center, 4, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(overlay, center, 2, (0, 255, 255), -1, cv2.LINE_AA)
+    for x, y, w, h in geometry.get("boxes", []):
+        cv2.rectangle(
+            overlay,
+            (round(x * width), round(y * height)),
+            (
+                min(width - 1, round((x + w) * width)),
+                min(height - 1, round((y + h) * height)),
+            ),
+            (255, 255, 0),
+            2,
+        )
+
+
+class H264Writer:
+    """VS Code plays H.264 in mp4. This OpenCV build has no H.264 encoder."""
+
+    def __init__(self, path: Path, fps: float, size: Tuple[int, int]) -> None:
+        width, height = size
+        # ponytail: yuv420p needs even sizes; pad if a frame is odd
+        self.width = width + (width & 1)
+        self.height = height + (height & 1)
+        self.proc: Optional[subprocess.Popen] = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-s",
+                f"{self.width}x{self.height}",
+                "-r",
+                f"{fps}",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+    def isOpened(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            frame = cv2.copyMakeBorder(
+                frame,
+                0,
+                self.height - frame.shape[0],
+                0,
+                self.width - frame.shape[1],
+                cv2.BORDER_REPLICATE,
+            )
+        assert self.proc is not None and self.proc.stdin is not None
+        self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+
+    def release(self) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        self.proc = None
+        if proc.stdin is not None:
+            proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while writing video")

@@ -36,6 +36,7 @@ def load_resource_as_video_frames(
     img_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     async_loading_frames: bool = False,
     video_loader_type: str = "cv2",
+    progress=True,
 ) -> tuple[Any, int, int]:
     """! @brief 将输入资源规范化为视频帧张量序列。
 
@@ -102,6 +103,7 @@ def load_resource_as_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            progress=progress,
         )
 
 
@@ -145,6 +147,7 @@ def load_video_frames(
     img_std=(0.5, 0.5, 0.5),
     async_loading_frames=False,
     video_loader_type="cv2",
+    progress=True,
 ):
     """! @brief 根据资源类型选择图片目录或视频文件的解码路径。
 
@@ -174,6 +177,7 @@ def load_video_frames(
             img_mean=img_mean,
             img_std=img_std,
             async_loading_frames=async_loading_frames,
+            progress=progress,
         )
     elif os.path.splitext(video_path)[-1].lower() in VIDEO_EXTS:
         return load_video_frames_from_video_file(
@@ -184,6 +188,7 @@ def load_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            progress=progress,
         )
     else:
         # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
@@ -197,6 +202,7 @@ def load_video_frames(
                 img_std=img_std,
                 async_loading_frames=async_loading_frames,
                 video_loader_type=video_loader_type,
+                progress=progress,
             )
         except Exception as e:
             raise NotImplementedError(
@@ -212,6 +218,7 @@ def load_video_frames_from_image_folder(
     img_mean,
     img_std,
     async_loading_frames,
+    progress=True,
 ):
     """! @brief 从图片目录按帧号读取视频帧。
 
@@ -244,7 +251,12 @@ def load_video_frames_from_image_folder(
 
     if async_loading_frames:
         lazy_images = AsyncImageFrameLoader(
-            img_paths, image_size, offload_video_to_cpu, img_mean, img_std
+            img_paths,
+            image_size,
+            offload_video_to_cpu,
+            img_mean,
+            img_std,
+            progress=progress,
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
@@ -252,7 +264,11 @@ def load_video_frames_from_image_folder(
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
     video_height, video_width = None, None
     for n, img_path in enumerate(
-        tqdm(img_paths, desc=f"frame loading (image folder) [rank={RANK}]")
+        tqdm(
+            img_paths,
+            desc=f"frame loading (image folder) [rank={RANK}]",
+            disable=not progress,
+        )
     ):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
@@ -275,6 +291,7 @@ def load_video_frames_from_video_file(
     gpu_acceleration=False,
     gpu_device=None,
     video_loader_type="cv2",
+    progress=True,
 ):
     """Load the video frames from a video file."""
     if video_loader_type == "cv2":
@@ -284,6 +301,7 @@ def load_video_frames_from_video_file(
             img_mean=img_mean,
             img_std=img_std,
             offload_video_to_cpu=offload_video_to_cpu,
+            progress=progress,
         )
     elif video_loader_type == "torchcodec":
         logger.info("Using torchcodec to load video file")
@@ -295,6 +313,7 @@ def load_video_frames_from_video_file(
             img_std=img_std,
             gpu_acceleration=gpu_acceleration,
             gpu_device=gpu_device,
+            progress=progress,
         )
         # The `AsyncVideoFileLoaderWithTorchCodec` class always loads the videos asynchronously,
         # so we just wait for its loading thread to finish if async_loading_frames=False.
@@ -313,6 +332,7 @@ def load_video_frames_from_video_file_using_cv2(
     img_mean: tuple = (0.5, 0.5, 0.5),
     img_std: tuple = (0.5, 0.5, 0.5),
     offload_video_to_cpu: bool = False,
+    progress=True,
 ) -> torch.Tensor:
     """
     Load video from path, convert to normalized tensor with specified preprocessing
@@ -339,7 +359,11 @@ def load_video_frames_from_video_file_using_cv2(
     num_frames = num_frames if num_frames > 0 else None
 
     frames = []
-    pbar = tqdm(desc=f"frame loading (OpenCV) [rank={RANK}]", total=num_frames)
+    pbar = tqdm(
+        desc=f"frame loading (OpenCV) [rank={RANK}]",
+        total=num_frames,
+        disable=not progress,
+    )
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -416,7 +440,15 @@ class AsyncImageFrameLoader:
     A list of video frames to be load asynchronously without blocking session start.
     """
 
-    def __init__(self, img_paths, image_size, offload_video_to_cpu, img_mean, img_std):
+    def __init__(
+        self,
+        img_paths,
+        image_size,
+        offload_video_to_cpu,
+        img_mean,
+        img_std,
+        progress=True,
+    ):
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
@@ -440,6 +472,7 @@ class AsyncImageFrameLoader:
                 for n in tqdm(
                     range(len(self.images)),
                     desc=f"frame loading (image folder) [rank={RANK}]",
+                    disable=not progress,
                 ):
                     self.__getitem__(n)
             except Exception as e:
@@ -589,8 +622,10 @@ class AsyncVideoFileLoaderWithTorchCodec:
         gpu_acceleration: bool = True,
         gpu_device: Optional[torch.device] = None,
         use_rand_seek_in_loading: bool = False,
+        progress: bool = True,
     ) -> None:
         # Check and possibly infer the output device (and also get its GPU id when applicable)
+        self.progress = progress
         assert gpu_device is None or gpu_device.type == "cuda"
         gpu_id = (
             gpu_device.index
@@ -660,7 +695,7 @@ class AsyncVideoFileLoaderWithTorchCodec:
     @torch.inference_mode()
     def _start_video_loading(self):
         desc = f"frame loading (TorchCodec w/ {'GPU' if self.gpu_acceleration else 'CPU'}) [rank={RANK}]"
-        pbar = tqdm(desc=desc, total=self.num_frames)
+        pbar = tqdm(desc=desc, total=self.num_frames, disable=not self.progress)
         self.num_loaded_frames = 0
         # load the first frame synchronously to cache it before the session is opened
         idx = self.num_loaded_frames

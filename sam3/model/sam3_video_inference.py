@@ -117,6 +117,7 @@ class Sam3VideoInference(Sam3VideoBase):
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
             video_loader_type=video_loader_type,
+            progress=getattr(self, "progress", True),
         )
         return self._init_state_from_images(
             images,
@@ -403,7 +404,7 @@ class Sam3VideoInference(Sam3VideoBase):
             inference_state["num_frames"],
             reverse,
             desc="propagate_in_video",
-            disable=self.rank > 0,
+            disable=self.rank > 0 or not getattr(self, "progress", True),
         ):
             # 每帧同时生成新检测并传播旧对象，随后在父类中完成关联和 memory 更新。
             out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
@@ -1043,7 +1044,7 @@ class Sam3VideoInference(Sam3VideoBase):
         feat_size = self.tracker.sam_image_embedding_size**2  # 72 * 72 = 5184
         hidden_dim = self.tracker.hidden_dim  # 256
         mem_dim = self.tracker.mem_dim  # 64
-        for _ in tqdm(range(num_iters)):
+        for _ in tqdm(range(num_iters), disable=not getattr(self, "progress", True)):
             for b in range(1, self.num_obj_for_compile + 1):
                 for i in range(
                     1,
@@ -1490,7 +1491,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         # 两个方向都已完成且没有新动作时，缓存已经是完整答案。
         if propagation_type == "propagation_fetch":
             for frame_idx in _frame_progress(
-                processing_order, inference_state["num_frames"], reverse
+                processing_order,
+                inference_state["num_frames"],
+                reverse,
+                disable=not getattr(self, "progress", True),
             ):
                 if self.rank == 0:
                     obj_id_to_mask = inference_state["cached_frame_outputs"].get(
@@ -1537,7 +1541,10 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 )
 
         for frame_idx in _frame_progress(
-            processing_order, inference_state["num_frames"], reverse
+            processing_order,
+            inference_state["num_frames"],
+            reverse,
+            disable=not getattr(self, "progress", True),
         ):
             # 局部路径先确保本帧视觉特征可用，再仅推进被细化对象的 tracker state。
             if propagation_type == "propagation_partial":

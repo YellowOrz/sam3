@@ -557,3 +557,32 @@ Chunk merging remaps scores with mask identities. Loading/resaving preserves sco
 replacing masks without scores clears their old scores. Legacy files still load
 without inventing scores or starting inference to recover them. Export validates
 scores before replacing existing video files.
+
+### Public headless backend (API v1)
+
+`sam3.video_backend` exposes `API_VERSION`, `MODEL`, `CAPABILITIES`,
+`create_predictor`, `normalize_output_arrays`, `create_mask_editor`, and
+`segment_video`. It is installed with the Python package and does not import the
+`scripts` tree or initialize a desktop GUI. `create_predictor` requires a local
+checkpoint and an explicit CUDA device; there is no device/model fallback.
+
+`create_predictor(..., progress=False)` disables frame-loading and propagation
+progress bars on that predictor only. Existing native predictor/desktop defaults
+remain visible. `clip_overseg` is also a construction argument rather than a
+client mutation of private model state.
+
+`segment_video(predictor, video=..., prompts=[...], output_dirs=[...])` requires
+one distinct empty output directory per prompt. It consumes the request/stream
+API directly, closes sessions on errors and exports the existing label-video,
+metadata and score format without desktop checkpoint requests. Optional
+`geometry_prompts`, `chunk_frames`, `progress(done,total)` and
+`prompt_done(text,path,frames,elapsed_seconds)` preserve the existing headless
+workflow. A successful return is not human review.
+
+`create_mask_editor(predictor, state, frame_path=lambda i: paths[i])` exposes the
+existing tracker-only editor with lossless PNG support. `reset`, `initialize`,
+`track_frame`, point requests and bounded stream requests retain their original
+validation and tracker semantics. The desktop script imports this same editor;
+clients must not copy backbone/FPN preprocessing. Shared video/output helpers
+live in `sam3.video_io` and `sam3.video_outputs`; the former script utility module
+remains a compatibility import.

@@ -2,7 +2,14 @@
 
 # pyre-unsafe
 
-from .model_builder import build_sam3_image_model, build_sam3_predictor
+
+def __getattr__(name):
+    if name in __all__:
+        from . import model_builder
+
+        return getattr(model_builder, name)
+    raise AttributeError(name)
+
 
 __version__ = "0.1.0"
 

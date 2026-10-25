@@ -45,6 +45,8 @@ class Sam3VideoPredictor(Sam3BasePredictor):
         apply_temporal_disambiguation: bool = True,
         compile: bool = False,
         learned_prompt_path=None,
+        progress=True,
+        clip_overseg=False,
     ):
         """! @brief 加载 SAM 3 视频模型并配置帧加载方式。
 
@@ -74,6 +76,9 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             .cuda()
             .eval()
         )
+
+        self.model.progress = progress
+        self.model.clip_overseg = clip_overseg
 
     @torch.inference_mode()
     def handle_request(self, request):
