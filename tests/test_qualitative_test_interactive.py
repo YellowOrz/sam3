@@ -1565,6 +1565,9 @@ def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
         app.frame_offset = start
         app.cache = {index: {1: mask} for index in range(frame_count)}
         app.probability_cache = {index: {1: 0.75} for index in range(frame_count)}
+        app.tracking_probability_cache = {
+            index: {1: 0.1 * (start + index)} for index in range(frame_count)
+        }
         app.confirmed_points = [qualitative.PointEdit(1, 0, 1, 4, 3, 1)]
         app.events = [
             {
@@ -1602,6 +1605,14 @@ def test_merge_chunk_outputs_concatenates_videos_and_offsets_interactions(
     finally:
         capture.release()
     metadata = json.loads((output_dir / "metadata.json").read_text())
+    assert [frame["frame_index"] for frame in metadata["mask_scores"]["frames"]] == [
+        0,
+        1,
+        2,
+    ]
+    assert [
+        frame["objects"][0]["tracking"] for frame in metadata["mask_scores"]["frames"]
+    ] == [0.0, 0.1, 0.2]
     assert metadata["frames_processed"] == 3
     assert metadata["clip_overseg"] is False
     assert [
@@ -3238,3 +3249,52 @@ def test_skip_stops_active_propagation(tmp_path, monkeypatch):
     with pytest.raises(qualitative.SkipVideo):
         app.run()
     assert events == ["stop", "join", "close"]
+
+
+def test_load_resave_preserves_scores_and_replacement_clears_old_scores(tmp_path):
+    original = make_app(tmp_path)
+    mask = np.ones((8, 10), dtype=bool)
+    original.cache = {frame: {7: mask} for frame in range(3)}
+    original.probability_cache = {frame: {7: 0.95} for frame in range(3)}
+    original.tracking_probability_cache = {0: {7: 0.1}, 1: {7: 0.0}, 2: {}}
+    qualitative.write_interactive_outputs(original)
+    app = make_loaded_app(tmp_path)
+    app.frame_count = 3
+    app.video_info = original.video_info
+    qualitative.load_interactive_result(app)
+    assert app.probability_cache == {frame: {0: 0.95} for frame in range(3)}
+    assert app.tracking_probability_cache == {0: {0: 0.1}, 1: {0: 0.0}, 2: {}}
+    qualitative.write_interactive_outputs(app)
+    frames = json.loads((app.output_dir / "metadata.json").read_text())["mask_scores"][
+        "frames"
+    ]
+    assert frames[1]["objects"][0]["tracking"] == 0.0
+    app.store_masks(0, {0: ~mask}, {})
+    assert app.probability_cache[0] == app.tracking_probability_cache[0] == {}
+
+
+def test_legacy_masks_load_without_inventing_scores(tmp_path):
+    original = make_app(tmp_path)
+    original.cache = {frame: {7: np.ones((8, 10), dtype=bool)} for frame in range(3)}
+    qualitative.write_interactive_outputs(original)
+    path = original.output_dir / "metadata.json"
+    metadata = json.loads(path.read_text())
+    del metadata["mask_scores"]
+    path.write_text(json.dumps(metadata))
+    app = make_loaded_app(tmp_path)
+    app.frame_count = 3
+    app.video_info = original.video_info
+    qualitative.load_interactive_result(app)
+    assert app.tracking_probability_cache == {0: {}, 1: {}, 2: {}}
+
+
+def test_loaded_preview_baseline_restores_both_score_types(tmp_path):
+    app = make_loaded_app(tmp_path)
+    mask = np.ones((8, 10), dtype=bool)
+    app.store_masks(0, {7: mask}, {7: 0.9}, {7: 0.2})
+    app.restore_preview_baseline(0)
+    app.store_masks(0, {7: ~mask}, {}, {7: 0.8})
+    app.restore_preview_baseline(0)
+    assert app.probability_cache[0] == {7: 0.9}
+    assert app.tracking_probability_cache[0] == {7: 0.2}
+    assert np.array_equal(app.cache[0][7], mask)

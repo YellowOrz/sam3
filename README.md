@@ -541,3 +541,19 @@ If you use SAM 3 or the SA-Co dataset in your research, please use the following
       url={https://arxiv.org/abs/2511.16719},
 }
 ```
+
+
+### Interactive mask score export
+
+`qualitative_test_interactive.py` (including multi-prompt/headless callers) now writes
+`metadata.json.mask_scores` with schema `sam3/mask-scores/1`. Every processed frame
+has its source `frame_index` and an `objects` list for nonempty masks. Each entry
+contains the exported `object_id`, its mask `label`, `detection` (`out_probs`, the
+initial detection score), and `tracking` (`out_tracker_probs`, the frame-wise
+tracker score). Missing values are JSON `null`; zero is valid. These are raw model
+scores, not calibrated probabilities that a mask is correct; prompt/conditioning
+scores may be supplied by the predictor rather than independently estimated.
+Chunk merging remaps scores with mask identities. Loading/resaving preserves scores;
+replacing masks without scores clears their old scores. Legacy files still load
+without inventing scores or starting inference to recover them. Export validates
+scores before replacing existing video files.

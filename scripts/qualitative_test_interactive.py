@@ -58,7 +58,7 @@ input 侧预分割结果不会因此被跳过，仍需加载审查。若要重�
 首次编辑只在编辑帧初始化 tracker；手动传播严格遵守当前范围（默认全视频），
 双向各自从同一修正帧初始化，经过其他已确认修正帧时使用其掩码作为新条件。
 这条路径仅推进已有实例的 tracker，不重新执行文本检测，也不恢复旧 session 的 memory；
-保存文件不含原始概率或重叠实例信息。原先分块生成的结果按合并后的全视频编辑，
+新结果的 metadata.json 含逐帧逐物体检测/跟踪分数；旧结果缺失分数仍留空，不恢复重叠实例信息。原先分块生成的结果按合并后的全视频编辑，
 全视频掩码会载入内存，长视频需要足够 RAM。
 从输出目录加载时，仅浏览后按 ``Q`` 不改写文件；从输入侧加载时，审查完成按 ``Q``
 会将原结果文件复制到输出目录（无修改时不重新编码、不运行模型；三文件批量结果另生成
@@ -642,23 +642,110 @@ def mutation_series(
     return series
 
 
+def probability(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError("a probability must be a finite number in [0, 1]")
+    value = float(value)
+    if not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError("a probability must be a finite number in [0, 1]")
+    return value
+
+
 def normalize_frame_outputs(
     outputs: Optional[Dict[str, Any]],
-) -> Tuple[Dict[int, np.ndarray], Dict[int, float]]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, float], Dict[int, float]]:
     masks = normalize_masks(outputs)
     if not outputs:
-        return masks, {}
+        return masks, {}, {}
     obj_ids = as_numpy(outputs.get("out_obj_ids")).reshape(-1)
-    probabilities = as_numpy(outputs.get("out_probs")).reshape(-1)
-    if len(probabilities) not in (0, len(obj_ids)):
-        raise RuntimeError(
-            f"object and probability counts differ: "
-            f"{len(obj_ids)} != {len(probabilities)}"
+    scores = []
+    for key in ("out_probs", "out_tracker_probs"):
+        values = as_numpy(outputs.get(key)).reshape(-1)
+        if len(values) not in (0, len(obj_ids)):
+            raise RuntimeError(f"object and {key} counts differ")
+        scores.append(
+            {
+                int(obj): probability(value)
+                for obj, value in zip(obj_ids, values)
+                if value is not None
+            }
         )
-    return masks, {
-        int(obj_id): float(probability)
-        for obj_id, probability in zip(obj_ids, probabilities)
-    }
+    return masks, scores[0], scores[1]
+
+
+MASK_SCORE_SCHEMA = "sam3/mask-scores/1"
+
+
+def read_mask_scores(metadata: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    board = metadata.get("mask_scores")
+    if board is None:
+        return None
+    if not isinstance(board, dict) or board.get("schema_version") != MASK_SCORE_SCHEMA:
+        raise ValueError("unsupported mask score schema")
+    frames = board.get("frames")
+    count = metadata["frames_processed"]
+    start = metadata.get("source", {}).get("frame_start", 0)
+    labels = {int(obj): label for obj, label in metadata["object_id_to_label"].items()}
+    if (
+        type(count) is not int
+        or count <= 0
+        or type(start) is not int
+        or not isinstance(frames, list)
+        or len(frames) != count
+    ):
+        raise ValueError("mask score frame count differs")
+    for index, frame in enumerate(frames):
+        if (
+            not isinstance(frame, dict)
+            or type(frame.get("frame_index")) is not int
+            or frame["frame_index"] != start + index
+            or not isinstance(frame.get("objects"), list)
+        ):
+            raise ValueError("invalid mask score frame")
+        seen = set()
+        for item in frame["objects"]:
+            obj = item["object_id"]
+            if (
+                type(obj) is not int
+                or obj not in labels
+                or obj in seen
+                or item["label"] != labels[obj]
+            ):
+                raise ValueError("mask score identity differs")
+            seen.add(obj)
+            for key in ("detection", "tracking"):
+                probability(item[key])
+    return frames
+
+
+def export_mask_scores(
+    app: Any, mapping: Dict[int, int], labels: Dict[int, int]
+) -> Dict[str, Any]:
+    frames = []
+    for frame in range(app.frame_count):
+        objects = []
+        for obj, mask in sorted(app.cache[frame].items()):
+            if not mask.any():
+                continue
+            exported = mapping[obj]
+            objects.append(
+                {
+                    "object_id": exported,
+                    "label": labels[exported],
+                    "detection": probability(
+                        app.probability_cache.get(frame, {}).get(obj)
+                    ),
+                    "tracking": probability(
+                        app.tracking_probability_cache.get(frame, {}).get(obj)
+                    ),
+                }
+            )
+        frames.append({"frame_index": app.frame_offset + frame, "objects": objects})
+    return {"schema_version": MASK_SCORE_SCHEMA, "frames": frames}
 
 
 def draw_frame_status_overlay(image: np.ndarray, status: str) -> np.ndarray:
@@ -1161,6 +1248,7 @@ class InteractiveApp:
         self._mutation_key: Optional[int] = None
         self._mutation_cached: List[Tuple[int, float]] = []
         self.probability_cache: Dict[int, Dict[int, float]] = {}
+        self.tracking_probability_cache: Dict[int, Dict[int, float]] = {}
         self.stale_frames: set[int] = set()
         self.display_index = 0
         self.playing = True
@@ -1234,9 +1322,11 @@ class InteractiveApp:
         frame_index: int,
         masks: Dict[int, np.ndarray],
         probabilities: Dict[int, float],
+        tracking_probabilities: Optional[Dict[int, float]] = None,
     ) -> None:
         self.cache[frame_index] = masks
         self.probability_cache[frame_index] = probabilities
+        self.tracking_probability_cache[frame_index] = tracking_probabilities or {}
         if masks:
             self.next_obj_id = max(self.next_obj_id, max(masks) + 1)
         self._mask_revision += 1
@@ -1244,8 +1334,7 @@ class InteractiveApp:
     def store_frame_outputs(
         self, frame_index: int, outputs: Optional[Dict[str, Any]]
     ) -> None:
-        masks, probabilities = normalize_frame_outputs(outputs)
-        self.store_masks(frame_index, masks, probabilities)
+        self.store_masks(frame_index, *normalize_frame_outputs(outputs))
 
     def cached_mutation_series(self) -> List[Tuple[int, float]]:
         if self._mutation_key != self._mask_revision:
@@ -1356,8 +1445,7 @@ class InteractiveApp:
                 continue
             if event_type == "frame":
                 frame_index = int(value)
-                masks, probabilities = extra
-                self.store_masks(frame_index, masks, probabilities)
+                self.store_masks(frame_index, *extra)
                 self.stale_frames.discard(frame_index)
             elif event_type == "done":
                 stopped = bool(value)
@@ -1575,8 +1663,9 @@ class InteractiveApp:
         )
         for masks in self.cache.values():
             masks.pop(obj_id, None)
-        for probs in self.probability_cache.values():
-            probs.pop(obj_id, None)
+        for cache in (self.probability_cache, self.tracking_probability_cache):
+            for probs in cache.values():
+                probs.pop(obj_id, None)
         self._mask_revision += 1
         self.clear_object_selection(update_status=False)
         self.predictor.handle_request(
@@ -2845,8 +2934,10 @@ class LoadedMaskPredictor:
             "out_obj_ids": np.asarray(list(tracked)),
             "out_binary_masks": np.stack(list(tracked.values())),
         }
-        if not untracked:
-            result["out_probs"] = as_numpy(scores.float().sigmoid()).reshape(-1)
+        score_by_id = dict(zip(ids, as_numpy(scores.float().sigmoid()).reshape(-1)))
+        result["out_tracker_probs"] = np.asarray(
+            [score_by_id.get(obj) for obj in tracked]
+        )
         return result
 
     @torch.inference_mode()
@@ -2959,6 +3050,7 @@ class LoadedInteractiveApp(InteractiveApp):
         self.loaded_points: Dict[int, Dict[str, Any]] = {}
         self.loaded_anchor_frames: set[int] = set()
         self.edit_baselines: Dict[int, Dict[int, np.ndarray]] = {}
+        self.edit_score_baselines: Dict[int, Any] = {}
         self.dirty = False
         self.playing = False
 
@@ -2968,7 +3060,14 @@ class LoadedInteractiveApp(InteractiveApp):
             target_frame_index,
             {obj: mask.copy() for obj, mask in self.cache[target_frame_index].items()},
         )
-        self.store_masks(target_frame_index, dict(baseline), {})
+        scores = self.edit_score_baselines.setdefault(
+            target_frame_index,
+            (
+                dict(self.probability_cache.get(target_frame_index, {})),
+                dict(self.tracking_probability_cache.get(target_frame_index, {})),
+            ),
+        )
+        self.store_masks(target_frame_index, dict(baseline), *scores)
         self.predictor.reset(target_frame_index, baseline)
         self.set_display_index(target_frame_index)
 
@@ -2982,6 +3081,7 @@ class LoadedInteractiveApp(InteractiveApp):
         frame = super().commit_draft()
         if frame is not None:
             self.edit_baselines.pop(frame, None)
+            self.edit_score_baselines.pop(frame, None)
             if changed:
                 self.loaded_anchor_frames.add(frame)
                 self.dirty = True
@@ -2992,6 +3092,7 @@ class LoadedInteractiveApp(InteractiveApp):
         super().cancel_edit()
         if frame is not None:
             self.edit_baselines.pop(frame, None)
+            self.edit_score_baselines.pop(frame, None)
 
     def start_propagation(self, frame_index: int, mode: str) -> None:
         if not self.prop_range_left <= frame_index <= self.prop_range_right:
@@ -3111,6 +3212,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             if not available:
                 raise RuntimeError("more than 255 instance labels; uint8 overflow")
             object_to_label[obj_id] = min(available)
+    mask_scores = export_mask_scores(app, id_mapping, object_to_label)
     app.output_dir.mkdir(parents=True, exist_ok=True)
     result_path = app.output_dir / "result.mp4"
     masks_path = app.output_dir / "masks.mkv"
@@ -3208,6 +3310,7 @@ def write_interactive_outputs(app: InteractiveApp) -> None:
             "clip_overseg": app.clip_overseg,
             "source": source,
             "frames_processed": app.frame_count,
+            "mask_scores": mask_scores,
             "original_object_id_to_object_id": id_mapping,
             "object_id_to_label": {
                 str(obj_id): label for obj_id, label in sorted(object_to_label.items())
@@ -3600,6 +3703,7 @@ def merge_chunk_outputs(
         raise RuntimeError("cannot create merged output videos")
 
     chunk_metadata = []
+    score_frames = []
     confirmed_points = []
     events = []
     sequence_offset = 0
@@ -3607,6 +3711,9 @@ def merge_chunk_outputs(
         for chunk_index, (start, end, chunk_dir) in enumerate(chunks, 1):
             mapping = mappings[chunk_index - 1]
             labels = local_labels[chunk_index - 1]
+            local_scores = read_mask_scores(metadata_by_chunk[chunk_index - 1])
+            if local_scores is not None and len(local_scores) != end - start:
+                raise ValueError("chunk score frame count differs from chunk range")
             mask_capture = cv2.VideoCapture(str(chunk_dir / "masks.mkv"))
             try:
                 if not mask_capture.isOpened():
@@ -3626,6 +3733,41 @@ def merge_chunk_outputs(
                         mapping[local_id]: local_image == label
                         for local_id, label in labels.items()
                     }
+                    objects = []
+                    known = (
+                        {
+                            item["object_id"]: item
+                            for item in local_scores[frame_index - start]["objects"]
+                        }
+                        if local_scores is not None
+                        else {}
+                    )
+                    if local_scores is not None and (
+                        local_scores[frame_index - start]["frame_index"] != frame_index
+                        or set(known)
+                        != {
+                            obj
+                            for obj, label in labels.items()
+                            if (local_image == label).any()
+                        }
+                    ):
+                        raise ValueError(
+                            "chunk scores do not match mask instances/frames"
+                        )
+                    for local_id, global_id in mapping.items():
+                        if (local_image == labels[local_id]).any():
+                            item = known.get(local_id, {})
+                            objects.append(
+                                {
+                                    "object_id": global_id,
+                                    "label": global_labels[global_id],
+                                    "detection": item.get("detection"),
+                                    "tracking": item.get("tracking"),
+                                }
+                            )
+                    score_frames.append(
+                        {"frame_index": frame_index, "objects": objects}
+                    )
                     mask_writer.write(
                         build_label_image(
                             masks, global_labels, video_info.width, video_info.height
@@ -3742,6 +3884,10 @@ def merge_chunk_outputs(
             "prompt": prompt,
             "frames_processed": video_info.frame_count,
             "object_identity_scope": "video",
+            "mask_scores": {
+                "schema_version": MASK_SCORE_SCHEMA,
+                "frames": score_frames,
+            },
         },
     )
     atomic_write_json(
@@ -3961,6 +4107,8 @@ def load_interactive_result(app: LoadedInteractiveApp) -> None:
             raise ValueError("saved mask video has extra frames")
     finally:
         capture.release()
+    score_frames = read_mask_scores(metadata)
+    app.frame_offset = metadata.get("source", {}).get("frame_start", 0)
     points = []
     for item in interactions.get("confirmed_points", []):
         if item.get("obj_id") is None:
@@ -3999,7 +4147,23 @@ def load_interactive_result(app: LoadedInteractiveApp) -> None:
     app.loaded_anchor_frames = {point.frame_index for point in points}
     app.next_obj_id = max(labels, default=-1) + 1
     for frame, masks in cache.items():
-        app.store_masks(frame, masks, {})
+        objects = score_frames[frame]["objects"] if score_frames is not None else []
+        if score_frames is not None and {item["object_id"] for item in objects} != set(
+            masks
+        ):
+            raise ValueError("saved scores do not match mask instances")
+        app.store_masks(
+            frame,
+            masks,
+            *[
+                {
+                    item["object_id"]: item[key]
+                    for item in objects
+                    if item[key] is not None
+                }
+                for key in ("detection", "tracking")
+            ],
+        )
     app.propagation_complete = True
     app.status = "loaded result - paused (no propagation)"
     app.cached_mutation_series()

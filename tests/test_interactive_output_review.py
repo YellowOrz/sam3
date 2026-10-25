@@ -32,6 +32,7 @@ def make_outputs(tmp_path, ids=(0, 2), frame_count=2):
         frame_offset=0,
         cache={index: dict(masks) for index in range(frame_count)},
         probability_cache={},
+        tracking_probability_cache={},
         prompt="hand",
         version="sam3",
         clip_overseg=False,
@@ -138,7 +139,12 @@ def test_global_label_capacity_checked_before_export():
 
 def test_review_rewrites_masks_and_records_until_confirmed(tmp_path, monkeypatch):
     app = make_outputs(tmp_path / "source", frame_count=2)
-    chunks = [(0, 1, app.output_dir), (1, 2, app.output_dir)]
+    chunks = []
+    for start in range(2):
+        chunk = make_outputs(tmp_path / f"chunk-{start}", frame_count=1)
+        chunk.frame_offset = start
+        qualitative.write_interactive_outputs(chunk)
+        chunks.append((start, start + 1, chunk.output_dir))
     output_dir = tmp_path / "merged"
     replay_states = []
 
@@ -220,3 +226,111 @@ def test_interrupted_review_retains_unconfirmed_mapping(
         "1": 8,
     }
     assert len(read_masks(output_dir)) == 2
+
+
+def test_normalize_keeps_detection_and_tracking_scores_separate():
+    masks = np.ones((2, 3, 4), dtype=bool)
+    _, detection, tracking = qualitative.normalize_frame_outputs(
+        {
+            "out_obj_ids": np.array([7, 2]),
+            "out_binary_masks": masks,
+            "out_probs": np.array([0.95, 0.9]),
+            "out_tracker_probs": np.array([0.2, 0.0]),
+        }
+    )
+    assert detection == {7: 0.95, 2: 0.9}
+    assert tracking == {7: 0.2, 2: 0.0}
+    _, detection, tracking = qualitative.normalize_frame_outputs(
+        {
+            "out_obj_ids": np.array([7, 2]),
+            "out_binary_masks": masks,
+        }
+    )
+    assert detection == tracking == {}
+
+
+@pytest.mark.parametrize("value", [True, -0.1, 1.1, float("nan"), float("inf")])
+def test_invalid_probability_is_not_exported(value):
+    with pytest.raises(ValueError):
+        qualitative.probability(value)
+
+
+def test_export_scores_follow_compacted_ids_labels_and_source_frames(tmp_path):
+    app = make_outputs(tmp_path, ids=(7, 2))
+    app.frame_offset = 10
+    app.probability_cache = {0: {7: 0.9, 2: 0.8}, 1: {7: 0.9}}
+    app.tracking_probability_cache = {0: {7: 0.2, 2: 0.0}, 1: {7: 0.7}}
+    qualitative.write_interactive_outputs(app)
+    metadata = read_json(app.output_dir)
+    frames = qualitative.read_mask_scores(metadata)
+    assert frames == [
+        {
+            "frame_index": 10,
+            "objects": [
+                {"object_id": 0, "label": 1, "detection": 0.8, "tracking": 0.0},
+                {"object_id": 1, "label": 2, "detection": 0.9, "tracking": 0.2},
+            ],
+        },
+        {
+            "frame_index": 11,
+            "objects": [
+                {"object_id": 0, "label": 1, "detection": None, "tracking": None},
+                {"object_id": 1, "label": 2, "detection": 0.9, "tracking": 0.7},
+            ],
+        },
+    ]
+    assert app.tracking_probability_cache[0] == {7: 0.2, 2: 0.0}
+
+
+def test_invalid_score_does_not_replace_successful_files(tmp_path):
+    app = make_outputs(tmp_path)
+    before = {p.name: p.read_bytes() for p in app.output_dir.iterdir()}
+    app.tracking_probability_cache = {0: {0: float("nan")}}
+    with pytest.raises(ValueError):
+        qualitative.write_interactive_outputs(app)
+    assert before == {p.name: p.read_bytes() for p in app.output_dir.iterdir()}
+
+
+def test_chunk_scores_use_global_identity_and_legacy_scores_stay_missing(tmp_path):
+    chunks = []
+    apps = []
+    for index in range(2):
+        app = make_outputs(tmp_path / str(index), ids=(7, 2), frame_count=1)
+        app.frame_offset = index
+        app.probability_cache = {0: {7: 0.9, 2: 0.8}}
+        app.tracking_probability_cache = {0: {7: 0.2, 2: 0.0}}
+        qualitative.write_interactive_outputs(app)
+        apps.append(app)
+        chunks.append((index, index + 1, app.output_dir))
+    meta = read_json(apps[1].output_dir)
+    del meta["mask_scores"]
+    (apps[1].output_dir / "metadata.json").write_text(json.dumps(meta))
+    frame_dir = tmp_path / "all-frames"
+    frame_dir.mkdir()
+    for index in range(2):
+        assert cv2.imwrite(
+            str(frame_dir / f"{index:05d}.jpg"), np.zeros((64, 96, 3), dtype=np.uint8)
+        )
+    dest = tmp_path / "merged"
+    qualitative.merge_chunk_outputs(
+        chunks,
+        dest,
+        tmp_path / "input.mp4",
+        qualitative.VideoInfo(96, 64, 2, 12.0),
+        "hand",
+        "sam3",
+        100,
+        frame_dir,
+        mappings=[{0: 9, 1: 4}, {0: 9, 1: 4}],
+        confirmed=True,
+    )
+    frames = qualitative.read_mask_scores(read_json(dest))
+    assert frames[0]["objects"] == [
+        {"object_id": 9, "label": 2, "detection": 0.8, "tracking": 0.0},
+        {"object_id": 4, "label": 1, "detection": 0.9, "tracking": 0.2},
+    ]
+    assert frames[1]["frame_index"] == 1
+    assert all(
+        item["tracking"] is None and item["detection"] is None
+        for item in frames[1]["objects"]
+    )
