@@ -586,6 +586,7 @@ def write_interactive_outputs(app: Any) -> None:
             "clip_overseg": app.clip_overseg,
             "source": source,
             "frames_processed": app.frame_count,
+            **({"propagation": app.propagation} if hasattr(app, "propagation") else {}),
             "mask_scores": mask_scores,
             "original_object_id_to_object_id": id_mapping,
             "object_id_to_label": {

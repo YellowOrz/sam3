@@ -37,7 +37,13 @@ class Predictor:
         self.requests.append(request)
         if self.fail:
             raise RuntimeError("failed stream")
-        for frame in range(3):
+        start = request["start_frame_index"]
+        frames = (
+            range(start, 3)
+            if request["propagation_direction"] == "forward"
+            else range(start - 1, -1, -1)
+        )
+        for frame in frames:
             yield {"frame_index": frame, "outputs": self.output()}
 
 
@@ -168,3 +174,131 @@ def test_backend_does_not_import_desktop_scripts():
         text = (root / name).read_text()
         assert "from scripts" not in text and "import scripts" not in text
         assert "tqdm.__init__" not in text
+
+
+@pytest.mark.parametrize(
+    "start, directions",
+    [(0, ["forward"]), (1, ["forward", "backward"]), (2, ["backward"])],
+)
+def test_custom_start_covers_all_frames_in_one_session(tmp_path, start, directions):
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for frame in range(3):
+        Image.new("RGB", (10, 8)).save(frames / f"{frame:05d}.jpg")
+    predictor = Predictor()
+    progress = []
+    backend._segment_clip(
+        predictor,
+        tmp_path / "video",
+        video_outputs.VideoInfo(10, 8, 3, 30),
+        frames,
+        tmp_path / "out",
+        "hand",
+        0,
+        None,
+        progress.append,
+        start_frame_index=start,
+    )
+    streams = [r for r in predictor.requests if r["type"] == "propagate_in_video"]
+    assert [r["propagation_direction"] for r in streams] == directions
+    assert all(
+        r["start_frame_index"] == start and r["session_id"] == "test" for r in streams
+    )
+    assert (
+        next(r for r in predictor.requests if r["type"] == "add_prompt")["frame_index"]
+        == start
+    )
+    assert sum(r["type"] == "start_session" for r in predictor.requests) == 1
+    assert progress == sorted(progress) and progress[-1] == 3
+    metadata = json.loads((tmp_path / "out/metadata.json").read_text())
+    assert metadata["propagation"]["start_frame_index"] == start
+    assert [f["frame_index"] for f in metadata["mask_scores"]["frames"]] == [0, 1, 2]
+
+
+def test_single_frame_needs_no_stream(tmp_path):
+    Image.new("RGB", (10, 8)).save(tmp_path / "00000.jpg")
+    predictor = Predictor()
+    backend._segment_clip(
+        predictor,
+        tmp_path / "video",
+        video_outputs.VideoInfo(10, 8, 1, 30),
+        tmp_path,
+        tmp_path / "out",
+        "hand",
+        0,
+        None,
+        lambda _: None,
+    )
+    assert not any(r["type"] == "propagate_in_video" for r in predictor.requests)
+    assert (
+        json.loads((tmp_path / "out/metadata.json").read_text())["frames_processed"]
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "count, index, fraction, expected",
+    [
+        (101, 0, 0.5, 50),
+        (100, 0, 0.5, 49),
+        (101, 0, 0.58, 58),
+        (101, 0, 0, 0),
+        (101, 0, 1, 100),
+        (3, 99, None, 2),
+        (1, 0, 0.5, 0),
+    ],
+)
+def test_public_backend_resolves_start_from_decoded_count(
+    tmp_path, monkeypatch, count, index, fraction, expected
+):
+    from contextlib import nullcontext
+
+    import torch
+
+    calls = []
+    monkeypatch.setattr(torch, "inference_mode", nullcontext)
+    monkeypatch.setattr(torch, "autocast", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    monkeypatch.setattr(
+        video_outputs, "probe_video", lambda _: video_outputs.VideoInfo(10, 8, 999, 30)
+    )
+    monkeypatch.setattr(video_outputs, "extract_frames", lambda *a: count)
+    monkeypatch.setattr(
+        backend, "_segment_clip", lambda *a, **kw: calls.append(kw["start_frame_index"])
+    )
+    result = backend.segment_video(
+        object(),
+        video=tmp_path / "video",
+        prompts=["hand", "cup"],
+        output_dirs=[tmp_path / "hand", tmp_path / "cup"],
+        start_frame_index=index,
+        start_fraction=fraction,
+    )
+    assert calls == [expected, expected]
+    assert result["start_frame_index"] == expected and result["frames"] == count
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"start_frame_index": True},
+        {"start_frame_index": -1},
+        {"start_fraction": float("nan")},
+        {"start_fraction": float("inf")},
+        {"start_fraction": -0.1},
+        {"start_fraction": 1.1},
+        {"start_fraction": True},
+        {"start_frame_index": 2, "start_fraction": 0.5},
+        {"chunk_frames": 100, "start_frame_index": 2},
+        {"chunk_frames": 100, "start_fraction": 0.5},
+    ],
+)
+def test_invalid_custom_start_is_rejected_before_decoding(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="start"):
+        backend.segment_video(
+            object(),
+            video=tmp_path / "video",
+            prompts=["hand"],
+            output_dirs=[tmp_path / "out"],
+            **kwargs,
+        )

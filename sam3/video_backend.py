@@ -4,8 +4,10 @@ The request/stream API is shared with Sam3VideoPredictor. No desktop UI,
 checkpoint interception, global progress patches, or business identities.
 """
 
+import math
 import tempfile
 import time
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +16,15 @@ from sam3.video_io import normalize_output_arrays
 API_VERSION = 1
 MODEL = "sam3"
 CAPABILITIES = frozenset(
-    {"text", "text_batch", "geometry", "points", "mask_tracking", "chunking"}
+    {
+        "text",
+        "text_batch",
+        "geometry",
+        "points",
+        "mask_tracking",
+        "chunking",
+        "propagation_start",
+    }
 )
 
 
@@ -56,10 +66,25 @@ def create_mask_editor(predictor, state, *, frame_path):
 
 
 def _segment_clip(
-    predictor, video, info, frames, output, prompt, offset, geometry, progress
+    predictor,
+    video,
+    info,
+    frames,
+    output,
+    prompt,
+    offset,
+    geometry,
+    progress,
+    *,
+    start_frame_index=0,
 ):
     from sam3.video_outputs import normalize_frame_outputs, write_interactive_outputs
 
+    if (
+        type(start_frame_index) is not int
+        or not 0 <= start_frame_index < info.frame_count
+    ):
+        raise ValueError("invalid propagation start frame")
     sid = predictor.handle_request(
         {
             "type": "start_session",
@@ -83,7 +108,11 @@ def _segment_clip(
         clip_overseg=False,
         confirmed_points=[],
         events=[],
-        initial_propagation_mode="forward",
+        initial_propagation_mode="both" if start_frame_index else "forward",
+        propagation={
+            "start_frame_index": start_frame_index,
+            "direction": "both" if start_frame_index else "forward",
+        },
     )
 
     def cache(frame, outputs):
@@ -96,30 +125,39 @@ def _segment_clip(
             state.cache[frame],
             state.probability_cache[frame],
             state.tracking_probability_cache[frame],
-        ) = masks, detection, tracking
+        ) = (
+            masks,
+            detection,
+            tracking,
+        )
         progress(len(state.cache))
 
     try:
         request = {
             "type": "add_geometry_prompts" if geometry else "add_prompt",
             "session_id": sid,
-            "frame_index": 0,
+            "frame_index": start_frame_index,
             "text": prompt,
         }
         if geometry:
             request["geometry_prompts"] = geometry
         initial = predictor.handle_request(request)
-        cache(0, initial.get("outputs"))
-        for result in predictor.handle_stream_request(
-            {
-                "type": "propagate_in_video",
-                "session_id": sid,
-                "start_frame_index": 0,
-                "max_frame_num_to_track": info.frame_count - 1,
-                "propagation_direction": "forward",
-            }
-        ):
-            cache(result["frame_index"], result["outputs"])
+        cache(start_frame_index, initial.get("outputs"))
+        # A forward pass at the last frame makes SAM3 treat the whole video as cached.
+        directions = ["forward"] if start_frame_index < info.frame_count - 1 else []
+        if start_frame_index > 0:
+            directions.append("backward")
+        for direction in directions:
+            for result in predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": sid,
+                    "start_frame_index": start_frame_index,
+                    "max_frame_num_to_track": info.frame_count - 1,
+                    "propagation_direction": direction,
+                }
+            ):
+                cache(result["frame_index"], result["outputs"])
         if len(state.cache) != info.frame_count:
             raise ValueError("backend returned an incomplete video")
         write_interactive_outputs(state)
@@ -135,6 +173,8 @@ def segment_video(
     output_dirs,
     geometry_prompts=None,
     chunk_frames=0,
+    start_frame_index=0,
+    start_fraction=None,
     progress=lambda *_: None,
     prompt_done=lambda *_: None,
 ):
@@ -161,6 +201,17 @@ def segment_video(
         raise ValueError("automatic output directories must be distinct and empty")
     if type(chunk_frames) is not int or chunk_frames < 0:
         raise ValueError("invalid chunk size")
+    if type(start_frame_index) is not int or start_frame_index < 0:
+        raise ValueError("invalid propagation start frame")
+    if start_fraction is not None and (
+        type(start_fraction) not in (int, float)
+        or not math.isfinite(start_fraction)
+        or not 0 <= start_fraction <= 1
+        or start_frame_index != 0
+    ):
+        raise ValueError("invalid propagation start fraction")
+    if chunk_frames and (start_frame_index != 0 or start_fraction not in (None, 0)):
+        raise ValueError("custom propagation start cannot be chunked")
     geometry_prompts = geometry_prompts or [None] * len(prompts)
     if len(geometry_prompts) != len(prompts) or chunk_frames and any(geometry_prompts):
         raise ValueError("geometry must align with prompts and cannot be chunked")
@@ -175,6 +226,11 @@ def segment_video(
         count = extract_frames(video, frames)
         if count <= 0:
             raise ValueError("video contains no frames")
+        start_frame_index = (
+            int((count - 1) * Fraction(str(start_fraction)))
+            if start_fraction is not None
+            else min(start_frame_index, count - 1)
+        )
         info = VideoInfo(original.width, original.height, count, original.fps)
         total = count * len(prompts)
         for query, (prompt, output, geometry) in enumerate(
@@ -192,6 +248,7 @@ def segment_video(
                     0,
                     geometry,
                     lambda done: progress(query * count + done, total),
+                    start_frame_index=start_frame_index,
                 )
             else:
                 chunks = []
@@ -230,4 +287,8 @@ def segment_video(
                     clip_overseg=False,
                 )
             prompt_done(prompt, output, count, time.monotonic() - started)
-        return {"frames": count, "prompt_count": len(prompts)}
+        return {
+            "frames": count,
+            "prompt_count": len(prompts),
+            "start_frame_index": start_frame_index,
+        }
