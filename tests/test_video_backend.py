@@ -47,11 +47,21 @@ class Predictor:
             yield {"frame_index": frame, "outputs": self.output()}
 
 
-def test_headless_exports_scores_without_desktop_checkpoints_and_closes(tmp_path):
+@pytest.mark.parametrize("render_preview", [False, True])
+def test_headless_exports_scores_without_desktop_checkpoints_and_closes(
+    tmp_path, monkeypatch, render_preview
+):
     frames = tmp_path / "frames"
     frames.mkdir()
     for i in range(3):
         Image.new("RGB", (10, 8)).save(frames / f"{i:05d}.jpg")
+    if not render_preview:
+
+        def no_preview(*args, **kwargs):
+            pytest.fail("mask-only export must not encode previews or reread RGB")
+
+        monkeypatch.setattr(video_outputs, "H264Writer", no_preview)
+        monkeypatch.setattr(video_outputs, "load_frame_bgr", no_preview)
     predictor = Predictor()
     seen = []
     backend._segment_clip(
@@ -64,6 +74,7 @@ def test_headless_exports_scores_without_desktop_checkpoints_and_closes(tmp_path
         0,
         None,
         seen.append,
+        render_preview=render_preview,
     )
     kinds = [r["type"] for r in predictor.requests]
     assert kinds == [
@@ -81,6 +92,10 @@ def test_headless_exports_scores_without_desktop_checkpoints_and_closes(tmp_path
     ]
     assert seen[-1] == 3
     assert (tmp_path / "out/masks.mkv").stat().st_size > 0
+    assert (tmp_path / "out/result.mp4").exists() is render_preview
+    assert ("visualization_video" in metadata["outputs"]) is render_preview
+    interactions = json.loads((tmp_path / "out/interactions.json").read_text())
+    assert interactions["outputs"] == metadata["outputs"]
 
 
 def test_headless_closes_on_failure_and_never_publishes_success(tmp_path):
@@ -301,4 +316,83 @@ def test_invalid_custom_start_is_rejected_before_decoding(tmp_path, kwargs):
             prompts=["hand"],
             output_dirs=[tmp_path / "out"],
             **kwargs,
+        )
+
+
+@pytest.mark.parametrize("chunk_frames", [0, 2])
+def test_public_mask_only_export_preserves_full_video_and_scores(
+    tmp_path, monkeypatch, chunk_frames
+):
+    from contextlib import nullcontext
+
+    import torch
+
+    monkeypatch.setattr(torch, "inference_mode", nullcontext)
+    monkeypatch.setattr(torch, "autocast", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    info = video_outputs.VideoInfo(10, 8, 5, 30)
+    monkeypatch.setattr(video_outputs, "probe_video", lambda _: info)
+
+    def extract(video, frames):
+        frames.mkdir()
+        for frame in range(info.frame_count):
+            Image.new("RGB", (10, 8)).save(frames / f"{frame:05d}.jpg")
+        return info.frame_count
+
+    def no_preview(*args, **kwargs):
+        pytest.fail("automatic export must not encode previews or reread RGB")
+
+    monkeypatch.setattr(video_outputs, "extract_frames", extract)
+    monkeypatch.setattr(video_outputs, "H264Writer", no_preview)
+    monkeypatch.setattr(video_outputs, "load_frame_bgr", no_preview)
+
+    class DecodedPredictor(Predictor):
+        def handle_request(self, request):
+            if request["type"] == "start_session":
+                self.count = len(list(Path(request["resource_path"]).glob("*.jpg")))
+            return super().handle_request(request)
+
+        def handle_stream_request(self, request):
+            for frame in range(self.count):
+                yield {"frame_index": frame, "outputs": self.output()}
+
+    output = tmp_path / "out"
+    backend.segment_video(
+        DecodedPredictor(),
+        video=tmp_path / "rgb.mkv",
+        prompts=["hand"],
+        output_dirs=[output],
+        chunk_frames=chunk_frames,
+        render_preview=False,
+    )
+    assert {p.name for p in output.iterdir()} == {
+        "masks.mkv",
+        "metadata.json",
+        "interactions.json",
+    }
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["status"] == "success" and metadata["frames_processed"] == 5
+    assert "visualization_video" not in metadata["outputs"]
+    scores = metadata["mask_scores"]["frames"]
+    assert [f["frame_index"] for f in scores] == list(range(5))
+    assert all(f["objects"][0]["tracking"] == 0 for f in scores)
+    capture = cv2.VideoCapture(str(output / "masks.mkv"))
+    try:
+        for _ in range(5):
+            ok, frame = capture.read()
+            assert ok and np.all(frame == 1)
+        assert not capture.read()[0]
+    finally:
+        capture.release()
+
+
+@pytest.mark.parametrize("render_preview", [None, 0, 1, "false"])
+def test_invalid_preview_flag_is_rejected_before_decoding(tmp_path, render_preview):
+    with pytest.raises(ValueError, match="render_preview"):
+        backend.segment_video(
+            object(),
+            video=tmp_path / "input",
+            prompts=["hand"],
+            output_dirs=[tmp_path / "out"],
+            render_preview=render_preview,
         )

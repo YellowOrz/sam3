@@ -467,7 +467,7 @@ def remap_interaction(item: Dict[str, Any], mapping: Dict[int, int]) -> Dict[str
     return result
 
 
-def write_interactive_outputs(app: Any) -> None:
+def write_interactive_outputs(app: Any, *, render_preview: bool = True) -> None:
     original_ids = sorted({obj_id for masks in app.cache.values() for obj_id in masks})
     id_mapping = (
         {obj_id: obj_id for obj_id in original_ids}
@@ -497,12 +497,14 @@ def write_interactive_outputs(app: Any) -> None:
     for path in (temporary_result, temporary_masks):
         if path.exists():
             path.unlink()
-    result_writer = H264Writer(
-        temporary_result,
-        app.video_info.fps,
-        (app.video_info.width, app.video_info.height),
-    )
-    if not result_writer.isOpened():
+    result_writer = None
+    if render_preview:
+        result_writer = H264Writer(
+            temporary_result,
+            app.video_info.fps,
+            (app.video_info.width, app.video_info.height),
+        )
+    if result_writer is not None and not result_writer.isOpened():
         result_writer.release()
         temporary_result.unlink(missing_ok=True)
         raise RuntimeError(f"cannot create output video: {temporary_result}")
@@ -514,7 +516,8 @@ def write_interactive_outputs(app: Any) -> None:
         isColor=False,
     )
     if not mask_writer.isOpened():
-        result_writer.release()
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
@@ -532,32 +535,36 @@ def write_interactive_outputs(app: Any) -> None:
                 app.video_info.height,
             )
             mask_writer.write(label_image)
-            result_writer.write(
-                render_frame_bgr(
-                    load_frame_bgr(app.frame_dir, frame_index),
-                    masks_by_obj,
-                    probabilities_by_obj={
-                        id_mapping[obj_id]: probability
-                        for obj_id, probability in app.probability_cache.get(
-                            frame_index, {}
-                        ).items()
-                        if obj_id in id_mapping
-                    },
-                    object_to_label=object_to_label,
-                    frame_index=app.frame_offset + frame_index,
-                    prompt=app.prompt,
+            if result_writer is not None:
+                result_writer.write(
+                    render_frame_bgr(
+                        load_frame_bgr(app.frame_dir, frame_index),
+                        masks_by_obj,
+                        probabilities_by_obj={
+                            id_mapping[obj_id]: probability
+                            for obj_id, probability in app.probability_cache.get(
+                                frame_index, {}
+                            ).items()
+                            if obj_id in id_mapping
+                        },
+                        object_to_label=object_to_label,
+                        frame_index=app.frame_offset + frame_index,
+                        prompt=app.prompt,
+                    )
                 )
-            )
     except BaseException:
-        result_writer.release()
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
         raise
     finally:
-        result_writer.release()
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
-    temporary_result.replace(result_path)
+    if result_writer is not None:
+        temporary_result.replace(result_path)
     temporary_masks.replace(masks_path)
     source = {
         "width": app.video_info.width,
@@ -570,7 +577,7 @@ def write_interactive_outputs(app: Any) -> None:
         "instance_masks_video": "masks.mkv",
         "instance_masks_codec": "FFV1",
         "instance_masks_pixel_format": "gray8",
-        "visualization_video": "result.mp4",
+        **({"visualization_video": "result.mp4"} if render_preview else {}),
         "label_dtype": "uint8",
         "background_label": 0,
     }
@@ -665,6 +672,7 @@ def merge_chunk_outputs(
     mappings: Optional[Sequence[Dict[int, int]]] = None,
     confirmed: bool = False,
     clip_overseg: bool = False,
+    render_preview: bool = True,
 ) -> None:
     metadata_by_chunk = [
         json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
@@ -687,11 +695,13 @@ def merge_chunk_outputs(
     temporary_masks = output_dir / ".masks.tmp.mkv"
     for path in (temporary_result, temporary_masks):
         path.unlink(missing_ok=True)
-    result_writer = H264Writer(
-        temporary_result,
-        video_info.fps,
-        (video_info.width, video_info.height),
-    )
+    result_writer = None
+    if render_preview:
+        result_writer = H264Writer(
+            temporary_result,
+            video_info.fps,
+            (video_info.width, video_info.height),
+        )
     mask_writer = cv2.VideoWriter(
         str(temporary_masks),
         cv2.VideoWriter_fourcc(*"FFV1"),
@@ -699,8 +709,11 @@ def merge_chunk_outputs(
         (video_info.width, video_info.height),
         isColor=False,
     )
-    if not result_writer.isOpened() or not mask_writer.isOpened():
-        result_writer.release()
+    if (
+        result_writer is not None and not result_writer.isOpened()
+    ) or not mask_writer.isOpened():
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
@@ -777,22 +790,23 @@ def merge_chunk_outputs(
                             masks, global_labels, video_info.width, video_info.height
                         )
                     )
-                    result_writer.write(
-                        render_frame_bgr(
-                            load_frame_bgr(frame_dir, frame_index),
-                            masks,
-                            object_to_label=global_labels,
-                            frame_index=frame_index,
-                            prompt=f"chunk={chunk_index} {prompt}",
-                            object_names={
-                                global_id: (
-                                    f"chunk={chunk_index} local={local_id} "
-                                    f"id={global_id}"
-                                )
-                                for local_id, global_id in mapping.items()
-                            },
+                    if result_writer is not None:
+                        result_writer.write(
+                            render_frame_bgr(
+                                load_frame_bgr(frame_dir, frame_index),
+                                masks,
+                                object_to_label=global_labels,
+                                frame_index=frame_index,
+                                prompt=f"chunk={chunk_index} {prompt}",
+                                object_names={
+                                    global_id: (
+                                        f"chunk={chunk_index} local={local_id} "
+                                        f"id={global_id}"
+                                    )
+                                    for local_id, global_id in mapping.items()
+                                },
+                            )
                         )
-                    )
             finally:
                 mask_capture.release()
 
@@ -842,16 +856,19 @@ def merge_chunk_outputs(
                 events.append(item)
             sequence_offset += max(local_sequences, default=0)
     except BaseException:
-        result_writer.release()
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
         for path in (temporary_result, temporary_masks):
             path.unlink(missing_ok=True)
         raise
     finally:
-        result_writer.release()
+        if result_writer is not None:
+            result_writer.release()
         mask_writer.release()
 
-    temporary_result.replace(output_dir / "result.mp4")
+    if result_writer is not None:
+        temporary_result.replace(output_dir / "result.mp4")
     temporary_masks.replace(output_dir / "masks.mkv")
     source = {
         "width": video_info.width,
@@ -863,7 +880,7 @@ def merge_chunk_outputs(
         "instance_masks_video": "masks.mkv",
         "instance_masks_codec": "FFV1",
         "instance_masks_pixel_format": "gray8",
-        "visualization_video": "result.mp4",
+        **({"visualization_video": "result.mp4"} if render_preview else {}),
         "label_dtype": "uint8",
         "background_label": 0,
         "label_scope": "video",

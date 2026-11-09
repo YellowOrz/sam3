@@ -577,7 +577,11 @@ API directly, closes sessions on errors and exports the existing label-video,
 metadata and score format without desktop checkpoint requests. Optional
 `geometry_prompts`, `chunk_frames`, `progress(done,total)` and
 `prompt_done(text,path,frames,elapsed_seconds)` preserve the existing headless
-workflow. A successful return is not human review.
+workflow. The `optional_preview` capability adds `render_preview=False` to skip
+RGB overlay rendering and `result.mp4` encoding, including chunk outputs and
+merging. Label masks, metadata, interactions and frame scores are unchanged;
+`outputs.visualization_video` is omitted. The default remains `True` for existing
+callers and desktop exports. A successful return is not human review.
 
 `create_mask_editor(predictor, state, frame_path=lambda i: paths[i])` exposes the
 existing tracker-only editor with lossless PNG support. `reset`, `initialize`,

@@ -24,6 +24,7 @@ CAPABILITIES = frozenset(
         "mask_tracking",
         "chunking",
         "propagation_start",
+        "optional_preview",
     }
 )
 
@@ -77,6 +78,7 @@ def _segment_clip(
     progress,
     *,
     start_frame_index=0,
+    render_preview=True,
 ):
     from sam3.video_outputs import normalize_frame_outputs, write_interactive_outputs
 
@@ -160,7 +162,7 @@ def _segment_clip(
                 cache(result["frame_index"], result["outputs"])
         if len(state.cache) != info.frame_count:
             raise ValueError("backend returned an incomplete video")
-        write_interactive_outputs(state)
+        write_interactive_outputs(state, render_preview=render_preview)
     finally:
         predictor.handle_request({"type": "close_session", "session_id": sid})
 
@@ -177,7 +179,10 @@ def segment_video(
     start_fraction=None,
     progress=lambda *_: None,
     prompt_done=lambda *_: None,
+    render_preview=True,
 ):
+    if type(render_preview) is not bool:
+        raise ValueError("render_preview must be a boolean")
     import torch
     from sam3.video_outputs import (
         extract_frames,
@@ -249,6 +254,7 @@ def segment_video(
                     geometry,
                     lambda done: progress(query * count + done, total),
                     start_frame_index=start_frame_index,
+                    render_preview=render_preview,
                 )
             else:
                 chunks = []
@@ -272,6 +278,7 @@ def segment_video(
                         start,
                         None,
                         lambda done: progress(query * count + start + done, total),
+                        render_preview=render_preview,
                     )
                     chunks.append((start, end, chunk_output))
                 merge_chunk_outputs(
@@ -285,6 +292,7 @@ def segment_video(
                     frames,
                     confirmed=True,
                     clip_overseg=False,
+                    render_preview=render_preview,
                 )
             prompt_done(prompt, output, count, time.monotonic() - started)
         return {
