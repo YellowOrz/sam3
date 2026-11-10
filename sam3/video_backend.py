@@ -4,6 +4,7 @@ The request/stream API is shared with Sam3VideoPredictor. No desktop UI,
 checkpoint interception, global progress patches, or business identities.
 """
 
+from contextlib import contextmanager
 import math
 import tempfile
 import time
@@ -25,8 +26,20 @@ CAPABILITIES = frozenset(
         "chunking",
         "propagation_start",
         "optional_preview",
+        "phase_timings",
     }
 )
+
+
+@contextmanager
+def _phase(callback, stage):
+    started = time.monotonic()
+    complete = False
+    try:
+        yield
+        complete = True
+    finally:
+        callback(stage, started, time.monotonic(), complete)
 
 
 def create_predictor(
@@ -79,6 +92,7 @@ def _segment_clip(
     *,
     start_frame_index=0,
     render_preview=True,
+    phase=lambda *_: None,
 ):
     from sam3.video_outputs import normalize_frame_outputs, write_interactive_outputs
 
@@ -87,84 +101,89 @@ def _segment_clip(
         or not 0 <= start_frame_index < info.frame_count
     ):
         raise ValueError("invalid propagation start frame")
-    sid = predictor.handle_request(
-        {
-            "type": "start_session",
-            "resource_path": str(frames),
-            "offload_video_to_cpu": True,
-            "offload_state_to_cpu": False,
-        }
-    )["session_id"]
-    state = SimpleNamespace(
-        cache={},
-        probability_cache={},
-        tracking_probability_cache={},
-        frame_count=info.frame_count,
-        video_info=info,
-        video_path=video,
-        frame_dir=frames,
-        output_dir=output,
-        frame_offset=offset,
-        prompt=prompt,
-        version="sam3",
-        clip_overseg=False,
-        confirmed_points=[],
-        events=[],
-        initial_propagation_mode="both" if start_frame_index else "forward",
-        propagation={
-            "start_frame_index": start_frame_index,
-            "direction": "both" if start_frame_index else "forward",
-        },
-    )
-
-    def cache(frame, outputs):
-        if type(frame) is not int or not 0 <= frame < info.frame_count:
-            raise ValueError("backend returned an invalid frame index")
-        masks, detection, tracking = normalize_frame_outputs(outputs)
-        if any(mask.shape != (info.height, info.width) for mask in masks.values()):
-            raise ValueError("backend masks must use original image coordinates")
-        (
-            state.cache[frame],
-            state.probability_cache[frame],
-            state.tracking_probability_cache[frame],
-        ) = (
-            masks,
-            detection,
-            tracking,
-        )
-        progress(len(state.cache))
-
+    sid = None
     try:
-        request = {
-            "type": "add_geometry_prompts" if geometry else "add_prompt",
-            "session_id": sid,
-            "frame_index": start_frame_index,
-            "text": prompt,
-        }
-        if geometry:
-            request["geometry_prompts"] = geometry
-        initial = predictor.handle_request(request)
-        cache(start_frame_index, initial.get("outputs"))
-        # A forward pass at the last frame makes SAM3 treat the whole video as cached.
-        directions = ["forward"] if start_frame_index < info.frame_count - 1 else []
-        if start_frame_index > 0:
-            directions.append("backward")
-        for direction in directions:
-            for result in predictor.handle_stream_request(
+        with _phase(phase, "sam3"):
+            sid = predictor.handle_request(
                 {
-                    "type": "propagate_in_video",
-                    "session_id": sid,
-                    "start_frame_index": start_frame_index,
-                    "max_frame_num_to_track": info.frame_count - 1,
-                    "propagation_direction": direction,
+                    "type": "start_session",
+                    "resource_path": str(frames),
+                    "offload_video_to_cpu": True,
+                    "offload_state_to_cpu": False,
                 }
-            ):
-                cache(result["frame_index"], result["outputs"])
-        if len(state.cache) != info.frame_count:
-            raise ValueError("backend returned an incomplete video")
-        write_interactive_outputs(state, render_preview=render_preview)
+            )["session_id"]
+            state = SimpleNamespace(
+                cache={},
+                probability_cache={},
+                tracking_probability_cache={},
+                frame_count=info.frame_count,
+                video_info=info,
+                video_path=video,
+                frame_dir=frames,
+                output_dir=output,
+                frame_offset=offset,
+                prompt=prompt,
+                version="sam3",
+                clip_overseg=False,
+                confirmed_points=[],
+                events=[],
+                initial_propagation_mode="both" if start_frame_index else "forward",
+                propagation={
+                    "start_frame_index": start_frame_index,
+                    "direction": "both" if start_frame_index else "forward",
+                },
+            )
+
+            def cache(frame, outputs):
+                if type(frame) is not int or not 0 <= frame < info.frame_count:
+                    raise ValueError("backend returned an invalid frame index")
+                masks, detection, tracking = normalize_frame_outputs(outputs)
+                if any(mask.shape != (info.height, info.width) for mask in masks.values()):
+                    raise ValueError("backend masks must use original image coordinates")
+                (
+                    state.cache[frame],
+                    state.probability_cache[frame],
+                    state.tracking_probability_cache[frame],
+                ) = (
+                    masks,
+                    detection,
+                    tracking,
+                )
+                progress(len(state.cache))
+
+            request = {
+                "type": "add_geometry_prompts" if geometry else "add_prompt",
+                "session_id": sid,
+                "frame_index": start_frame_index,
+                "text": prompt,
+            }
+            if geometry:
+                request["geometry_prompts"] = geometry
+            initial = predictor.handle_request(request)
+            cache(start_frame_index, initial.get("outputs"))
+            # A forward pass at the last frame makes SAM3 treat the whole video as cached.
+            directions = ["forward"] if start_frame_index < info.frame_count - 1 else []
+            if start_frame_index > 0:
+                directions.append("backward")
+            for direction in directions:
+                for result in predictor.handle_stream_request(
+                    {
+                        "type": "propagate_in_video",
+                        "session_id": sid,
+                        "start_frame_index": start_frame_index,
+                        "max_frame_num_to_track": info.frame_count - 1,
+                        "propagation_direction": direction,
+                    }
+                ):
+                    cache(result["frame_index"], result["outputs"])
+            if len(state.cache) != info.frame_count:
+                raise ValueError("backend returned an incomplete video")
+        with _phase(phase, "encoding"):
+            write_interactive_outputs(state, render_preview=render_preview)
     finally:
-        predictor.handle_request({"type": "close_session", "session_id": sid})
+        if sid is not None:
+            with _phase(phase, "cleanup"):
+                predictor.handle_request({"type": "close_session", "session_id": sid})
 
 
 def segment_video(
@@ -180,6 +199,7 @@ def segment_video(
     progress=lambda *_: None,
     prompt_done=lambda *_: None,
     render_preview=True,
+    phase=lambda *_: None,
 ):
     if type(render_preview) is not bool:
         raise ValueError("render_preview must be a boolean")
@@ -221,82 +241,91 @@ def segment_video(
     if len(geometry_prompts) != len(prompts) or chunk_frames and any(geometry_prompts):
         raise ValueError("geometry must align with prompts and cannot be chunked")
     video = Path(video).resolve()
-    original = probe_video(video)
+    with _phase(phase, "decoding"):
+        original = probe_video(video)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    with tempfile.TemporaryDirectory(
-        prefix="sam3_video_"
-    ) as temporary, torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
-        workspace = Path(temporary)
-        frames = workspace / "frames"
-        count = extract_frames(video, frames)
-        if count <= 0:
-            raise ValueError("video contains no frames")
-        start_frame_index = (
-            int((count - 1) * Fraction(str(start_fraction)))
-            if start_fraction is not None
-            else min(start_frame_index, count - 1)
-        )
-        info = VideoInfo(original.width, original.height, count, original.fps)
-        total = count * len(prompts)
-        for query, (prompt, output, geometry) in enumerate(
-            zip(prompts, outputs, geometry_prompts)
-        ):
-            started = time.monotonic()
-            if not chunk_frames:
-                _segment_clip(
-                    predictor,
-                    video,
-                    info,
-                    frames,
-                    output,
-                    prompt,
-                    0,
-                    geometry,
-                    lambda done: progress(query * count + done, total),
-                    start_frame_index=start_frame_index,
-                    render_preview=render_preview,
-                )
-            else:
-                chunks = []
-                for index, (start, end) in enumerate(frame_ranges(count, chunk_frames)):
-                    chunk_dir = workspace / f"q{query}-c{index}"
-                    chunk_frames_dir, chunk_output = (
-                        chunk_dir / "frames",
-                        chunk_dir / "output",
-                    )
-                    make_chunk_frame_dir(frames, chunk_frames_dir, start, end)
-                    chunk_info = VideoInfo(
-                        info.width, info.height, end - start, info.fps
-                    )
+    temporary = tempfile.TemporaryDirectory(prefix="sam3_video_")
+    try:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+            workspace = Path(temporary.name)
+            frames = workspace / "frames"
+            with _phase(phase, "decoding"):
+                count = extract_frames(video, frames)
+            if count <= 0:
+                raise ValueError("video contains no frames")
+            start_frame_index = (
+                int((count - 1) * Fraction(str(start_fraction)))
+                if start_fraction is not None
+                else min(start_frame_index, count - 1)
+            )
+            info = VideoInfo(original.width, original.height, count, original.fps)
+            total = count * len(prompts)
+            for query, (prompt, output, geometry) in enumerate(
+                zip(prompts, outputs, geometry_prompts)
+            ):
+                started = time.monotonic()
+                if not chunk_frames:
                     _segment_clip(
                         predictor,
                         video,
-                        chunk_info,
-                        chunk_frames_dir,
-                        chunk_output,
+                        info,
+                        frames,
+                        output,
                         prompt,
-                        start,
-                        None,
-                        lambda done: progress(query * count + start + done, total),
+                        0,
+                        geometry,
+                        lambda done: progress(query * count + done, total),
+                        start_frame_index=start_frame_index,
                         render_preview=render_preview,
+                        phase=phase,
                     )
-                    chunks.append((start, end, chunk_output))
-                merge_chunk_outputs(
-                    chunks,
-                    output,
-                    video,
-                    info,
-                    prompt,
-                    "sam3",
-                    chunk_frames,
-                    frames,
-                    confirmed=True,
-                    clip_overseg=False,
-                    render_preview=render_preview,
-                )
-            prompt_done(prompt, output, count, time.monotonic() - started)
-        return {
-            "frames": count,
-            "prompt_count": len(prompts),
-            "start_frame_index": start_frame_index,
-        }
+                else:
+                    chunks = []
+                    for index, (start, end) in enumerate(frame_ranges(count, chunk_frames)):
+                        chunk_dir = workspace / f"q{query}-c{index}"
+                        chunk_frames_dir, chunk_output = (
+                            chunk_dir / "frames",
+                            chunk_dir / "output",
+                        )
+                        with _phase(phase, "frame_preparation"):
+                            make_chunk_frame_dir(frames, chunk_frames_dir, start, end)
+                        chunk_info = VideoInfo(
+                            info.width, info.height, end - start, info.fps
+                        )
+                        _segment_clip(
+                            predictor,
+                            video,
+                            chunk_info,
+                            chunk_frames_dir,
+                            chunk_output,
+                            prompt,
+                            start,
+                            None,
+                            lambda done: progress(query * count + start + done, total),
+                            render_preview=render_preview,
+                            phase=phase,
+                        )
+                        chunks.append((start, end, chunk_output))
+                    with _phase(phase, "encoding"):
+                        merge_chunk_outputs(
+                            chunks,
+                            output,
+                            video,
+                            info,
+                            prompt,
+                            "sam3",
+                            chunk_frames,
+                            frames,
+                            confirmed=True,
+                            clip_overseg=False,
+                            render_preview=render_preview,
+                        )
+                prompt_done(prompt, output, count, time.monotonic() - started)
+            return {
+                "frames": count,
+                "prompt_count": len(prompts),
+                "start_frame_index": start_frame_index,
+            }
+    finally:
+        with _phase(phase, "cleanup"):
+            temporary.cleanup()
